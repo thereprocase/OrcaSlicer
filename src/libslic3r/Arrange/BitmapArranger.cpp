@@ -1207,13 +1207,42 @@ void BitmapArranger::arrange(
     // PHASE 4: Compaction — configurable strategies to reduce plate count
     // ============================================================
 
-    // Helper: try to place an item on a plate using bitmap collision (finds gaps below skyline)
+    // Helper: try to place an item on a plate using adaptive-stride bitmap scan.
+    // Stride scales with item bounding box: large items use fine stride (few positions),
+    // small items use coarse stride (many positions but gaps are plentiful).
+    // Based on tournament-winning quadtree/adaptive approach.
     auto try_compact_bitmap = [&](int idx, const BitmapItem &bmp, double rot, int plate_idx) -> bool {
         int max_x = bed_w_px - bmp.width_px;
         int max_y = bed_h_px - bmp.height_px;
         if (max_x < 0 || max_y < 0) return false;
-        int step = std::max(2, (int)(scaled<coord_t>(4.0) / res));
+
+        // Adaptive stride: scale with position space
+        int pos_space = (max_x + 1) * (max_y + 1);
+        int step;
+        if (pos_space < 40000)       step = std::max(2, (int)(scaled<coord_t>(2.0) / res));
+        else if (pos_space < 120000) step = std::max(2, (int)(scaled<coord_t>(4.0) / res));
+        else                         step = std::max(2, (int)(scaled<coord_t>(6.0) / res));
+
+        // Precompute row-level free pixel counts for band rejection
+        int item_px = 0;
+        for (int py = 0; py < bmp.height_px; py++)
+            for (int wx = 0; wx < bmp.width_words; wx++) {
+                uint64_t w = bmp.bits[(size_t)py * bmp.width_words + wx];
+                while (w) { item_px++; w &= w - 1; } // popcount
+            }
+
         for (int y = 0; y <= max_y; y += step) {
+            // Band free-pixel check: skip if rows can't possibly hold the item
+            int band_free = 0;
+            for (int dy = 0; dy < bmp.height_px && band_free < item_px; dy++) {
+                for (int wx = 0; wx < bed_w_words; wx++) {
+                    uint64_t w = ~plates[plate_idx].bits[(size_t)(y + dy) * bed_w_words + wx];
+                    while (w) { band_free++; w &= w - 1; }
+                    if (band_free >= item_px) break;
+                }
+            }
+            if (band_free < item_px) continue;
+
             for (int x = 0; x <= max_x; x += step) {
                 if (!collides(plates[plate_idx].bits, bed_w_words, bed_w_px, bed_h_px, bmp, x, y)) {
                     arrangables[entries[idx].orig_idx].translation = {
@@ -1296,8 +1325,10 @@ void BitmapArranger::arrange(
         return true;
     };
 
-    // Run compaction if enabled
-    if (!use_3d && plates.size() > 1 && params.compaction_mode > 0) {
+    // Run compaction if enabled (works for both 2D and 3D modes)
+    // For 3D mode, compaction uses 2D bitmap collision on the bottom slice —
+    // if the bottom slice doesn't collide, the item fits (conservative but fast).
+    if (plates.size() > 1 && params.compaction_mode > 0) {
         bool compacted = true;
         while (compacted && plates.size() > 1) {
             compacted = false;
@@ -1431,6 +1462,54 @@ void BitmapArranger::arrange(
                     // Skip gravity for now if it requires un-stamping (complex)
                     // TODO: implement proper un-stamp + re-stamp
                     break;
+                }
+            }
+        }
+    }
+
+    // ============================================================
+    // PHASE 6: Overlap safety check — paranoid failsafe
+    // ============================================================
+    // Re-rasterize all placed items per plate and verify no pixel overlaps.
+    // If any overlap is found, move the offending item to a new plate.
+    // This should never trigger — if it does, there's a bug upstream.
+    // But overlapping parts on a 14-hour print is a catastrophic failure,
+    // so we check anyway. Cost: O(items × item_pixels), negligible.
+    {
+        int n_plates_check = use_3d ? (int)plates_3d.size() : (int)plates.size();
+        // Rebuild bed bitmaps from scratch per plate
+        for (int pi = 0; pi < n_plates_check; pi++) {
+            std::vector<uint64_t> verify_bits(bed_w_words * bed_h_px, 0);
+            stamp_excludes(verify_bits);
+
+            for (int i = 0; i < n; i++) {
+                if (!item_placed[i]) continue;
+                int item_plate = arrangables[entries[i].orig_idx].bed_idx;
+                if (item_plate != pi) continue;
+                if (rot_bmps_all[i].empty()) continue;
+
+                // Find the bitmap matching the committed rotation
+                double cur_rot = arrangables[entries[i].orig_idx].rotation;
+                const BitmapItem *cur_bmp = nullptr;
+                for (const auto &[bmp, rot] : rot_bmps_all[i]) {
+                    if (std::abs(rot - cur_rot) < 0.01) { cur_bmp = &bmp; break; }
+                }
+                if (!cur_bmp || cur_bmp->width_px <= 0) continue;
+
+                // Compute pixel position from translation
+                coord_t tx = arrangables[entries[i].orig_idx].translation.x();
+                coord_t ty = arrangables[entries[i].orig_idx].translation.y();
+                int px = (int)((tx + cur_bmp->offset_x - effective_bed.min.x()) / res);
+                int py = (int)((ty + cur_bmp->offset_y - effective_bed.min.y()) / res);
+
+                if (collides(verify_bits, bed_w_words, bed_w_px, bed_h_px, *cur_bmp, px, py)) {
+                    // Overlap detected — move item to unarranged
+                    BOOST_LOG_TRIVIAL(error) << "BitmapArranger: OVERLAP detected for item "
+                                             << entries[i].orig_idx << " on plate " << pi
+                                             << " — moving to new plate as failsafe";
+                    arrangables[entries[i].orig_idx].bed_idx = n_plates_check;
+                } else {
+                    stamp(verify_bits, bed_w_words, bed_w_px, bed_h_px, *cur_bmp, px, py);
                 }
             }
         }

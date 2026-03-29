@@ -6076,7 +6076,6 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
 
         ImGui::AlignTextToFramePadding();
         imgui->text(_L("Rotation step"));
-        ImGui::SameLine(1.2 * cursor_slider_left);
         ImGui::PushItemWidth(window_width);
         if (ImGui::Combo("##rotation_step", &rot_step_idx, rot_step_labels, 3)) {
             settings.rotation_step_deg = rot_step_values[rot_step_idx];
