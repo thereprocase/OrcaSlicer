@@ -312,6 +312,20 @@ BitmapArranger::SliceStack BitmapArranger::rasterize_slices(
     for (float z : tri_z) max_z = std::max(max_z, z);
     stack.n_slices = std::max(1, (int)std::ceil(max_z / slice_height_mm));
 
+    // Compute GLOBAL bounding box from ALL triangles, expanded by inflation.
+    // All slices must share this same coordinate frame so that collides_3d
+    // can pass the same (ox, oy) to collides() for every slice. Without this,
+    // each slice has a different offset/size and the collision check is misaligned.
+    BoundingBox global_bb(tri_verts);
+    global_bb.min -= Vec2crd(inflation, inflation);
+    global_bb.max += Vec2crd(inflation, inflation);
+
+    int global_w = (int)std::ceil((double)(global_bb.max.x() - global_bb.min.x()) / res) + 1;
+    int global_h = (int)std::ceil((double)(global_bb.max.y() - global_bb.min.y()) / res) + 1;
+    int global_ww = (global_w + 63) / 64;
+
+    if (global_w <= 0 || global_h <= 0) return stack;
+
     // Bin triangles into slices. Each triangle goes to every slice its Z range
     // intersects, padded by z_clearance.
     std::vector<Points> slice_tris(stack.n_slices);
@@ -327,23 +341,134 @@ BitmapArranger::SliceStack BitmapArranger::rasterize_slices(
         }
     }
 
-    // Rasterize each slice using the existing triangle rasterizer.
-    // Each slice is independent — parallelize when there are enough slices
-    // to justify the TBB overhead (a 100mm part at 2mm slice height = 50 slices).
+    // Rasterize each slice into the GLOBAL coordinate frame.
+    // Instead of calling rasterize_triangles (which computes its own BB),
+    // rasterize directly into the shared bounding box so all slices have
+    // identical offset_x, offset_y, width_px, height_px, width_words.
+    double inv_res = 1.0 / res;
+
+    auto rasterize_into_global = [&](const Points &tris) -> BitmapItem {
+        BitmapItem item;
+        item.offset_x = global_bb.min.x();
+        item.offset_y = global_bb.min.y();
+        item.width_px = global_w;
+        item.height_px = global_h;
+        item.width_words = global_ww;
+        item.bits.assign((size_t)global_ww * global_h, 0);
+
+        // Scanline-fill each triangle (same as rasterize_triangles but with fixed BB)
+        for (size_t ti = 0; ti + 2 < tris.size(); ti += 3) {
+            double x0 = (tris[ti].x()     - global_bb.min.x()) * inv_res;
+            double y0 = (tris[ti].y()     - global_bb.min.y()) * inv_res;
+            double x1 = (tris[ti + 1].x() - global_bb.min.x()) * inv_res;
+            double y1 = (tris[ti + 1].y() - global_bb.min.y()) * inv_res;
+            double x2 = (tris[ti + 2].x() - global_bb.min.x()) * inv_res;
+            double y2 = (tris[ti + 2].y() - global_bb.min.y()) * inv_res;
+
+            if (y0 > y1) { std::swap(x0, x1); std::swap(y0, y1); }
+            if (y0 > y2) { std::swap(x0, x2); std::swap(y0, y2); }
+            if (y1 > y2) { std::swap(x1, x2); std::swap(y1, y2); }
+
+            int py_min = std::max(0, (int)y0);
+            int py_max = std::min(global_h - 1, (int)y2);
+
+            for (int py = py_min; py <= py_max; py++) {
+                double row = py + 0.5;
+                double left = 1e18, right = -1e18;
+
+                auto edge_intersect = [&](double ax, double ay, double bx, double by) {
+                    if ((ay <= row && by > row) || (by <= row && ay > row)) {
+                        double t = (row - ay) / (by - ay);
+                        double ix = ax + t * (bx - ax);
+                        left = std::min(left, ix);
+                        right = std::max(right, ix);
+                    }
+                };
+
+                edge_intersect(x0, y0, x1, y1);
+                edge_intersect(x1, y1, x2, y2);
+                edge_intersect(x0, y0, x2, y2);
+
+                if (left > right) continue;
+
+                int px_left  = std::max(0, (int)left);
+                int px_right = std::min(global_w - 1, (int)right);
+
+                if (px_left <= px_right) {
+                    int sw = px_left / 64, ew = px_right / 64;
+                    int sb = px_left % 64, eb = px_right % 64;
+                    if (sw == ew) {
+                        uint64_t mask = ((uint64_t(2) << eb) - 1) & ~((uint64_t(1) << sb) - 1);
+                        item.bits[(size_t)py * global_ww + sw] |= mask;
+                    } else {
+                        item.bits[(size_t)py * global_ww + sw] |= ~((uint64_t(1) << sb) - 1);
+                        for (int w = sw + 1; w < ew; w++)
+                            item.bits[(size_t)py * global_ww + w] = ~uint64_t(0);
+                        item.bits[(size_t)py * global_ww + ew] |= (uint64_t(2) << eb) - 1;
+                    }
+                }
+            }
+        }
+
+        // Dilation for inflation
+        if (inflation > 0) {
+            int inflate_px = std::max(1, (int)(inflation * inv_res));
+            std::vector<uint64_t> dilated = item.bits;
+            for (int py = 0; py < global_h; py++) {
+                for (int wx = 0; wx < global_ww; wx++) {
+                    uint64_t word = item.bits[(size_t)py * global_ww + wx];
+                    if (word == 0) continue;
+                    while (word) {
+                        int bit = ctz64(word);
+                        int px = wx * 64 + bit;
+                        for (int dy = -inflate_px; dy <= inflate_px; dy++) {
+                            int ny = py + dy;
+                            if (ny < 0 || ny >= global_h) continue;
+                            for (int dx = -inflate_px; dx <= inflate_px; dx++) {
+                                int nx = px + dx;
+                                if (nx < 0 || nx >= global_w) continue;
+                                dilated[(size_t)ny * global_ww + nx / 64] |= (uint64_t(1) << (nx % 64));
+                            }
+                        }
+                        word &= word - 1;
+                    }
+                }
+            }
+            item.bits = std::move(dilated);
+        }
+
+        return item;
+    };
+
     stack.slices.resize(stack.n_slices);
     if (stack.n_slices >= 4) {
         tbb::parallel_for(tbb::blocked_range<int>(0, stack.n_slices),
             [&](const tbb::blocked_range<int> &range) {
                 for (int s = range.begin(); s < range.end(); s++) {
                     if (!slice_tris[s].empty())
-                        stack.slices[s] = rasterize_triangles(slice_tris[s], inflation, res);
+                        stack.slices[s] = rasterize_into_global(slice_tris[s]);
+                    else {
+                        // Empty slice still needs correct dimensions for collides_3d
+                        stack.slices[s].offset_x = global_bb.min.x();
+                        stack.slices[s].offset_y = global_bb.min.y();
+                        stack.slices[s].width_px = global_w;
+                        stack.slices[s].height_px = global_h;
+                        stack.slices[s].width_words = global_ww;
+                    }
                 }
             }
         );
     } else {
         for (int s = 0; s < stack.n_slices; s++) {
             if (!slice_tris[s].empty())
-                stack.slices[s] = rasterize_triangles(slice_tris[s], inflation, res);
+                stack.slices[s] = rasterize_into_global(slice_tris[s]);
+            else {
+                stack.slices[s].offset_x = global_bb.min.x();
+                stack.slices[s].offset_y = global_bb.min.y();
+                stack.slices[s].width_px = global_w;
+                stack.slices[s].height_px = global_h;
+                stack.slices[s].width_words = global_ww;
+            }
         }
     }
 
@@ -1009,8 +1134,9 @@ void BitmapArranger::arrange(
     // one step of the first collision-free spot. Balances speed vs. packing quality.
     // 2D scan step: 1mm (used for legacy bitmap scanning if needed)
     int scan_step = std::max(1, (int)(scaled<coord_t>(1.0) / res));
-    // 3D scan step: coarser (4mm) since it's the fallback after skyline
-    int scan_step_3d = std::max(2, (int)(scaled<coord_t>(4.0) / res));
+    // 3D scan step: 2mm — fallback after skyline, needs decent resolution
+    // to find gaps in concave 3D arrangements
+    int scan_step_3d = std::max(2, (int)(scaled<coord_t>(2.0) / res));
 
     // Check whether an item's filament_temp_type is compatible with a plate's
     // assigned material_group. HighTemp (0) and LowTemp (1) cannot coexist.
@@ -1695,6 +1821,60 @@ void BitmapArranger::arrange(
                     arrangables[entries[i].orig_idx].bed_idx = -1;
                 } else {
                     stamp(verify_bits, bed_w_words, bed_w_px, bed_h_px, *cur_bmp, px, py);
+                }
+            }
+        }
+    }
+
+    // ============================================================
+    // PHASE 7: Nothing left behind — if multi-plate is enabled,
+    // every item MUST end up on a plate. Any item with bed_idx = -1
+    // gets placed on a new overflow plate via the standard placement
+    // path. This catches items that failed earlier due to collision
+    // bugs, overlap failsafe ejection, or edge cases.
+    // ============================================================
+    if (params.allow_multi_plate) {
+        std::vector<int> orphans;
+        for (size_t i = 0; i < arrangables.size(); i++) {
+            if (arrangables[i].bed_idx < 0)
+                orphans.push_back((int)i);
+        }
+        if (!orphans.empty()) {
+            BOOST_LOG_TRIVIAL(warning) << "BitmapArranger: " << orphans.size()
+                                       << " orphaned items — placing on overflow plates";
+            // Find matching entry index for each orphan
+            for (int orig_idx : orphans) {
+                int entry_idx = -1;
+                for (int j = 0; j < n; j++) {
+                    if ((int)entries[j].orig_idx == orig_idx) { entry_idx = j; break; }
+                }
+                if (entry_idx < 0) continue;
+
+                bool placed = false;
+                // Try all existing plates first
+                int n_existing = use_3d ? (int)plates_3d.size() : (int)plates.size();
+                for (int pi = 0; pi < n_existing && !placed; pi++) {
+                    if (use_3d && !rot_stacks_all[entry_idx].empty()) {
+                        placed = try_place_on_plate_3d(entries[entry_idx], rot_stacks_all[entry_idx], pi);
+                    } else if (!rot_bmps_all[entry_idx].empty()) {
+                        placed = try_place_on_plate(entries[entry_idx], rot_bmps_all[entry_idx], pi);
+                    }
+                }
+
+                // Still not placed — create a new plate
+                if (!placed) {
+                    int new_pi = use_3d ? new_3d_plate() : new_2d_plate();
+                    if (use_3d && !rot_stacks_all[entry_idx].empty()) {
+                        placed = try_place_on_plate_3d(entries[entry_idx], rot_stacks_all[entry_idx], new_pi);
+                    } else if (!rot_bmps_all[entry_idx].empty()) {
+                        placed = try_place_on_plate(entries[entry_idx], rot_bmps_all[entry_idx], new_pi);
+                    }
+                }
+
+                if (!placed) {
+                    // Truly cannot place (item larger than bed?) — log and leave unarranged
+                    BOOST_LOG_TRIVIAL(error) << "BitmapArranger: item " << orig_idx
+                                             << " cannot fit on any plate (larger than bed?)";
                 }
             }
         }
