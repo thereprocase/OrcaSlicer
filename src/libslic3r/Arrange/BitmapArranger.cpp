@@ -6,9 +6,6 @@
 #include <tbb/blocked_range.h>
 #include <atomic>
 #include <mutex>
-#include <thread>
-#include <condition_variable>
-#include <memory>
 
 // Coordinate systems used in this module:
 //   Scaled coords (coord_t): Slic3r internal units. 1mm = scaled(1.0).
@@ -1179,9 +1176,7 @@ void BitmapArranger::arrange(
                         base_bitmaps[i] = rasterize(entry.poly, entry.inflation, res);
                     }
 
-                    int done = rast_progress.fetch_add(1, std::memory_order_relaxed) + 1;
-                    if (params.progressind && (done % 4 == 0 || done == n))
-                        params.progressind(done, " (computing shapes)");
+                    rast_progress.fetch_add(1, std::memory_order_relaxed);
                     if (params.stopcondition && params.stopcondition())
                         rast_cancelled.store(true, std::memory_order_relaxed);
                 }
@@ -1189,6 +1184,10 @@ void BitmapArranger::arrange(
         );
 
         if (rast_cancelled.load()) return;
+
+        // Report progress from main thread (wxWidgets is not thread-safe)
+        if (params.progressind)
+            params.progressind(n, " (computing shapes)");
     }
 
     // ============================================================
@@ -1232,9 +1231,7 @@ void BitmapArranger::arrange(
                     }
                 }
 
-                int done = rot_progress.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (params.progressind && (done % 4 == 0 || done == n))
-                    params.progressind(done, " (preparing rotations)");
+                rot_progress.fetch_add(1, std::memory_order_relaxed);
                 if (params.stopcondition && params.stopcondition())
                     rot_cancelled.store(true, std::memory_order_relaxed);
             }
@@ -1242,6 +1239,10 @@ void BitmapArranger::arrange(
     );
 
     if (rot_cancelled.load()) return;
+
+    // Report progress from main thread (wxWidgets is not thread-safe)
+    if (params.progressind)
+        params.progressind(n, " (preparing rotations)");
 
     // Free the triangle and Z data — no longer needed after rasterization
     for (auto &entry : entries) {
@@ -1318,24 +1319,9 @@ void BitmapArranger::arrange(
 
     bool use_3d = params.nesting_3d;
 
-    // ============================================================
-    // Pipeline placement: each plate has its own thread.
-    //
-    // Plate 0's thread sweeps items largest-first. When an item doesn't
-    // fit, it's pushed to plate 1's queue. Plate 1's thread pulls items
-    // and places them, pushing rejects to plate 2, etc.
-    //
-    // Each thread owns its plate bitmap exclusively — zero contention
-    // on the hot path. The only shared structures are the concurrent
-    // queues between plates.
-    //
-    // Falls back to single-threaded when multi-plate is disabled.
-    // ============================================================
-
     // Plate-centric placement: fill one plate completely (largest to smallest),
-    // then move to the next. Proven reliable — the pipeline threading approach
-    // had vector invalidation races when plates.push_back() was called while
-    // other threads held references into the plates vector.
+    // then move to the next. Each sweep tries all unplaced items on the current
+    // plate. When nothing fits, create a new plate and sweep again.
     int current_plate = 0;
 
     for (;;) {
@@ -1350,7 +1336,7 @@ void BitmapArranger::arrange(
 
             if (use_3d && !rot_stacks_all[i].empty()) {
                 if (is_material_compatible(
-                        use_3d ? plates_3d[current_plate].material_group : -1,
+                        plates_3d[current_plate].material_group,
                         entry.filament_temp_type))
                     placed = try_place_on_plate_3d(entry, rot_stacks_all[i], current_plate);
             } else {
@@ -1392,10 +1378,6 @@ void BitmapArranger::arrange(
         }
     }
     done:
-
-    // ============================================================
-    // PHASE 4: Compaction — configurable strategies to reduce plate count
-    // ============================================================
 
     // ============================================================
     // PHASE 4: Compaction — parallel plate search
@@ -1595,7 +1577,6 @@ void BitmapArranger::arrange(
                         if (best_idx >= 0) {
                             auto &r = results[best_idx];
                             // Re-verify (plate may have changed if another item was committed)
-                            const auto &bmp = *candidates[0].bmp; // use matching ri
                             for (const auto &cand : candidates) {
                                 if (cand.ri == r.ri) {
                                     if (!collides(plates[r.plate_idx].bits, bed_w_words, bed_w_px, bed_h_px,
@@ -1667,43 +1648,9 @@ void BitmapArranger::arrange(
         }
     }
 
-    // ============================================================
-    // PHASE 5: Gravity — slide parts toward Y=0 to tighten layout
-    // ============================================================
-    if (!use_3d && params.gravity_compact) {
-        for (int i = 0; i < n; i++) {
-            if (!item_placed[i]) continue;
-            int pi = arrangables[entries[i].orig_idx].bed_idx;
-            if (pi < 0 || pi >= (int)plates.size()) continue;
-            if (rot_bmps_all[i].empty()) continue;
-
-            // Find the bitmap that matches the current rotation
-            double cur_rot = arrangables[entries[i].orig_idx].rotation;
-            const BitmapItem *cur_bmp = nullptr;
-            for (const auto &[bmp, rot] : rot_bmps_all[i]) {
-                if (std::abs(rot - cur_rot) < 0.01) { cur_bmp = &bmp; break; }
-            }
-            if (!cur_bmp || cur_bmp->width_px <= 0) continue;
-
-            // Current position in pixels
-            coord_t tx = arrangables[entries[i].orig_idx].translation.x();
-            coord_t ty = arrangables[entries[i].orig_idx].translation.y();
-            int cur_px = (int)((tx + cur_bmp->offset_x - effective_bed.min.x()) / res);
-            int cur_py = (int)((ty + cur_bmp->offset_y - effective_bed.min.y()) / res);
-
-            // Erase from bed bitmap
-            // (simple approach: rebuild bed from scratch for this plate — expensive but correct)
-            // Instead: just try lower Y positions and re-stamp if we find one
-            for (int try_y = 0; try_y < cur_py; try_y++) {
-                if (!collides(plates[pi].bits, bed_w_words, bed_w_px, bed_h_px, *cur_bmp, cur_px, try_y)) {
-                    // Found a lower valid position — but we can't move without un-stamping first
-                    // Skip gravity for now if it requires un-stamping (complex)
-                    // TODO: implement proper un-stamp + re-stamp
-                    break;
-                }
-            }
-        }
-    }
+    // PHASE 5: Gravity compaction — not yet implemented.
+    // Requires un-stamp + re-stamp to move items without leaving ghost pixels.
+    // Placeholder: the UI option exists but does nothing until this is built.
 
     // ============================================================
     // PHASE 6: Overlap safety check — paranoid failsafe
@@ -1741,11 +1688,11 @@ void BitmapArranger::arrange(
                 int py = (int)((ty + cur_bmp->offset_y - effective_bed.min.y()) / res);
 
                 if (collides(verify_bits, bed_w_words, bed_w_px, bed_h_px, *cur_bmp, px, py)) {
-                    // Overlap detected — move item to unarranged
+                    // Overlap detected — mark as unarranged so the GUI shows it as failed
                     BOOST_LOG_TRIVIAL(error) << "BitmapArranger: OVERLAP detected for item "
                                              << entries[i].orig_idx << " on plate " << pi
-                                             << " — moving to new plate as failsafe";
-                    arrangables[entries[i].orig_idx].bed_idx = n_plates_check;
+                                             << " — marking unarranged as failsafe";
+                    arrangables[entries[i].orig_idx].bed_idx = -1;
                 } else {
                     stamp(verify_bits, bed_w_words, bed_w_px, bed_h_px, *cur_bmp, px, py);
                 }
