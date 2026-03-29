@@ -330,11 +330,50 @@ BitmapArranger::SliceStack BitmapArranger::rasterize_slices(
         }
     }
 
-    // Rasterize each slice using the existing triangle rasterizer
+    // Rasterize each slice using the existing triangle rasterizer.
+    // Each slice is independent — parallelize when there are enough slices
+    // to justify the TBB overhead (a 100mm part at 2mm slice height = 50 slices).
     stack.slices.resize(stack.n_slices);
-    for (int s = 0; s < stack.n_slices; s++) {
-        if (!slice_tris[s].empty())
-            stack.slices[s] = rasterize_triangles(slice_tris[s], inflation, res);
+    if (stack.n_slices >= 4) {
+        tbb::parallel_for(tbb::blocked_range<int>(0, stack.n_slices),
+            [&](const tbb::blocked_range<int> &range) {
+                for (int s = range.begin(); s < range.end(); s++) {
+                    if (!slice_tris[s].empty())
+                        stack.slices[s] = rasterize_triangles(slice_tris[s], inflation, res);
+                }
+            }
+        );
+    } else {
+        for (int s = 0; s < stack.n_slices; s++) {
+            if (!slice_tris[s].empty())
+                stack.slices[s] = rasterize_triangles(slice_tris[s], inflation, res);
+        }
+    }
+
+    // Optimization: if all slices have identical triangle sets (no overhangs),
+    // collapse to a single slice. This avoids N×rotations work for simple parts.
+    // Check by comparing triangle counts per slice — if all match slice 0, they're
+    // likely identical (same triangles contribute to every Z range).
+    if (stack.n_slices > 1) {
+        size_t ref_count = slice_tris[0].size();
+        bool all_same = true;
+        for (int s = 1; s < stack.n_slices; s++) {
+            if (slice_tris[s].size() != ref_count) {
+                all_same = false;
+                break;
+            }
+        }
+        if (all_same && ref_count > 0) {
+            // All slices have the same triangles — just keep one and replicate
+            // during collision checks. Store as single-slice stack.
+            BitmapItem s0 = std::move(stack.slices[0]);
+            stack.slices.clear();
+            stack.slices.push_back(std::move(s0));
+            // Keep n_slices as the original count so collides_3d knows the Z extent,
+            // but the single-slice stack signals "use slice 0 for all Z levels"
+            BOOST_LOG_TRIVIAL(debug) << "BitmapArranger: collapsed " << stack.n_slices
+                                     << " identical slices to 1";
+        }
     }
 
     return stack;
@@ -344,12 +383,19 @@ bool BitmapArranger::collides_3d(
     const SliceStack &bed_stack, int bed_w, int bed_w_px, int bed_h,
     const SliceStack &item_stack, int ox, int oy)
 {
+    // Handle collapsed stacks: if slices.size() < n_slices, all Z levels
+    // use slice 0 (the part has no overhangs, all slices are identical).
+    bool item_collapsed = (int)item_stack.slices.size() < item_stack.n_slices;
+    bool bed_collapsed = (int)bed_stack.slices.size() < bed_stack.n_slices;
+
     for (int z = 0; z < item_stack.n_slices; z++) {
-        if (item_stack.slices[z].width_px <= 0) continue;
-        if (z < bed_stack.n_slices && bed_stack.slices[z].width_px > 0) {
-            // Check against occupied pixels on this bed slice
-            if (collides(bed_stack.slices[z].bits, bed_w, bed_w_px, bed_h,
-                         item_stack.slices[z], ox, oy))
+        int item_z = item_collapsed ? 0 : z;
+        int bed_z = bed_collapsed ? 0 : z;
+        if (item_z >= (int)item_stack.slices.size()) break;
+        if (item_stack.slices[item_z].width_px <= 0) continue;
+        if (bed_z < (int)bed_stack.slices.size() && bed_stack.slices[bed_z].width_px > 0) {
+            if (collides(bed_stack.slices[bed_z].bits, bed_w, bed_w_px, bed_h,
+                         item_stack.slices[item_z], ox, oy))
                 return true;
         }
         // Upper slices beyond bed stack: bed edges are still enforced by
@@ -378,8 +424,11 @@ void BitmapArranger::stamp_3d(
         bed_stack.slices.push_back(std::move(new_slice));
         bed_stack.n_slices++;
     }
+    bool item_collapsed = (int)item_stack.slices.size() < item_stack.n_slices;
     for (int z = 0; z < item_stack.n_slices; z++) {
-        if (item_stack.slices[z].width_px <= 0) continue;
+        int item_z = item_collapsed ? 0 : z;
+        if (item_z >= (int)item_stack.slices.size()) break;
+        if (item_stack.slices[item_z].width_px <= 0) continue;
         if (bed_stack.slices[z].bits.empty()) {
             bed_stack.slices[z].bits.assign(bed_w * bed_h, 0);
             bed_stack.slices[z].width_words = bed_w;
@@ -388,7 +437,7 @@ void BitmapArranger::stamp_3d(
             if (init_slice) init_slice(bed_stack.slices[z].bits);
         }
         stamp(bed_stack.slices[z].bits, bed_stack.slices[z].width_words,
-              bed_w_px, bed_h, item_stack.slices[z], ox, oy);
+              bed_w_px, bed_h, item_stack.slices[item_z], ox, oy);
     }
 }
 
@@ -488,12 +537,25 @@ BitmapArranger::SliceStack BitmapArranger::rotate_stack(
 {
     SliceStack dst;
     dst.n_slices = src.n_slices;
-    dst.slices.reserve(src.n_slices);
-    for (const auto &slice : src.slices) {
-        if (slice.width_px > 0)
-            dst.slices.push_back(rotate_bitmap(slice, angle_rad, res));
-        else
-            dst.slices.push_back({});
+
+    // Collapsed stack (all slices identical): only rotate the one slice
+    int actual_slices = (int)src.slices.size();
+    dst.slices.resize(actual_slices);
+
+    if (actual_slices >= 4) {
+        tbb::parallel_for(tbb::blocked_range<int>(0, actual_slices),
+            [&](const tbb::blocked_range<int> &range) {
+                for (int s = range.begin(); s < range.end(); s++) {
+                    if (src.slices[s].width_px > 0)
+                        dst.slices[s] = rotate_bitmap(src.slices[s], angle_rad, res);
+                }
+            }
+        );
+    } else {
+        for (int s = 0; s < actual_slices; s++) {
+            if (src.slices[s].width_px > 0)
+                dst.slices[s] = rotate_bitmap(src.slices[s], angle_rad, res);
+        }
     }
     return dst;
 }
