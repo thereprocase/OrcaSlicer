@@ -3348,10 +3348,12 @@ void ModelInstance::get_arrange_polygon(void *ap, const Slic3r::DynamicPrintConf
                 ret.concave_triangles.emplace_back(scaled<coord_t>(p0.x()), scaled<coord_t>(p0.y()));
                 ret.concave_triangles.emplace_back(scaled<coord_t>(p1.x()), scaled<coord_t>(p1.y()));
                 ret.concave_triangles.emplace_back(scaled<coord_t>(p2.x()), scaled<coord_t>(p2.y()));
-                // Store Z coords for 3D-aware nesting (parallel array)
-                ret.concave_z.push_back(p0.z());
-                ret.concave_z.push_back(p1.z());
-                ret.concave_z.push_back(p2.z());
+                // Store Z coords for 3D-aware nesting (parallel array).
+                // Clamp to z=0 — parts sunk into the bed are intentional,
+                // the below-bed portion is trimmed, not moved.
+                ret.concave_z.push_back(std::max(0.f, p0.z()));
+                ret.concave_z.push_back(std::max(0.f, p1.z()));
+                ret.concave_z.push_back(std::max(0.f, p2.z()));
             }
         }
     }

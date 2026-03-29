@@ -337,36 +337,48 @@ bool BitmapArranger::collides_3d(
     const SliceStack &bed_stack, int bed_w, int bed_w_px, int bed_h,
     const SliceStack &item_stack, int ox, int oy)
 {
-    int check_slices = std::min(bed_stack.n_slices, item_stack.n_slices);
-    for (int z = 0; z < check_slices; z++) {
+    for (int z = 0; z < item_stack.n_slices; z++) {
         if (item_stack.slices[z].width_px <= 0) continue;
-        if (bed_stack.slices[z].width_px <= 0) continue;
-        if (collides(bed_stack.slices[z].bits, bed_w, bed_w_px, bed_h,
-                     item_stack.slices[z], ox, oy))
-            return true;
+        if (z < bed_stack.n_slices && bed_stack.slices[z].width_px > 0) {
+            // Check against occupied pixels on this bed slice
+            if (collides(bed_stack.slices[z].bits, bed_w, bed_w_px, bed_h,
+                         item_stack.slices[z], ox, oy))
+                return true;
+        }
+        // Upper slices beyond bed stack: bed edges are still enforced by
+        // collides() bounds checking (out-of-bitmap = collision), so items
+        // can't extend past the build volume. No explicit check needed here
+        // because find_placement constrains ox/oy to valid bitmap positions.
     }
-    // If item has more slices than bed, those upper slices are free — no collision
     return false;
 }
 
 void BitmapArranger::stamp_3d(
     SliceStack &bed_stack, int bed_w, int bed_w_px, int bed_h,
-    const SliceStack &item_stack, int ox, int oy)
+    const SliceStack &item_stack, int ox, int oy,
+    const std::function<void(std::vector<uint64_t>&)> &init_slice)
 {
     // Extend bed stack if item is taller
     while (bed_stack.n_slices < item_stack.n_slices) {
-        bed_stack.slices.push_back({}); // empty slice
+        BitmapItem new_slice;
+        new_slice.bits.assign(bed_w * bed_h, 0);
+        new_slice.width_words = bed_w;
+        new_slice.width_px = bed_w_px;
+        new_slice.height_px = bed_h;
+        // Stamp physical obstacles (cut notch, fixed items) on new slices.
+        // Bed edges are enforced by bitmap dimensions in collides().
+        if (init_slice) init_slice(new_slice.bits);
+        bed_stack.slices.push_back(std::move(new_slice));
         bed_stack.n_slices++;
     }
     for (int z = 0; z < item_stack.n_slices; z++) {
         if (item_stack.slices[z].width_px <= 0) continue;
         if (bed_stack.slices[z].bits.empty()) {
-            // Initialize this bed slice bitmap
-            int bed_w_words_local = (bed_w_px + 63) / 64;
-            bed_stack.slices[z].bits.assign(bed_w_words_local * bed_h, 0);
-            bed_stack.slices[z].width_words = bed_w_words_local;
+            bed_stack.slices[z].bits.assign(bed_w * bed_h, 0);
+            bed_stack.slices[z].width_words = bed_w;
             bed_stack.slices[z].width_px = bed_w_px;
             bed_stack.slices[z].height_px = bed_h;
+            if (init_slice) init_slice(bed_stack.slices[z].bits);
         }
         stamp(bed_stack.slices[z].bits, bed_stack.slices[z].width_words,
               bed_w_px, bed_h, item_stack.slices[z], ox, oy);
@@ -824,7 +836,7 @@ void BitmapArranger::arrange(
                 };
                 arrangables[entry.orig_idx].rotation = rot;
                 arrangables[entry.orig_idx].bed_idx = plate_idx;
-                stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py);
+                stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
                 if (plates_3d[plate_idx].material_group < 0)
                     plates_3d[plate_idx].material_group = entry.filament_temp_type;
                 return true;

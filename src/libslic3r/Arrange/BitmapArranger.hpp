@@ -88,10 +88,12 @@ private:
                             int bed_w, int bed_w_px, int bed_h,
                             const SliceStack &item_stack, int ox, int oy);
 
-    // 3D stamp: stamp all Z slices.
+    // 3D stamp: stamp all Z slices. init_slice is called on newly created
+    // slices to stamp physical obstacles (cut notch, fixed items).
     static void stamp_3d(SliceStack &bed_stack,
                          int bed_w, int bed_w_px, int bed_h,
-                         const SliceStack &item_stack, int ox, int oy);
+                         const SliceStack &item_stack, int ox, int oy,
+                         const std::function<void(std::vector<uint64_t>&)> &init_slice = nullptr);
 
     // 3D find_placement: center-out scan with per-slice collision.
     static std::optional<std::pair<int,int>> find_placement_3d(
