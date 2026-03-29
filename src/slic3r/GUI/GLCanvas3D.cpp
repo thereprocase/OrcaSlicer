@@ -6126,6 +6126,12 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     }
 
     ImGui::Separator();
+    // Debug version tag — helps confirm which build is running during testing
+    if (settings_out.use_concave_hulls) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 0.8f));
+        imgui->text("bitmap arranger dev");
+        ImGui::PopStyleColor();
+    }
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(15.0f, 10.0f));
     if (imgui->button(_L("Arrange"))) {
         wxGetApp().plater()->set_prepare_state(Job::PREPARE_STATE_DEFAULT);

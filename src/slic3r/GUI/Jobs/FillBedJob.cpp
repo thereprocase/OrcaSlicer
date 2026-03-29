@@ -54,7 +54,7 @@ void FillBedJob::prepare()
         {
             bool selected = (oidx == m_object_idx);
 
-            ArrangePolygon ap = get_instance_arrange_poly(mo->instances[inst_idx], global_config);
+            ArrangePolygon ap = get_instance_arrange_poly(mo->instances[inst_idx], global_config, params.use_concave_hulls);
             BoundingBox ap_bb = ap.transformed_poly().contour.bounding_box();
             ap.name = mo->name;
 
@@ -160,14 +160,18 @@ void FillBedJob::prepare()
     double fixed_area = unsel_area + m_selected.size() * poly_area;
     double bed_area   = Polygon{m_bedpts}.area() / sc;
 
-    // This is the maximum number of items, the real number will always be close but less.
+    // Estimate how many copies can fit. Area ratio assumes 100% packing density.
+    // For concave parts that interlock, actual density can exceed this estimate,
+    // so pad the count to give the arranger enough candidates.
     int needed_items = (bed_area - fixed_area) / poly_area;
+    if (params.use_concave_hulls && needed_items > 0)
+        needed_items = static_cast<int>(needed_items * 1.25) + 2;
 
     //int sel_id = m_plater->get_selection().get_instance_idx();
     // if the selection is not a single instance, choose the first as template
     //sel_id = std::max(sel_id, 0);
     ModelInstance *mi = model_object->instances[sel_id];
-    ArrangePolygon template_ap = get_instance_arrange_poly(mi, global_config);
+    ArrangePolygon template_ap = get_instance_arrange_poly(mi, global_config, params.use_concave_hulls);
 
     int obj_idx;
     double offset_base, offset;
@@ -253,7 +257,11 @@ void FillBedJob::process(Ctl &ctl)
     // final align用的是凸包，在有fixed item的情况下可能找到的参考点位置是错的，这里就不做了。见STUDIO-3265
     params.do_final_align = !is_bbl;
 
-    if (m_selected.size() > 100){
+    // Grid bypass threshold: libnest2d gets slow at high item counts, but
+    // BitmapArranger handles large counts fine (O(bed_pixels) per item).
+    // Raise the threshold for concave mode so the bitmap packer handles it.
+    size_t grid_bypass_threshold = params.use_concave_hulls ? 500 : 100;
+    if (m_selected.size() > grid_bypass_threshold){
         // too many items, just find grid empty cells to put them
         Vec2f step = unscaled<float>(get_extents(m_selected.front().poly).size()) + Vec2f(m_selected.front().brim_width, m_selected.front().brim_width);
         std::vector<Vec2f> empty_cells = Plater::get_empty_cells(step);

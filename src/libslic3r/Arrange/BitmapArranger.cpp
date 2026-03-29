@@ -60,6 +60,9 @@ namespace {
 // 64M words * 8 bytes = 512MB max bitmap allocation per plate
 constexpr size_t MAX_BITMAP_WORDS = 64'000'000u;
 
+// Build version for debug — update each commit during development
+static const char* BITMAP_ARRANGE_VERSION = "dev-337350405b";
+
 #ifdef _MSC_VER
 #include <intrin.h>
 // Count trailing zeros. Precondition: x != 0 (callers must guard).
@@ -1007,6 +1010,59 @@ tier2:
     }
 }
 
+// Polygon bed overload: compute bounding box, delegate to BoundingBox overload,
+// then mask pixels outside the polygon as occupied.
+void BitmapArranger::arrange(
+    ArrangePolygons &arrangables,
+    const ArrangePolygons &excludes,
+    const Polygon &bed_shape,
+    const ArrangeParams &params)
+{
+    // Store the bed polygon for masking — the BoundingBox overload will use it
+    // if present. We pass it via a modified ArrangeParams with bed_polygon set.
+    // Actually, simpler: just call the BoundingBox overload and handle the masking
+    // by adding the bed boundary as an exclude.
+    //
+    // Approach: rasterize the bed polygon, invert it, and treat the inverted
+    // bitmap as an exclusion region. This marks all pixels OUTSIDE the polygon
+    // as occupied, so items can only be placed inside.
+    //
+    // We do this by computing the bounding box, calling the main arrange with
+    // an augmented excludes list that includes the bed boundary mask.
+
+    BoundingBox bb = get_extents(bed_shape);
+
+    // Create an ExPolygon that represents the area OUTSIDE the bed polygon
+    // within the bounding box. This is: bounding box minus bed polygon.
+    // We'll add this as an exclude region.
+    Polygon bb_rect;
+    bb_rect.points = {
+        {bb.min.x(), bb.min.y()},
+        {bb.max.x(), bb.min.y()},
+        {bb.max.x(), bb.max.y()},
+        {bb.min.x(), bb.max.y()}
+    };
+
+    // The bed shape is the hole in the bounding box rectangle
+    Polygon bed_hole = bed_shape;
+    bed_hole.make_clockwise(); // holes must be clockwise
+
+    ExPolygon outside_bed(bb_rect);
+    outside_bed.holes.push_back(bed_hole);
+
+    // Add the outside-bed region as an exclude
+    ArrangePolygons augmented_excludes = excludes;
+    ArrangePolygon bed_mask_exclude;
+    bed_mask_exclude.poly = outside_bed;
+    bed_mask_exclude.translation = {0, 0};
+    bed_mask_exclude.rotation = 0;
+    bed_mask_exclude.bed_idx = 0;
+    augmented_excludes.push_back(bed_mask_exclude);
+
+    // Delegate to the BoundingBox overload
+    arrange(arrangables, augmented_excludes, bb, params);
+}
+
 void BitmapArranger::arrange(
     ArrangePolygons &arrangables,
     const ArrangePolygons &excludes,
@@ -1048,6 +1104,7 @@ void BitmapArranger::arrange(
 
     ArrangeLog::instance().begin_session("BitmapArranger");
 
+    ARRANGE_LOG("version " << BITMAP_ARRANGE_VERSION);
     ARRANGE_LOG("bed " << bed_w_px << "x" << bed_h_px
                 << " px, res " << params.bitmap_resolution_mm << " mm/px"
                 << ", " << arrangables.size() << " items"
@@ -1500,15 +1557,38 @@ void BitmapArranger::arrange(
                             const auto &item_s0 = stack.slices[0];
                             auto profile = compute_profile(item_s0, bed_h_px);
 
-                            arrangables[entry.orig_idx].translation = {
-                                effective_bed.min.x() + (coord_t)(cx * res) - item_s0.offset_x,
-                                effective_bed.min.y() + (coord_t)(best_y * res) - item_s0.offset_y
-                            };
+                            coord_t tx = effective_bed.min.x() + (coord_t)(cx * res) - item_s0.offset_x;
+                            coord_t ty = effective_bed.min.y() + (coord_t)(best_y * res) - item_s0.offset_y;
+                            arrangables[entry.orig_idx].translation = {tx, ty};
                             arrangables[entry.orig_idx].rotation = rot;
                             arrangables[entry.orig_idx].bed_idx = plate_idx;
                             stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, cx, best_y, stamp_excludes);
                             if (plates_3d[plate_idx].material_group < 0)
                                 plates_3d[plate_idx].material_group = entry.filament_temp_type;
+
+                            // Boundary debug: check if any slice extends past bed
+                            for (int sz = 0; sz < (int)stack.slices.size(); sz++) {
+                                const auto &sl = stack.slices[sz];
+                                if (sl.width_px <= 0) continue;
+                                coord_t right = tx + sl.offset_x + (coord_t)(sl.width_px * res) - effective_bed.min.x();
+                                coord_t top_edge = ty + sl.offset_y + (coord_t)(sl.height_px * res) - effective_bed.min.y();
+                                coord_t bed_right = effective_bed.max.x() - effective_bed.min.x();
+                                coord_t bed_top = effective_bed.max.y() - effective_bed.min.y();
+                                if (right > bed_right || top_edge > bed_top) {
+                                    ARRANGE_LOG("3D BOUNDARY WARNING: item " << entry.orig_idx
+                                        << " slice " << sz << " extends past bed"
+                                        << " right=" << (double)right/1000000. << "mm"
+                                        << " bed_right=" << (double)bed_right/1000000. << "mm"
+                                        << " top=" << (double)top_edge/1000000. << "mm"
+                                        << " bed_top=" << (double)bed_top/1000000. << "mm"
+                                        << " cx=" << cx << " best_y=" << best_y
+                                        << " s0_offset=(" << (double)item_s0.offset_x/1000000.
+                                        << "," << (double)item_s0.offset_y/1000000. << ")"
+                                        << " s0_size=" << item_s0.width_px << "x" << item_s0.height_px);
+                                    break;
+                                }
+                            }
+
                             return true;
                         }
                     }
@@ -1520,7 +1600,9 @@ void BitmapArranger::arrange(
         return false;
     };
 
-    constexpr int MAX_PLATES = 100;
+    // Must match MAX_PLATE_COUNT in src/slic3r/GUI/PartPlate.hpp.
+    // Can't include that header from libslic3r (dependency direction).
+    constexpr int MAX_PLATES = 36;
     int n = (int)entries.size();
 
     // ============================================================
@@ -1968,7 +2050,9 @@ void BitmapArranger::arrange(
                     item_placed[idx] = true;
                     placed_count++;
                 } else if (params.allow_multi_plate) {
-                    // Create new plate for this reject
+                    // Create new plate for this reject (if under limit)
+                    int n_cur = use_3d ? (int)plates_3d.size() : (int)plates.size();
+                    if (n_cur >= MAX_PLATES) continue; // all plates full
                     int new_pi = use_3d ? new_3d_plate() : new_2d_plate();
                     if (use_3d && !rot_stacks_all[idx].empty()) {
                         if (try_place_on_plate_3d(entry, rot_stacks_all[idx], new_pi)) {
@@ -2201,6 +2285,9 @@ void BitmapArranger::arrange(
                         }
                     }
                 }
+
+                if (params.progressind)
+                    params.progressind(placed_count + failed_count, " (compacting 3D)");
             }
 
             if (moved > 0 && moved == (int)last_plate_items.size()) {
@@ -2359,6 +2446,9 @@ void BitmapArranger::arrange(
                         }
                     }
                 }
+
+                if (params.progressind)
+                    params.progressind(placed_count + failed_count, " (compacting)");
             }
 
             if (moved > 0 && moved == (int)last_plate_items.size()) {
@@ -2504,20 +2594,23 @@ void BitmapArranger::arrange(
                     }
                 }
 
-                // Still not placed — create a new plate
+                // Still not placed — create a new plate if under the limit
                 if (!placed) {
-                    int new_pi = use_3d ? new_3d_plate() : new_2d_plate();
-                    if (use_3d && !rot_stacks_all[entry_idx].empty()) {
-                        placed = try_place_on_plate_3d(entries[entry_idx], rot_stacks_all[entry_idx], new_pi);
-                    } else if (!rot_bmps_all[entry_idx].empty()) {
-                        placed = try_place_on_plate(entries[entry_idx], entry_idx, rot_bmps_all[entry_idx], new_pi);
+                    int n_cur = use_3d ? (int)plates_3d.size() : (int)plates.size();
+                    if (n_cur < MAX_PLATES) {
+                        int new_pi = use_3d ? new_3d_plate() : new_2d_plate();
+                        if (use_3d && !rot_stacks_all[entry_idx].empty()) {
+                            placed = try_place_on_plate_3d(entries[entry_idx], rot_stacks_all[entry_idx], new_pi);
+                        } else if (!rot_bmps_all[entry_idx].empty()) {
+                            placed = try_place_on_plate(entries[entry_idx], entry_idx, rot_bmps_all[entry_idx], new_pi);
+                        }
                     }
                 }
 
                 if (!placed) {
-                    // Truly cannot place (item larger than bed?) — log and leave unarranged
-                    BOOST_LOG_TRIVIAL(error) << "BitmapArranger: item " << orig_idx
-                                             << " cannot fit on any plate (larger than bed?)";
+                    // All 36 plates full or item can't fit — leave unarranged
+                    BOOST_LOG_TRIVIAL(warning) << "BitmapArranger: item " << orig_idx
+                                               << " — all plates full, leaving unarranged";
                 }
             }
         }

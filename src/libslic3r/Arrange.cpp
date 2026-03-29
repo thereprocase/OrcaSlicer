@@ -1158,44 +1158,111 @@ void arrange(ArrangePolygons &      arrangables,
     }
 }
 
+// CircleBed: approximate as 64-gon polygon, route to BitmapArranger for concave mode
+void arrange(ArrangePolygons &      arrangables,
+             const ArrangePolygons &excludes,
+             const CircleBed &      bed,
+             const ArrangeParams &  params)
+{
+    if (params.use_concave_hulls && !params.is_seq_print) {
+        // Convert circle to polygon approximation
+        Polygon circle_poly;
+        constexpr int N = 64;
+        double r = bed.radius();
+        Point c = bed.center();
+        circle_poly.points.reserve(N);
+        for (int i = 0; i < N; i++) {
+            double angle = 2.0 * PI * i / N;
+            circle_poly.points.push_back({
+                c.x() + (coord_t)(r * std::cos(angle)),
+                c.y() + (coord_t)(r * std::sin(angle))
+            });
+        }
+        BitmapArranger::arrange(arrangables, excludes, circle_poly, params);
+        return;
+    }
+
+    // Fall through to libnest2d
+    namespace clppr = Slic3r::ClipperLib;
+    std::vector<Item> items, fixeditems;
+    items.reserve(arrangables.size());
+    for (ArrangePolygon &arrangeable : arrangables)
+        process_arrangeable(arrangeable, items);
+    for (const ArrangePolygon &fixed: excludes)
+        process_arrangeable(fixed, fixeditems);
+    for (Item &itm : fixeditems) itm.inflate(scaled(-2. * EPSILON));
+    _arrange(items, fixeditems, to_nestbin(bed), params, params.progressind, params.stopcondition);
+    for(size_t i = 0; i < items.size(); ++i) {
+        Point tr = items[i].translation();
+        arrangables[i].translation = {coord_t(tr.x()), coord_t(tr.y())};
+        arrangables[i].rotation    = items[i].rotation();
+        arrangables[i].bed_idx     = items[i].binId();
+        arrangables[i].itemid      = items[i].itemId();
+    }
+}
+
+// Polygon bed: route to BitmapArranger for concave mode
+void arrange(ArrangePolygons &      arrangables,
+             const ArrangePolygons &excludes,
+             const Polygon &        bed,
+             const ArrangeParams &  params)
+{
+    if (params.use_concave_hulls && !params.is_seq_print) {
+        BitmapArranger::arrange(arrangables, excludes, bed, params);
+        return;
+    }
+
+    // Fall through to libnest2d
+    namespace clppr = Slic3r::ClipperLib;
+    std::vector<Item> items, fixeditems;
+    items.reserve(arrangables.size());
+    for (ArrangePolygon &arrangeable : arrangables)
+        process_arrangeable(arrangeable, items);
+    for (const ArrangePolygon &fixed: excludes)
+        process_arrangeable(fixed, fixeditems);
+    for (Item &itm : fixeditems) itm.inflate(scaled(-2. * EPSILON));
+    _arrange(items, fixeditems, to_nestbin(bed), params, params.progressind, params.stopcondition);
+    for(size_t i = 0; i < items.size(); ++i) {
+        Point tr = items[i].translation();
+        arrangables[i].translation = {coord_t(tr.x()), coord_t(tr.y())};
+        arrangables[i].rotation    = items[i].rotation();
+        arrangables[i].bed_idx     = items[i].binId();
+        arrangables[i].itemid      = items[i].itemId();
+    }
+}
+
+// Generic fallback for InfiniteBed and any other bed types
+// that don't have explicit specializations above.
+// Uses libnest2d — no bitmap arranger support.
 template<class BedT>
 void arrange(ArrangePolygons &      arrangables,
              const ArrangePolygons &excludes,
              const BedT &           bed,
              const ArrangeParams &  params)
 {
-    if (params.use_concave_hulls) {
-        BOOST_LOG_TRIVIAL(warning) << "BitmapArranger: concave hulls only supported for rectangular beds, falling back to convex";
-    }
-
     namespace clppr = Slic3r::ClipperLib;
-
     std::vector<Item> items, fixeditems;
     items.reserve(arrangables.size());
-
     for (ArrangePolygon &arrangeable : arrangables)
         process_arrangeable(arrangeable, items);
-
     for (const ArrangePolygon &fixed: excludes)
         process_arrangeable(fixed, fixeditems);
-
     for (Item &itm : fixeditems) itm.inflate(scaled(-2. * EPSILON));
-
     _arrange(items, fixeditems, to_nestbin(bed), params, params.progressind, params.stopcondition);
-
     for(size_t i = 0; i < items.size(); ++i) {
         Point tr = items[i].translation();
         arrangables[i].translation = {coord_t(tr.x()), coord_t(tr.y())};
         arrangables[i].rotation    = items[i].rotation();
         arrangables[i].bed_idx     = items[i].binId();
-        arrangables[i].itemid      = items[i].itemId();  // arrange order is useful for sequential printing
+        arrangables[i].itemid      = items[i].itemId();
     }
 }
 
-// BoundingBox specialization is defined above (with bitmap arranger support)
-template void arrange(ArrangePolygons &items, const ArrangePolygons &excludes, const CircleBed &bed, const ArrangeParams &params);
-template void arrange(ArrangePolygons &items, const ArrangePolygons &excludes, const Polygon &bed, const ArrangeParams &params);
 template void arrange(ArrangePolygons &items, const ArrangePolygons &excludes, const InfiniteBed &bed, const ArrangeParams &params);
+
+// Note: CircleBed and Polygon are handled by the non-template overloads
+// above (which route to BitmapArranger when concave mode is on).
+// The template is NOT instantiated for these types.
 
 } // namespace arr
 } // namespace Slic3r

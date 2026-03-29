@@ -45,10 +45,20 @@ public:
 
     // Run the bitmap arrangement.
     // Modifies arrangables in-place (translation, rotation, bed_idx).
+    // BoundingBox overload: rectangular beds (most common).
     static void arrange(
         ArrangePolygons &arrangables,
         const ArrangePolygons &excludes,
         const BoundingBox &bed,
+        const ArrangeParams &params);
+
+    // Polygon overload: non-rectangular beds (circular, delta, clipped corners).
+    // Computes bounding box internally, then masks pixels outside the polygon
+    // as occupied before placing any items.
+    static void arrange(
+        ArrangePolygons &arrangables,
+        const ArrangePolygons &excludes,
+        const Polygon &bed_shape,
         const ArrangeParams &params);
 
 private:
