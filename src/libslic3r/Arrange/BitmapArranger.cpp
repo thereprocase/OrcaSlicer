@@ -1224,6 +1224,11 @@ void BitmapArranger::arrange(
 
             if (last_plate_items.empty()) break;
 
+            // Use bitmap collision scanning (not skyline) for compaction.
+            // Skyline already said "no" for these items — the gaps are BELOW
+            // the skyline in concave regions. Bitmap scanning finds them.
+            int scan_step_compact = std::max(1, (int)(scaled<coord_t>(1.0) / res));
+
             int moved = 0;
             for (int idx : last_plate_items) {
                 auto &entry = entries[idx];
@@ -1232,13 +1237,36 @@ void BitmapArranger::arrange(
                 for (int pi = 0; pi < last_plate; pi++) {
                     if (!is_material_compatible(plates[pi].material_group, entry.filament_temp_type))
                         continue;
-                    if (try_place_on_plate(entry, rot_bmps_all[idx], pi)) {
-                        relocated = true;
-                        moved++;
-                        break;
+
+                    // Try each rotation variant with bitmap scanning
+                    for (const auto &[bmp, rot] : rot_bmps_all[idx]) {
+                        if (bmp.width_px <= 0 || bmp.height_px <= 0) continue;
+                        auto result = find_placement(plates[pi].bits, bed_w_words, bed_w_px, bed_h_px,
+                                                     bmp, scan_step_compact);
+                        if (result) {
+                            auto [px, py] = *result;
+                            arrangables[entry.orig_idx].translation = {
+                                effective_bed.min.x() + (coord_t)(px * res) - bmp.offset_x,
+                                effective_bed.min.y() + (coord_t)(py * res) - bmp.offset_y
+                            };
+                            arrangables[entry.orig_idx].rotation = rot;
+                            arrangables[entry.orig_idx].bed_idx = pi;
+                            stamp(plates[pi].bits, bed_w_words, bed_w_px, bed_h_px, bmp, px, py);
+                            // Update skyline for this plate
+                            auto profile = compute_profile(bmp, bed_h_px);
+                            for (const auto &[col, top] : profile.top_pairs) {
+                                int c = px + col;
+                                int v = py + top;
+                                if (c < bed_w_px && v > plates[pi].skyline[c])
+                                    plates[pi].skyline[c] = v;
+                            }
+                            relocated = true;
+                            moved++;
+                            break;
+                        }
                     }
+                    if (relocated) break;
                 }
-                // If not relocated, it stays on the last plate
             }
 
             if (moved > 0 && moved == (int)last_plate_items.size()) {
