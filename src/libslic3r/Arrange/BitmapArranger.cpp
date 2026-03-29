@@ -61,7 +61,7 @@ namespace {
 constexpr size_t MAX_BITMAP_WORDS = 64'000'000u;
 
 // Build version for debug — update each commit during development
-static const char* BITMAP_ARRANGE_VERSION = "dev-337350405b";
+static const char* BITMAP_ARRANGE_VERSION = "dev-92189a7b8e";
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -1512,12 +1512,22 @@ void BitmapArranger::arrange(
 
         // Try all rotations' skyline positions, pick best Y across all rotations
         // at each of top-K candidate X positions.
-        // Use the first rotation's profile for candidate generation (all rotations
-        // have similar width since they share the same global bounding box).
-        if (!rot_stacks.empty() && !rot_stacks[0].first.slices.empty()) {
-            const auto &first_s0 = rot_stacks[0].first.slices[0];
-            if (first_s0.width_px > 0) {
-                auto envelope_profile = compute_profile(first_s0, bed_h_px);
+        // Use the WIDEST rotation for candidate generation so the X constraint
+        // is safe for all rotations. Per-rotation bounds checks reject rotations
+        // that don't fit at a given candidate position.
+        {
+            // Find the widest rotation to build the envelope profile
+            int max_w = 0, widest_ri = -1;
+            for (size_t ri = 0; ri < rot_stacks.size(); ri++) {
+                const auto &[stack, rot] = rot_stacks[ri];
+                if (stack.slices.empty()) continue;
+                const auto &s0 = stack.slices[0];
+                if (s0.width_px > max_w) { max_w = s0.width_px; widest_ri = (int)ri; }
+            }
+
+            if (widest_ri >= 0 && max_w > 0) {
+                const auto &widest_s0 = rot_stacks[widest_ri].first.slices[0];
+                auto envelope_profile = compute_profile(widest_s0, bed_h_px);
                 if (envelope_profile.max_y >= 0) {
                     auto candidates = find_skyline_topk(sky, envelope_profile, 5);
 
@@ -1531,17 +1541,22 @@ void BitmapArranger::arrange(
                             const auto &item_s0 = stack.slices[0];
                             if (item_s0.width_px <= 0) continue;
 
+                            // Per-rotation bounds check: this rotation must fit
+                            // within the bed at this candidate X position
+                            if (cx + item_s0.width_px > bed_w_px) continue;
+
                             auto profile = compute_profile(item_s0, bed_h_px);
                             if (profile.max_y < 0) continue;
 
                             // Compute this rotation's Y at candidate X
                             int ry = 0;
-                            for (int c = 0; c < profile.bw && cx + c < bed_w_px; c++) {
+                            for (int c = 0; c < profile.bw; c++) {
                                 int diff = sky[cx + c] - profile.bottom[c];
                                 if (diff > ry) ry = diff;
                             }
                             if (ry < 0) ry = 0;
                             if (ry > profile.max_y) continue;
+                            if (ry + item_s0.height_px > bed_h_px) continue;
 
                             if (ry < best_y) {
                                 // Verify with 3D collision at this rotation's Y
