@@ -76,7 +76,25 @@ private:
                          int bed_w, int bed_w_px, int bed_h,
                          const BitmapItem &item, int ox, int oy);
 
-    // Find best placement for an item on the bed using center-out scan.
+    // Item profiles for skyline placement — precomputed from bitmap.
+    struct ItemProfile {
+        std::vector<int> bottom; // lowest set pixel per column (full width, sentinel for inactive)
+        std::vector<std::pair<int,int>> top_pairs; // (column, top_pixel) for active columns only
+        int bw = 0, bh = 0;
+        int max_y = 0; // plate_h - bh
+    };
+
+    // Compute item profile from a rasterized bitmap.
+    static ItemProfile compute_profile(const BitmapItem &item, int bed_h);
+
+    // Skyline-based placement: O(bed_width) per item instead of O(bed_width × bed_height).
+    // Slides the item's bottom profile across the skyline to find the best-fit position.
+    // Coarse stride + refinement for speed.
+    static std::optional<std::pair<int,int>> find_placement_skyline(
+        const std::vector<int> &skyline, int bed_w_px, int bed_h,
+        const ItemProfile &profile);
+
+    // Legacy bitmap-scanning placement (kept for 3D nesting where skyline doesn't apply).
     static std::optional<std::pair<int,int>> find_placement(
         const std::vector<uint64_t> &bed_bits,
         int bed_w, int bed_w_px, int bed_h,

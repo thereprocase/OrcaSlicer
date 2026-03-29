@@ -554,6 +554,106 @@ bool BitmapArranger::collides(
     return false;
 }
 
+// ============================================================
+// Skyline placement — O(bed_width) per item
+// ============================================================
+
+BitmapArranger::ItemProfile BitmapArranger::compute_profile(
+    const BitmapItem &item, int bed_h)
+{
+    ItemProfile prof;
+    prof.bw = item.width_px;
+    prof.bh = item.height_px;
+    prof.max_y = bed_h - item.height_px;
+    if (prof.max_y < 0) return prof;
+
+    // Bottom profile: lowest set pixel per column. Sentinel (bed_h+1) for inactive columns.
+    prof.bottom.assign(prof.bw, bed_h + 1);
+    for (int x = 0; x < prof.bw; x++) {
+        for (int y = 0; y < prof.bh; y++) {
+            int word = x / 64;
+            int bit = x % 64;
+            if (item.bits[(size_t)y * item.width_words + word] & (uint64_t(1) << bit)) {
+                prof.bottom[x] = y;
+                break;
+            }
+        }
+    }
+
+    // Top profile: highest set pixel + 1 per active column (for skyline update)
+    for (int x = 0; x < prof.bw; x++) {
+        if (prof.bottom[x] > bed_h) continue; // inactive column
+        for (int y = prof.bh - 1; y >= 0; y--) {
+            int word = x / 64;
+            int bit = x % 64;
+            if (item.bits[(size_t)y * item.width_words + word] & (uint64_t(1) << bit)) {
+                prof.top_pairs.push_back({x, y + 1});
+                break;
+            }
+        }
+    }
+
+    return prof;
+}
+
+std::optional<std::pair<int,int>> BitmapArranger::find_placement_skyline(
+    const std::vector<int> &skyline, int bed_w_px, int bed_h,
+    const ItemProfile &profile)
+{
+    if (profile.max_y < 0 || profile.bw > bed_w_px)
+        return std::nullopt;
+
+    int n_pos = bed_w_px - profile.bw + 1;
+    if (n_pos <= 0) return std::nullopt;
+
+    constexpr int STRIDE = 8;
+    constexpr int REFINE = 10;
+
+    // Coarse pass: evaluate every STRIDE-th position
+    int best_x = -1, best_y = INT_MAX;
+
+    for (int x = 0; x < n_pos; x += STRIDE) {
+        // Compute placement Y: max(skyline[x+col] - bottom[col]) for all columns
+        int y = 0;
+        for (int c = 0; c < profile.bw; c++) {
+            int diff = skyline[x + c] - profile.bottom[c];
+            if (diff > y) y = diff;
+        }
+        if (y < 0) y = 0;
+        if (y < best_y) {
+            best_y = y;
+            best_x = x;
+            if (y == 0) break; // floor placement — can't do better
+        }
+    }
+
+    if (best_x < 0 || best_y > profile.max_y)
+        return std::nullopt;
+
+    // Refine around coarse winner
+    if (best_y > 0) {
+        int ref_lo = std::max(0, best_x - REFINE);
+        int ref_hi = std::min(n_pos, best_x + REFINE + 1);
+        for (int x = ref_lo; x < ref_hi; x++) {
+            int y = 0;
+            for (int c = 0; c < profile.bw; c++) {
+                int diff = skyline[x + c] - profile.bottom[c];
+                if (diff > y) y = diff;
+            }
+            if (y < 0) y = 0;
+            if (y < best_y) {
+                best_y = y;
+                best_x = x;
+            }
+        }
+    }
+
+    if (best_y > profile.max_y)
+        return std::nullopt;
+
+    return std::make_pair(best_x, best_y);
+}
+
 std::optional<std::pair<int,int>> BitmapArranger::find_placement(
     const std::vector<uint64_t> &bed_bits, int bed_w, int bed_w_px, int bed_h,
     const BitmapItem &item, int step)
@@ -748,8 +848,9 @@ void BitmapArranger::arrange(
     // all plates instead of forward-only assignment.
     struct PlateState {
         std::vector<uint64_t> bits;
-        int material_group = -1; // filament_temp_type of first item placed; -1 = unassigned
-        int free_px = 0;         // approximate free pixel count for quick skip
+        std::vector<int> skyline;  // 1D height per column for O(bed_w) placement
+        int material_group = -1;
+        int free_px = 0;
     };
 
     struct PlateState3D {
@@ -774,9 +875,19 @@ void BitmapArranger::arrange(
     };
 
     std::vector<PlateState> plates;
-    plates.push_back({std::vector<uint64_t>(bed_w_words * bed_h_px, 0), -1, 0});
+    plates.push_back({std::vector<uint64_t>(bed_w_words * bed_h_px, 0), std::vector<int>(bed_w_px, 0), -1, 0});
     stamp_excludes(plates[0].bits);
     plates[0].free_px = count_free_px(plates[0].bits);
+    // Initialize skyline from excludes — set skyline height where excludes are stamped
+    for (int x = 0; x < bed_w_px; x++) {
+        for (int y = bed_h_px - 1; y >= 0; y--) {
+            int word = x / 64, bit = x % 64;
+            if (plates[0].bits[(size_t)y * bed_w_words + word] & (uint64_t(1) << bit)) {
+                plates[0].skyline[x] = y + 1;
+                break;
+            }
+        }
+    }
 
     std::vector<PlateState3D> plates_3d;
     if (params.nesting_3d) {
@@ -812,40 +923,51 @@ void BitmapArranger::arrange(
         return plate_group == item_type;
     };
 
-    // Try placing an item on a single plate.
-    // Rasterizes once at 0°, then rotates the BITMAP for each angle (no re-rasterization).
-    // Each rotated bitmap is generated from the 0° original — never iteratively.
+    // Try placing an item on a single plate using SKYLINE placement.
+    // O(bed_width) per rotation instead of O(bed_width × bed_height).
     auto try_place_on_plate = [&](const ItemEntry &entry,
                                   const std::vector<std::pair<BitmapItem, double>> &rot_bmps,
                                   int plate_idx) -> bool {
-        auto &bits = plates[plate_idx].bits;
+        auto &plate = plates[plate_idx];
         for (const auto &[bmp, rot] : rot_bmps) {
             if (bmp.width_px <= 0 || bmp.height_px <= 0) continue;
 
-            auto result = find_placement(bits, bed_w_words, bed_w_px, bed_h_px, bmp, scan_step);
+            // Compute bottom/top profiles for this rotated bitmap
+            auto profile = compute_profile(bmp, bed_h_px);
+            if (profile.max_y < 0) continue;
+
+            // Skyline placement — O(bed_width)
+            auto result = find_placement_skyline(plate.skyline, bed_w_px, bed_h_px, profile);
             if (result) {
                 auto [px, py] = *result;
+
+                // Verify with bitmap collision (catches concave edge cases skyline misses)
+                if (collides(plate.bits, bed_w_words, bed_w_px, bed_h_px, bmp, px, py)) {
+                    // Skyline said OK but bitmap says overlap — skip this rotation.
+                    // This can happen with concave shapes where the skyline overestimates free space.
+                    continue;
+                }
+
                 arrangables[entry.orig_idx].translation = {
                     effective_bed.min.x() + (coord_t)(px * res) - bmp.offset_x,
                     effective_bed.min.y() + (coord_t)(py * res) - bmp.offset_y
                 };
                 arrangables[entry.orig_idx].rotation = rot;
                 arrangables[entry.orig_idx].bed_idx = plate_idx;
-                stamp(bits, bed_w_words, bed_w_px, bed_h_px, bmp, px, py);
 
-                // Update free pixel estimate
-                int item_px = 0;
-                for (auto w : bmp.bits) {
-                    #ifdef _MSC_VER
-                    item_px += (int)__popcnt64(w);
-                    #else
-                    item_px += __builtin_popcountll(w);
-                    #endif
+                // Stamp bitmap
+                stamp(plate.bits, bed_w_words, bed_w_px, bed_h_px, bmp, px, py);
+
+                // Update skyline
+                for (const auto &[col, top] : profile.top_pairs) {
+                    int c = px + col;
+                    int v = py + top;
+                    if (c < bed_w_px && v > plate.skyline[c])
+                        plate.skyline[c] = v;
                 }
-                plates[plate_idx].free_px -= item_px;
 
-                if (plates[plate_idx].material_group < 0)
-                    plates[plate_idx].material_group = entry.filament_temp_type;
+                if (plate.material_group < 0)
+                    plate.material_group = entry.filament_temp_type;
                 return true;
             }
         }
@@ -984,9 +1106,19 @@ void BitmapArranger::arrange(
     // Helper to create a new 2D plate
     auto new_2d_plate = [&]() -> int {
         int idx = (int)plates.size();
-        plates.push_back({std::vector<uint64_t>(bed_w_words * bed_h_px, 0), -1, 0});
+        plates.push_back({std::vector<uint64_t>(bed_w_words * bed_h_px, 0), std::vector<int>(bed_w_px, 0), -1, 0});
         stamp_excludes(plates[idx].bits);
         plates[idx].free_px = count_free_px(plates[idx].bits);
+        // Initialize skyline from excludes
+        for (int x = 0; x < bed_w_px; x++) {
+            for (int y = bed_h_px - 1; y >= 0; y--) {
+                int word = x / 64, bit = x % 64;
+                if (plates[idx].bits[(size_t)y * bed_w_words + word] & (uint64_t(1) << bit)) {
+                    plates[idx].skyline[x] = y + 1;
+                    break;
+                }
+            }
+        }
         return idx;
     };
 
