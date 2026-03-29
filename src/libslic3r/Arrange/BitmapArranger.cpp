@@ -1016,14 +1016,7 @@ void BitmapArranger::arrange(
     coord_t res = scaled<coord_t>(std::clamp(params.bitmap_resolution_mm, 0.1f, 2.0f));
     coord_t inflation = params.min_obj_distance / 2;
 
-    // Safety margin: shrink effective bed by 1 pixel on each side to prevent
-    // rounding errors from placing items at positions where the actual geometry
-    // extends past the bed boundary. OrcaSlicer checks boundaries in scaled
-    // coords, but we place in pixel coords — the 0.5-pixel rounding can push
-    // a part's edge past the bed by up to 0.5 * resolution.
     BoundingBox effective_bed = bed;
-    effective_bed.min += Vec2crd(res, res);
-    effective_bed.max -= Vec2crd(res, res);
 
     // Apply purge pad: shrink the effective bed along one edge
     if (params.avoid_purge_pad && params.purge_pad_mm > 0.f) {
@@ -1037,10 +1030,12 @@ void BitmapArranger::arrange(
         }
     }
 
-    // Bed dimensions in pixels. +1 prevents edge pixels from clipping:
-    // a polygon whose extent equals the bed size must still fit entirely.
-    int bed_w_px = (int)std::ceil((double)(effective_bed.max.x() - effective_bed.min.x()) / res) + 1;
-    int bed_h_px = (int)std::ceil((double)(effective_bed.max.y() - effective_bed.min.y()) / res) + 1;
+    // Bed dimensions in pixels. No +1 here — the bed bitmap must represent
+    // exactly the physical bed area. Item bitmaps use +1 to capture their
+    // rightmost edge, but the bed must not extend past its boundary or items
+    // placed at the rightmost pixel will overshoot the physical bed edge.
+    int bed_w_px = (int)std::ceil((double)(effective_bed.max.x() - effective_bed.min.x()) / res);
+    int bed_h_px = (int)std::ceil((double)(effective_bed.max.y() - effective_bed.min.y()) / res);
     int bed_w_words = (bed_w_px + 63) / 64;
 
     // Cap bitmap size to prevent unbounded allocation from pathological beds
