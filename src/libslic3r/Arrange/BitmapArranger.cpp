@@ -558,51 +558,83 @@ std::optional<std::pair<int,int>> BitmapArranger::find_placement(
     const std::vector<uint64_t> &bed_bits, int bed_w, int bed_w_px, int bed_h,
     const BitmapItem &item, int step)
 {
-    // Center-out scan: try positions closest to bed center first.
-    // This distributes parts naturally from the middle instead of packing into a corner.
+    // Multi-tier search: coarse → medium → fine, center-out at each tier.
+    // Like Google Maps: continent → city → street.
     int max_x = bed_w_px - item.width_px;
     int max_y = bed_h - item.height_px;
     if (max_x < 0 || max_y < 0) return std::nullopt;
 
-    int cx = max_x / 2;  // center of valid placement range
+    int cx = max_x / 2;
     int cy = max_y / 2;
 
-    // Spiral outward from center in coarse steps
+    // Tier 1: Very coarse scan (4x step) to find candidate region
+    int coarse_step = step * 4;
+    int hit_x = -1, hit_y = -1;
+    int best_dist = INT_MAX;
+
+    // Center-out spiral at coarse resolution
     int max_radius = std::max(max_x, max_y);
-    for (int r = 0; r <= max_radius; r += step) {
-        // Scan a square ring at distance r from center
+    for (int r = 0; r <= max_radius; r += coarse_step) {
         int y_lo = std::max(0, cy - r);
         int y_hi = std::min(max_y, cy + r);
         int x_lo = std::max(0, cx - r);
         int x_hi = std::min(max_x, cx + r);
 
-        for (int y = y_lo; y <= y_hi; y += step) {
-            for (int x = x_lo; x <= x_hi; x += step) {
-                // Only check positions on the ring perimeter (skip interior, already checked)
-                if (r > step && x > x_lo + step && x < x_hi - step &&
-                    y > y_lo + step && y < y_hi - step)
+        for (int y = y_lo; y <= y_hi; y += coarse_step) {
+            for (int x = x_lo; x <= x_hi; x += coarse_step) {
+                if (r > coarse_step && x > x_lo + coarse_step && x < x_hi - coarse_step &&
+                    y > y_lo + coarse_step && y < y_hi - coarse_step)
                     continue;
 
                 if (!collides(bed_bits, bed_w, bed_w_px, bed_h, item, x, y)) {
-                    // Refine within one step for tightest center-ward placement
-                    int best_x = x, best_y = y;
-                    int best_dist = (x - cx) * (x - cx) + (y - cy) * (y - cy);
-                    for (int ry = std::max(0, y - step + 1); ry <= std::min(max_y, y + step - 1); ry++) {
-                        for (int rx = std::max(0, x - step + 1); rx <= std::min(max_x, x + step - 1); rx++) {
-                            int d = (rx - cx) * (rx - cx) + (ry - cy) * (ry - cy);
-                            if (d < best_dist && !collides(bed_bits, bed_w, bed_w_px, bed_h, item, rx, ry)) {
-                                best_x = rx;
-                                best_y = ry;
-                                best_dist = d;
-                            }
-                        }
+                    int d = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+                    if (d < best_dist) {
+                        hit_x = x; hit_y = y; best_dist = d;
                     }
-                    return std::make_pair(best_x, best_y);
+                    goto tier2; // found a region, refine it
                 }
             }
         }
     }
+    // Coarse scan found nothing — item doesn't fit
     return std::nullopt;
+
+tier2:
+    // Tier 2: Medium scan around the coarse hit (within coarse_step radius)
+    {
+        int search_r = coarse_step;
+        int y_lo = std::max(0, hit_y - search_r);
+        int y_hi = std::min(max_y, hit_y + search_r);
+        int x_lo = std::max(0, hit_x - search_r);
+        int x_hi = std::min(max_x, hit_x + search_r);
+
+        best_dist = INT_MAX;
+        for (int y = y_lo; y <= y_hi; y += step) {
+            for (int x = x_lo; x <= x_hi; x += step) {
+                if (!collides(bed_bits, bed_w, bed_w_px, bed_h, item, x, y)) {
+                    int d = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+                    if (d < best_dist) {
+                        hit_x = x; hit_y = y; best_dist = d;
+                    }
+                }
+            }
+        }
+    }
+
+    // Tier 3: Pixel-level refinement around the medium hit (within one step)
+    {
+        int best_x = hit_x, best_y = hit_y;
+        best_dist = (hit_x - cx) * (hit_x - cx) + (hit_y - cy) * (hit_y - cy);
+        for (int ry = std::max(0, hit_y - step); ry <= std::min(max_y, hit_y + step); ry++) {
+            for (int rx = std::max(0, hit_x - step); rx <= std::min(max_x, hit_x + step); rx++) {
+                int d = (rx - cx) * (rx - cx) + (ry - cy) * (ry - cy);
+                if (d < best_dist && !collides(bed_bits, bed_w, bed_w_px, bed_h, item, rx, ry)) {
+                    best_x = rx; best_y = ry; best_dist = d;
+                }
+            }
+        }
+        return std::make_pair(best_x, best_y);
+    }
 }
 
 void BitmapArranger::arrange(
