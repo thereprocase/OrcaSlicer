@@ -1203,6 +1203,55 @@ void BitmapArranger::arrange(
     }
     done:
 
+    // ============================================================
+    // PHASE 4: Compaction — try to empty the last plate
+    // Move items from the last plate onto earlier plates to reduce plate count.
+    // Repeat until the last plate can't be emptied.
+    // ============================================================
+    if (!use_3d && plates.size() > 1) {
+        bool compacted = true;
+        while (compacted && plates.size() > 1) {
+            compacted = false;
+            int last_plate = (int)plates.size() - 1;
+
+            // Collect items on the last plate (smallest first for best fit)
+            std::vector<int> last_plate_items;
+            for (int i = n - 1; i >= 0; i--) { // entries are sorted largest-first, so reverse = smallest-first
+                if (!item_placed[i]) continue;
+                if (arrangables[entries[i].orig_idx].bed_idx == last_plate)
+                    last_plate_items.push_back(i);
+            }
+
+            if (last_plate_items.empty()) break;
+
+            int moved = 0;
+            for (int idx : last_plate_items) {
+                auto &entry = entries[idx];
+                bool relocated = false;
+
+                for (int pi = 0; pi < last_plate; pi++) {
+                    if (!is_material_compatible(plates[pi].material_group, entry.filament_temp_type))
+                        continue;
+                    if (try_place_on_plate(entry, rot_bmps_all[idx], pi)) {
+                        relocated = true;
+                        moved++;
+                        break;
+                    }
+                }
+                // If not relocated, it stays on the last plate
+            }
+
+            if (moved > 0 && moved == (int)last_plate_items.size()) {
+                // Entire last plate emptied — remove it
+                plates.pop_back();
+                compacted = true;
+                BOOST_LOG_TRIVIAL(info) << "BitmapArranger: compacted — removed plate " << last_plate;
+            } else {
+                compacted = false; // some items stuck, stop trying
+            }
+        }
+    }
+
     int total_plates = params.nesting_3d ? (int)plates_3d.size() : (int)plates.size();
     BOOST_LOG_TRIVIAL(info) << "BitmapArranger: placed " << placed_count
                             << "/" << arrangables.size() << " on "
