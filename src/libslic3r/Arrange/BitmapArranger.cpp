@@ -1130,6 +1130,25 @@ void BitmapArranger::arrange(
         plates_3d.push_back(std::move(p3d));
     }
 
+    // Ensure a 3D plate's bed stack has at least n_slices entries, each
+    // stamped with excludes. Exclusion zones (filament cutter, LIDAR, purge
+    // line) are physical structures at ALL heights — the bed must have
+    // exclude data at every Z level an item might occupy. Without this,
+    // collides_3d skips height levels where the bed has no data, allowing
+    // items to be placed over exclusion zones at height.
+    auto ensure_bed_height = [&](SliceStack &bed_stack, int required_slices) {
+        while ((int)bed_stack.slices.size() < required_slices) {
+            BitmapItem new_slice;
+            new_slice.bits.assign(bed_w_words * bed_h_px, 0);
+            new_slice.width_words = bed_w_words;
+            new_slice.width_px = bed_w_px;
+            new_slice.height_px = bed_h_px;
+            stamp_excludes(new_slice.bits);
+            bed_stack.slices.push_back(std::move(new_slice));
+        }
+        bed_stack.n_slices = std::max(bed_stack.n_slices, required_slices);
+    };
+
     // Coarse step (~1mm): scan the bed in large strides, then refine within
     // one step of the first collision-free spot. Balances speed vs. packing quality.
     // 2D scan step: 1mm (used for legacy bitmap scanning if needed)
@@ -1212,6 +1231,15 @@ void BitmapArranger::arrange(
                                       int plate_idx) -> bool {
         auto &bed_stack = plates_3d[plate_idx].stack;
         if (bed_stack.slices.empty()) return false;
+
+        // Ensure bed stack covers the tallest rotation of this item.
+        // Exclusion zones must exist at every Z level to prevent items
+        // from being placed over physical obstacles at height.
+        int max_item_slices = 0;
+        for (const auto &[stack, rot] : rot_stacks)
+            max_item_slices = std::max(max_item_slices, stack.n_slices);
+        if (max_item_slices > 0)
+            ensure_bed_height(bed_stack, max_item_slices);
 
         // Build skyline from bottom slice once — reused across all rotation attempts
         const auto &bed_s0 = bed_stack.slices[0];
@@ -1638,9 +1666,18 @@ void BitmapArranger::arrange(
                 if (rot_stacks_all[idx].empty()) continue;
 
                 bool relocated = false;
+
+                // Determine max item height across rotations
+                int max_item_slices = 0;
+                for (const auto &[stack, rot] : rot_stacks_all[idx])
+                    max_item_slices = std::max(max_item_slices, stack.n_slices);
+
                 for (int pi = 0; pi < last_plate && !relocated; pi++) {
                     if (!is_material_compatible(plates_3d[pi].material_group, entries[idx].filament_temp_type))
                         continue;
+
+                    // Ensure bed covers item height (excludes at all Z levels)
+                    ensure_bed_height(plates_3d[pi].stack, max_item_slices);
 
                     // Try each rotation on this plate
                     for (const auto &[stack, rot] : rot_stacks_all[idx]) {
