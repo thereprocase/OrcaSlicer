@@ -1178,6 +1178,14 @@ void GLCanvas3D::load_arrange_settings()
     if (!z_clear_str.empty())
         m_arrange_settings_fff.z_clearance_mm = std::stof(z_clear_str);
 
+    std::string compact_mode_str = wxGetApp().app_config->get("arrange", "compaction_mode");
+    if (!compact_mode_str.empty())
+        m_arrange_settings_fff.compaction_mode = std::stoi(compact_mode_str);
+
+    std::string best_fit_str = wxGetApp().app_config->get("arrange", "best_fit_compact");
+    if (!best_fit_str.empty())
+        m_arrange_settings_fff.best_fit_compact = (best_fit_str == "1" || best_fit_str == "true");
+
     //BBS: add specific arrange settings
     m_arrange_settings_fff_seq_print.is_seq_print = true;
 }
@@ -6019,6 +6027,37 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     }
 
     ImGui::Separator();
+
+    // Compaction mode dropdown
+    const char* compact_labels[] = { "None", "Coarse bitmap", "Reverse skyline", "Both" };
+    ImGui::AlignTextToFramePadding();
+    imgui->text(_L("Compaction"));
+    ImGui::SameLine(1.2 * cursor_slider_left);
+    ImGui::PushItemWidth(window_width);
+    if (ImGui::Combo("##compaction", &settings.compaction_mode, compact_labels, 4)) {
+        settings_out.compaction_mode = settings.compaction_mode;
+        appcfg->set("arrange", "compaction_mode", std::to_string(settings_out.compaction_mode));
+        settings_changed = true;
+    }
+    ImGui::PopItemWidth();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", _u8L("Strategy for reducing plate count after initial placement.\n"
+                                     "None: no post-placement optimization\n"
+                                     "Coarse bitmap: scan for gaps below skyline (finds concave pockets)\n"
+                                     "Reverse skyline: bottom-up profile matching (fast)\n"
+                                     "Both: try reverse skyline first, then bitmap scan").c_str());
+
+    // Best-fit checkbox
+    if (imgui->bbl_checkbox(_L("Best-fit plate selection"), settings.best_fit_compact)) {
+        settings_out.best_fit_compact = settings.best_fit_compact;
+        appcfg->set("arrange", "best_fit_compact", settings_out.best_fit_compact ? "1" : "0");
+        settings_changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", _u8L("During compaction, try all plates and pick the tightest fit\n"
+                                     "instead of taking the first plate that works.").c_str());
+
+    ImGui::Separator();
     if (imgui->bbl_checkbox(_L("Auto rotate for arrangement"), settings.enable_rotation)) {
         settings_out.enable_rotation = settings.enable_rotation;
         appcfg->set("arrange", rot_key.c_str(), settings_out.enable_rotation);
@@ -6121,6 +6160,8 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         appcfg->set("arrange", "purge_pad_edge", std::to_string(settings_out.purge_pad_edge));
         appcfg->set("arrange", "purge_pad_mm", float_to_string_decimal_point(settings_out.purge_pad_mm));
         appcfg->set("arrange", "bitmap_resolution_mm", float_to_string_decimal_point(settings_out.bitmap_resolution_mm));
+        appcfg->set("arrange", "compaction_mode", std::to_string(settings_out.compaction_mode));
+        appcfg->set("arrange", "best_fit_compact", settings_out.best_fit_compact ? "1" : "0");
         appcfg->set("arrange", "nesting_3d", settings_out.nesting_3d ? "1" : "0");
         appcfg->set("arrange", "slice_height_mm", float_to_string_decimal_point(settings_out.slice_height_mm));
         appcfg->set("arrange", "z_clearance_mm", float_to_string_decimal_point(settings_out.z_clearance_mm));

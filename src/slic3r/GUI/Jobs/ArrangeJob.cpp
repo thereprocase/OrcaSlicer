@@ -791,6 +791,9 @@ arrangement::ArrangeParams init_arrange_params(Plater *p)
     params.nesting_3d                          = settings.nesting_3d;
     params.slice_height_mm                     = settings.slice_height_mm;
     params.z_clearance_mm                      = settings.z_clearance_mm;
+    params.compaction_mode                     = settings.compaction_mode;
+    params.best_fit_compact                    = settings.best_fit_compact;
+    params.gravity_compact                     = false; // not exposed in UI yet — needs un-stamp implementation
 
     int state = p->get_prepare_state();
     if (state == Job::JobPrepareState::PREPARE_STATE_MENU) {
