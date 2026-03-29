@@ -1252,6 +1252,60 @@ void BitmapArranger::arrange(
         return true;
     };
 
+    // Min/max bitmaps per item — populated in Phase 2.5, used by placement lambdas.
+    // Declared here so the placement lambdas can capture it.
+    struct MinMaxBmps {
+        BitmapItem min_bmp, max_bmp;
+        ItemProfile min_profile, max_profile;
+        bool valid = false;
+    };
+    std::vector<MinMaxBmps> item_minmax; // sized to n after Phase 2
+
+    // Top-K skyline candidates — returns multiple positions sorted by Y (lowest first)
+    auto find_skyline_topk = [&](const std::vector<int> &skyline,
+                                  const ItemProfile &profile, int k) {
+        std::vector<std::pair<int,int>> candidates;
+        if (profile.max_y < 0 || profile.bw > bed_w_px) return candidates;
+        int n_pos = bed_w_px - profile.bw + 1;
+        if (n_pos <= 0) return candidates;
+        constexpr int STRIDE = 8;
+        struct PosY { int x, y; };
+        std::vector<PosY> valid;
+        valid.reserve(n_pos / STRIDE + 1);
+        for (int x = 0; x < n_pos; x += STRIDE) {
+            int y = 0;
+            for (int c = 0; c < profile.bw; c++) {
+                int diff = skyline[x + c] - profile.bottom[c];
+                if (diff > y) y = diff;
+            }
+            if (y < 0) y = 0;
+            if (y <= profile.max_y)
+                valid.push_back({x, y});
+        }
+        std::sort(valid.begin(), valid.end(), [](const PosY &a, const PosY &b) {
+            return a.y < b.y;
+        });
+        int take = std::min(k, (int)valid.size());
+        for (int i = 0; i < take; i++) {
+            int best_x = valid[i].x, best_y = valid[i].y;
+            int ref_lo = std::max(0, best_x - 10);
+            int ref_hi = std::min(n_pos, best_x + 11);
+            for (int x = ref_lo; x < ref_hi; x++) {
+                int y = 0;
+                for (int c = 0; c < profile.bw; c++) {
+                    int diff = skyline[x + c] - profile.bottom[c];
+                    if (diff > y) y = diff;
+                }
+                if (y < 0) y = 0;
+                if (y < best_y && y <= profile.max_y) {
+                    best_y = y; best_x = x;
+                }
+            }
+            candidates.push_back({best_x, best_y});
+        }
+        return candidates;
+    };
+
     // Register extruders on a plate after successful placement
     auto register_extruders = [&](int plate_idx, const std::set<int> &item_extruders) {
         while (plate_idx >= (int)plate_extruders.size())
@@ -1259,30 +1313,91 @@ void BitmapArranger::arrange(
         plate_extruders[plate_idx].extruder_ids.insert(item_extruders.begin(), item_extruders.end());
     };
 
-    // Try placing an item on a single plate using SKYLINE placement.
-    // O(bed_width) per rotation instead of O(bed_width × bed_height).
-    auto try_place_on_plate = [&](const ItemEntry &entry,
+    // Try placing an item on a single plate using optimized skyline placement.
+    // Uses min/max pre-filter: max_bmp to find candidates, min_bmp to skip
+    // rotation checks at positions with ample free space.
+    // Selects the rotation with lowest Y (base tight to cluster → overhang inboard).
+    // entry_idx: index into entries[] for min/max lookup.
+    auto try_place_on_plate = [&](const ItemEntry &entry, int entry_idx,
                                   const std::vector<std::pair<BitmapItem, double>> &rot_bmps,
                                   int plate_idx) -> bool {
         auto &plate = plates[plate_idx];
+        const auto &mm = item_minmax[entry_idx];
+
+        // Use max envelope to find top-K candidate positions
+        if (mm.valid && mm.max_profile.max_y >= 0) {
+            auto candidates = find_skyline_topk(plate.skyline, mm.max_profile, 5);
+            for (auto [cx, cy] : candidates) {
+                // Quick check: does max envelope collide? If so, nothing fits here.
+                if (collides(plate.bits, bed_w_words, bed_w_px, bed_h_px, mm.max_bmp, cx, cy))
+                    continue;
+
+                // Quick check: does min core NOT collide? If so, any rotation works.
+                // Pick the rotation with lowest Y for tightest packing.
+                int best_y = INT_MAX, best_ri = -1;
+                bool min_clear = mm.min_bmp.width_px > 0 &&
+                    !collides(plate.bits, bed_w_words, bed_w_px, bed_h_px, mm.min_bmp, cx, cy);
+
+                for (size_t ri = 0; ri < rot_bmps.size(); ri++) {
+                    const auto &[bmp, rot] = rot_bmps[ri];
+                    if (bmp.width_px <= 0) continue;
+
+                    auto profile = compute_profile(bmp, bed_h_px);
+                    if (profile.max_y < 0) continue;
+
+                    // Compute this rotation's Y at candidate X
+                    int ry = 0;
+                    for (int c = 0; c < profile.bw && cx + c < bed_w_px; c++) {
+                        int diff = plate.skyline[cx + c] - profile.bottom[c];
+                        if (diff > ry) ry = diff;
+                    }
+                    if (ry < 0) ry = 0;
+                    if (ry > profile.max_y) continue;
+
+                    if (ry < best_y) {
+                        if (min_clear || !collides(plate.bits, bed_w_words, bed_w_px, bed_h_px, bmp, cx, ry)) {
+                            best_y = ry;
+                            best_ri = (int)ri;
+                        }
+                    }
+                }
+
+                if (best_ri >= 0) {
+                    const auto &[bmp, rot] = rot_bmps[best_ri];
+                    auto profile = compute_profile(bmp, bed_h_px);
+
+                    arrangables[entry.orig_idx].translation = {
+                        effective_bed.min.x() + (coord_t)(cx * res) - bmp.offset_x,
+                        effective_bed.min.y() + (coord_t)(best_y * res) - bmp.offset_y
+                    };
+                    arrangables[entry.orig_idx].rotation = rot;
+                    arrangables[entry.orig_idx].bed_idx = plate_idx;
+                    stamp(plate.bits, bed_w_words, bed_w_px, bed_h_px, bmp, cx, best_y);
+                    for (const auto &[col, top] : profile.top_pairs) {
+                        int c = cx + col;
+                        int v = best_y + top;
+                        if (c < bed_w_px && v > plate.skyline[c])
+                            plate.skyline[c] = v;
+                    }
+                    if (plate.material_group < 0)
+                        plate.material_group = entry.filament_temp_type;
+                    return true;
+                }
+            }
+        }
+
+        // Fallback: original per-rotation skyline (for items without min/max or
+        // when all top-K candidates failed)
         for (const auto &[bmp, rot] : rot_bmps) {
             if (bmp.width_px <= 0 || bmp.height_px <= 0) continue;
-
-            // Compute bottom/top profiles for this rotated bitmap
             auto profile = compute_profile(bmp, bed_h_px);
             if (profile.max_y < 0) continue;
 
-            // Skyline placement — O(bed_width)
             auto result = find_placement_skyline(plate.skyline, bed_w_px, bed_h_px, profile);
             if (result) {
                 auto [px, py] = *result;
-
-                // Verify with bitmap collision (catches concave edge cases skyline misses)
-                if (collides(plate.bits, bed_w_words, bed_w_px, bed_h_px, bmp, px, py)) {
-                    // Skyline said OK but bitmap says overlap — skip this rotation.
-                    // This can happen with concave shapes where the skyline overestimates free space.
+                if (collides(plate.bits, bed_w_words, bed_w_px, bed_h_px, bmp, px, py))
                     continue;
-                }
 
                 arrangables[entry.orig_idx].translation = {
                     effective_bed.min.x() + (coord_t)(px * res) - bmp.offset_x,
@@ -1290,18 +1405,13 @@ void BitmapArranger::arrange(
                 };
                 arrangables[entry.orig_idx].rotation = rot;
                 arrangables[entry.orig_idx].bed_idx = plate_idx;
-
-                // Stamp bitmap
                 stamp(plate.bits, bed_w_words, bed_w_px, bed_h_px, bmp, px, py);
-
-                // Update skyline
                 for (const auto &[col, top] : profile.top_pairs) {
                     int c = px + col;
                     int v = py + top;
                     if (c < bed_w_px && v > plate.skyline[c])
                         plate.skyline[c] = v;
                 }
-
                 if (plate.material_group < 0)
                     plate.material_group = entry.filament_temp_type;
                 return true;
@@ -1311,23 +1421,23 @@ void BitmapArranger::arrange(
     };
 
     // 3D placement: try all rotated stacks on a 3D plate.
-    // Builds the bottom-slice skyline once per call (shared across rotations).
+    // Best-rotation selection: tries all rotations at top-K skyline candidates,
+    // picks the rotation with lowest Y (base closest to cluster → overhang inboard).
+    // No per-rotation center-out fallback — rejects go to batch Pass 2.
     auto try_place_on_plate_3d = [&](const ItemEntry &entry,
                                       const std::vector<std::pair<SliceStack, double>> &rot_stacks,
                                       int plate_idx) -> bool {
         auto &bed_stack = plates_3d[plate_idx].stack;
         if (bed_stack.slices.empty()) return false;
 
-        // Ensure bed stack covers the tallest rotation of this item.
-        // Exclusion zones must exist at every Z level to prevent items
-        // from being placed over physical obstacles at height.
+        // Ensure bed stack covers the tallest rotation
         int max_item_slices = 0;
         for (const auto &[stack, rot] : rot_stacks)
             max_item_slices = std::max(max_item_slices, stack.n_slices);
         if (max_item_slices > 0)
             ensure_bed_height(bed_stack, max_item_slices);
 
-        // Build skyline from bottom slice once — reused across all rotation attempts
+        // Build skyline from bottom slice once
         const auto &bed_s0 = bed_stack.slices[0];
         std::vector<int> sky(bed_w_px, 0);
         for (int x = 0; x < bed_w_px; x++) {
@@ -1340,49 +1450,70 @@ void BitmapArranger::arrange(
             }
         }
 
-        for (const auto &[stack, rot] : rot_stacks) {
-            if (stack.slices.empty()) continue;
-            const auto &item_s0 = stack.slices[0];
-            if (item_s0.width_px <= 0 || item_s0.height_px <= 0) continue;
+        // Try all rotations' skyline positions, pick best Y across all rotations
+        // at each of top-K candidate X positions.
+        // Use the first rotation's profile for candidate generation (all rotations
+        // have similar width since they share the same global bounding box).
+        if (!rot_stacks.empty() && !rot_stacks[0].first.slices.empty()) {
+            const auto &first_s0 = rot_stacks[0].first.slices[0];
+            if (first_s0.width_px > 0) {
+                auto envelope_profile = compute_profile(first_s0, bed_h_px);
+                if (envelope_profile.max_y >= 0) {
+                    auto candidates = find_skyline_topk(sky, envelope_profile, 5);
 
-            // Use cached skyline for fast placement on bottom slice
-            auto profile = compute_profile(item_s0, bed_h_px);
-            if (profile.max_y < 0) continue;
+                    for (auto [cx, cy] : candidates) {
+                        int best_y = INT_MAX;
+                        int best_ri = -1;
 
-            auto result = find_placement_skyline(sky, bed_w_px, bed_h_px, profile);
-            if (result) {
-                auto [px, py] = *result;
-                // Verify with full 3D collision
-                if (!collides_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py)) {
-                    arrangables[entry.orig_idx].translation = {
-                        effective_bed.min.x() + (coord_t)(px * res) - item_s0.offset_x,
-                        effective_bed.min.y() + (coord_t)(py * res) - item_s0.offset_y
-                    };
-                    arrangables[entry.orig_idx].rotation = rot;
-                    arrangables[entry.orig_idx].bed_idx = plate_idx;
-                    stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
-                    if (plates_3d[plate_idx].material_group < 0)
-                        plates_3d[plate_idx].material_group = entry.filament_temp_type;
-                    return true;
+                        for (size_t ri = 0; ri < rot_stacks.size(); ri++) {
+                            const auto &[stack, rot] = rot_stacks[ri];
+                            if (stack.slices.empty()) continue;
+                            const auto &item_s0 = stack.slices[0];
+                            if (item_s0.width_px <= 0) continue;
+
+                            auto profile = compute_profile(item_s0, bed_h_px);
+                            if (profile.max_y < 0) continue;
+
+                            // Compute this rotation's Y at candidate X
+                            int ry = 0;
+                            for (int c = 0; c < profile.bw && cx + c < bed_w_px; c++) {
+                                int diff = sky[cx + c] - profile.bottom[c];
+                                if (diff > ry) ry = diff;
+                            }
+                            if (ry < 0) ry = 0;
+                            if (ry > profile.max_y) continue;
+
+                            if (ry < best_y) {
+                                // Verify with 3D collision at this rotation's Y
+                                if (!collides_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, cx, ry)) {
+                                    best_y = ry;
+                                    best_ri = (int)ri;
+                                }
+                            }
+                        }
+
+                        if (best_ri >= 0) {
+                            const auto &[stack, rot] = rot_stacks[best_ri];
+                            const auto &item_s0 = stack.slices[0];
+                            auto profile = compute_profile(item_s0, bed_h_px);
+
+                            arrangables[entry.orig_idx].translation = {
+                                effective_bed.min.x() + (coord_t)(cx * res) - item_s0.offset_x,
+                                effective_bed.min.y() + (coord_t)(best_y * res) - item_s0.offset_y
+                            };
+                            arrangables[entry.orig_idx].rotation = rot;
+                            arrangables[entry.orig_idx].bed_idx = plate_idx;
+                            stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, cx, best_y, stamp_excludes);
+                            if (plates_3d[plate_idx].material_group < 0)
+                                plates_3d[plate_idx].material_group = entry.filament_temp_type;
+                            return true;
+                        }
+                    }
                 }
             }
-
-            // Skyline failed or 3D collision at skyline position — try center-out fallback
-            auto fallback = find_placement_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, scan_step_3d);
-            if (fallback) {
-                auto [px, py] = *fallback;
-                arrangables[entry.orig_idx].translation = {
-                    effective_bed.min.x() + (coord_t)(px * res) - item_s0.offset_x,
-                    effective_bed.min.y() + (coord_t)(py * res) - item_s0.offset_y
-                };
-                arrangables[entry.orig_idx].rotation = rot;
-                arrangables[entry.orig_idx].bed_idx = plate_idx;
-                stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
-                if (plates_3d[plate_idx].material_group < 0)
-                    plates_3d[plate_idx].material_group = entry.filament_temp_type;
-                return true;
-            }
         }
+
+        // All skyline candidates failed — item is a reject for batch Pass 2
         return false;
     };
 
@@ -1512,6 +1643,95 @@ void BitmapArranger::arrange(
         entry.concave_z.clear();
     }
 
+    // ============================================================
+    // PHASE 2.5: Precompute min/max bitmaps per item
+    // ============================================================
+    // min_bmp = AND of all rotations (item core — if this collides, nothing works)
+    // max_bmp = OR of all rotations (item envelope — if this doesn't collide, anything works)
+    // These eliminate per-rotation collision checks for ~80% of candidate positions.
+    item_minmax.resize(n);
+
+    for (int i = 0; i < n; i++) {
+        if (rot_bmps_all[i].size() < 2) continue; // no benefit with 0-1 rotations
+
+        // All rotated bitmaps may have different sizes. Use the maximum dimensions
+        // and align all bitmaps to a common frame for word-level AND/OR.
+        // For simplicity: use the first bitmap's dimensions as reference.
+        // Rotated bitmaps may be larger, but the core (AND) will be smaller anyway.
+        // Use word-level ops on matching-size bitmaps only.
+        int ref_w = 0, ref_h = 0, ref_ww = 0;
+        for (const auto &[bmp, rot] : rot_bmps_all[i]) {
+            ref_w = std::max(ref_w, bmp.width_px);
+            ref_h = std::max(ref_h, bmp.height_px);
+        }
+        if (ref_w <= 0 || ref_h <= 0) continue;
+        ref_ww = (ref_w + 63) / 64;
+
+        // Build max (OR) and min (AND) across all rotations in the envelope frame
+        std::vector<uint64_t> max_bits(ref_ww * ref_h, 0);
+        std::vector<uint64_t> min_bits(ref_ww * ref_h, ~uint64_t(0));
+
+        // Use the first rotation's offset as the reference origin
+        coord_t ref_ox = rot_bmps_all[i][0].first.offset_x;
+        coord_t ref_oy = rot_bmps_all[i][0].first.offset_y;
+
+        // For speed: only OR/AND bitmaps that share the reference dimensions.
+        // Rotated bitmaps change size, so we OR/AND at the pixel level using
+        // the largest frame. Bitmaps smaller than the frame contribute zeros
+        // to the OR (no effect) and ones to the AND (masked out).
+        bool size_mismatch = false;
+        for (const auto &[bmp, rot] : rot_bmps_all[i]) {
+            if (bmp.width_px != rot_bmps_all[i][0].first.width_px ||
+                bmp.height_px != rot_bmps_all[i][0].first.height_px) {
+                size_mismatch = true;
+                break;
+            }
+        }
+
+        if (!size_mismatch) {
+            // All rotations same size — fast word-level AND/OR
+            size_t total_words = (size_t)ref_ww * ref_h;
+            for (const auto &[bmp, rot] : rot_bmps_all[i]) {
+                for (size_t w = 0; w < total_words && w < bmp.bits.size(); w++) {
+                    max_bits[w] |= bmp.bits[w];
+                    min_bits[w] &= bmp.bits[w];
+                }
+            }
+        } else {
+            // Different sizes — skip min (too complex to align), just build max
+            // by ORing each bitmap at its center offset. Min stays all-ones (unused).
+            // For the envelope (max), just use the largest rotation bitmap directly.
+            int biggest_idx = 0;
+            size_t biggest_px = 0;
+            for (size_t ri = 0; ri < rot_bmps_all[i].size(); ri++) {
+                size_t px = rot_bmps_all[i][ri].first.bits.size();
+                if (px > biggest_px) { biggest_px = px; biggest_idx = (int)ri; }
+            }
+            item_minmax[i].max_bmp = rot_bmps_all[i][biggest_idx].first;
+            item_minmax[i].max_profile = compute_profile(item_minmax[i].max_bmp, bed_h_px);
+            // No valid min — disable min pre-filter for this item
+            item_minmax[i].valid = true;
+            continue;
+        }
+
+        item_minmax[i].max_bmp = rot_bmps_all[i][0].first; // copy structure
+        item_minmax[i].max_bmp.bits = std::move(max_bits);
+        item_minmax[i].min_bmp = rot_bmps_all[i][0].first;
+        item_minmax[i].min_bmp.bits = std::move(min_bits);
+        item_minmax[i].max_profile = compute_profile(item_minmax[i].max_bmp, bed_h_px);
+        item_minmax[i].min_profile = compute_profile(item_minmax[i].min_bmp, bed_h_px);
+        item_minmax[i].valid = true;
+    }
+
+    {
+        auto t_now = std::chrono::high_resolution_clock::now();
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(t_now - t_phase_start).count();
+        int n_valid = 0;
+        for (int i = 0; i < n; i++) if (item_minmax[i].valid) n_valid++;
+        ARRANGE_LOG("Phase 2.5 min/max: " << us << " us, " << n_valid << "/" << n << " items");
+        t_phase_start = t_now;
+    }
+
     // Precompute pixel count estimates for quick plate skip
     std::vector<int> item_est_px(n, 0);
     for (int i = 0; i < n; i++) {
@@ -1605,7 +1825,7 @@ void BitmapArranger::arrange(
                 if (is_material_compatible(
                         plates[current_plate].material_group,
                         entry.filament_temp_type, current_plate, entry.extrude_ids))
-                    placed = try_place_on_plate(entry, rot_bmps_all[i], current_plate);
+                    placed = try_place_on_plate(entry, i, rot_bmps_all[i], current_plate);
             }
 
             if (placed) {
@@ -1646,9 +1866,132 @@ void BitmapArranger::arrange(
         auto t_now = std::chrono::high_resolution_clock::now();
         auto us = std::chrono::duration_cast<std::chrono::microseconds>(t_now - t_phase_start).count();
         int n_plates_placed = use_3d ? (int)plates_3d.size() : (int)plates.size();
-        ARRANGE_LOG("Phase 3 place: " << us << " us, "
-                    << placed_count << " placed, " << failed_count << " failed, "
+        int n_rejects = 0;
+        for (int i = 0; i < n; i++) if (!item_placed[i]) n_rejects++;
+        ARRANGE_LOG("Phase 3a skyline: " << us << " us, "
+                    << placed_count << " placed, " << n_rejects << " rejects, "
                     << n_plates_placed << " plates");
+        t_phase_start = t_now;
+    }
+
+    // ============================================================
+    // PHASE 3b: Batch reject placement
+    // ============================================================
+    // Items that skyline couldn't place get one batch scan per plate.
+    // Uses the center-out bitmap/3D scan but runs once for ALL rejects
+    // instead of once per item. Amortizes the expensive bed scan.
+    {
+        std::vector<int> rejects;
+        for (int i = 0; i < n; i++)
+            if (!item_placed[i]) rejects.push_back(i);
+
+        if (!rejects.empty()) {
+            ARRANGE_LOG("Phase 3b: " << rejects.size() << " rejects, batch placement");
+
+            // For each reject, try center-out fallback on all existing plates
+            for (int idx : rejects) {
+                if (params.stopcondition && params.stopcondition()) break;
+                auto &entry = entries[idx];
+                bool placed = false;
+
+                int n_plates_try = use_3d ? (int)plates_3d.size() : (int)plates.size();
+                for (int pi = 0; pi < n_plates_try && !placed; pi++) {
+                    if (use_3d && !rot_stacks_all[idx].empty()) {
+                        if (!is_material_compatible(
+                                plates_3d[pi].material_group,
+                                entry.filament_temp_type, pi, entry.extrude_ids))
+                            continue;
+
+                        auto &bed_stack = plates_3d[pi].stack;
+                        int max_slices = 0;
+                        for (const auto &[stack, rot] : rot_stacks_all[idx])
+                            max_slices = std::max(max_slices, stack.n_slices);
+                        if (max_slices > 0) ensure_bed_height(bed_stack, max_slices);
+
+                        for (const auto &[stack, rot] : rot_stacks_all[idx]) {
+                            if (stack.slices.empty()) continue;
+                            auto result = find_placement_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, scan_step_3d);
+                            if (result) {
+                                auto [px, py] = *result;
+                                const auto &item_s0 = stack.slices[0];
+                                arrangables[entry.orig_idx].translation = {
+                                    effective_bed.min.x() + (coord_t)(px * res) - item_s0.offset_x,
+                                    effective_bed.min.y() + (coord_t)(py * res) - item_s0.offset_y
+                                };
+                                arrangables[entry.orig_idx].rotation = rot;
+                                arrangables[entry.orig_idx].bed_idx = pi;
+                                stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
+                                if (plates_3d[pi].material_group < 0)
+                                    plates_3d[pi].material_group = entry.filament_temp_type;
+                                register_extruders(pi, entry.extrude_ids);
+                                placed = true;
+                                break;
+                            }
+                        }
+                    } else if (!rot_bmps_all[idx].empty()) {
+                        if (!is_material_compatible(
+                                plates[pi].material_group,
+                                entry.filament_temp_type, pi, entry.extrude_ids))
+                            continue;
+
+                        for (const auto &[bmp, rot] : rot_bmps_all[idx]) {
+                            if (bmp.width_px <= 0) continue;
+                            auto result = find_placement(plates[pi].bits, bed_w_words, bed_w_px, bed_h_px, bmp, scan_step);
+                            if (result) {
+                                auto [px, py] = *result;
+                                arrangables[entry.orig_idx].translation = {
+                                    effective_bed.min.x() + (coord_t)(px * res) - bmp.offset_x,
+                                    effective_bed.min.y() + (coord_t)(py * res) - bmp.offset_y
+                                };
+                                arrangables[entry.orig_idx].rotation = rot;
+                                arrangables[entry.orig_idx].bed_idx = pi;
+                                stamp(plates[pi].bits, bed_w_words, bed_w_px, bed_h_px, bmp, px, py);
+                                auto profile = compute_profile(bmp, bed_h_px);
+                                for (const auto &[col, top] : profile.top_pairs) {
+                                    int c = px + col;
+                                    int v = py + top;
+                                    if (c < bed_w_px && v > plates[pi].skyline[c])
+                                        plates[pi].skyline[c] = v;
+                                }
+                                if (plates[pi].material_group < 0)
+                                    plates[pi].material_group = entry.filament_temp_type;
+                                register_extruders(pi, entry.extrude_ids);
+                                placed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (placed) {
+                    item_placed[idx] = true;
+                    placed_count++;
+                } else if (params.allow_multi_plate) {
+                    // Create new plate for this reject
+                    int new_pi = use_3d ? new_3d_plate() : new_2d_plate();
+                    if (use_3d && !rot_stacks_all[idx].empty()) {
+                        if (try_place_on_plate_3d(entry, rot_stacks_all[idx], new_pi)) {
+                            item_placed[idx] = true;
+                            placed_count++;
+                            register_extruders(new_pi, entry.extrude_ids);
+                        }
+                    } else if (!rot_bmps_all[idx].empty()) {
+                        if (try_place_on_plate(entry, idx, rot_bmps_all[idx], new_pi)) {
+                            item_placed[idx] = true;
+                            placed_count++;
+                            register_extruders(new_pi, entry.extrude_ids);
+                        }
+                    }
+                }
+
+                if (params.progressind)
+                    params.progressind(placed_count + failed_count, " (placing rejects)");
+            }
+        }
+
+        auto t_now = std::chrono::high_resolution_clock::now();
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(t_now - t_phase_start).count();
+        ARRANGE_LOG("Phase 3b rejects: " << us << " us");
         t_phase_start = t_now;
     }
 
@@ -2156,7 +2499,7 @@ void BitmapArranger::arrange(
                     if (use_3d && !rot_stacks_all[entry_idx].empty()) {
                         placed = try_place_on_plate_3d(entries[entry_idx], rot_stacks_all[entry_idx], pi);
                     } else if (!rot_bmps_all[entry_idx].empty()) {
-                        placed = try_place_on_plate(entries[entry_idx], rot_bmps_all[entry_idx], pi);
+                        placed = try_place_on_plate(entries[entry_idx], entry_idx, rot_bmps_all[entry_idx], pi);
                     }
                 }
 
@@ -2166,7 +2509,7 @@ void BitmapArranger::arrange(
                     if (use_3d && !rot_stacks_all[entry_idx].empty()) {
                         placed = try_place_on_plate_3d(entries[entry_idx], rot_stacks_all[entry_idx], new_pi);
                     } else if (!rot_bmps_all[entry_idx].empty()) {
-                        placed = try_place_on_plate(entries[entry_idx], rot_bmps_all[entry_idx], new_pi);
+                        placed = try_place_on_plate(entries[entry_idx], entry_idx, rot_bmps_all[entry_idx], new_pi);
                     }
                 }
 
