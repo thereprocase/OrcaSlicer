@@ -6,6 +6,49 @@
 #include <tbb/blocked_range.h>
 #include <atomic>
 #include <mutex>
+#include <set>
+#include <chrono>
+#include <fstream>
+#include <sstream>
+
+// Arrange-specific debug log. Writes to arrange_debug.log in the app data
+// directory (next to the regular log). Only writes when ARRANGE_DEBUG_LOG
+// is defined or when the file already exists (touch it to enable).
+namespace {
+    class ArrangeLog {
+    public:
+        static ArrangeLog &instance() {
+            static ArrangeLog s;
+            return s;
+        }
+        void log(const std::string &msg) {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (!file_.is_open()) return;
+            auto now = std::chrono::high_resolution_clock::now();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()).count();
+            file_ << "[" << ms << "] " << msg << "\n";
+            file_.flush();
+        }
+        void begin_session(const std::string &header) {
+            std::lock_guard<std::mutex> lock(mtx_);
+            // Try to open in the current working directory
+            file_.open("arrange_debug.log", std::ios::app);
+            if (file_.is_open()) {
+                file_ << "\n=== " << header << " ===\n";
+                file_.flush();
+            }
+        }
+    private:
+        std::ofstream file_;
+        std::mutex mtx_;
+    };
+}
+#define ARRANGE_LOG(msg) do { \
+    std::ostringstream _oss; _oss << msg; \
+    ArrangeLog::instance().log(_oss.str()); \
+    BOOST_LOG_TRIVIAL(info) << _oss.str(); \
+} while(0)
 
 // Coordinate systems used in this module:
 //   Scaled coords (coord_t): Slic3r internal units. 1mm = scaled(1.0).
@@ -1000,10 +1043,19 @@ void BitmapArranger::arrange(
         return;
     }
 
-    BOOST_LOG_TRIVIAL(info) << "BitmapArranger: bed " << bed_w_px << "x" << bed_h_px
-                            << " px, resolution " << params.bitmap_resolution_mm << " mm/px"
-                            << ", " << arrangables.size() << " items"
-                            << (params.consolidate_plates ? " (consolidate)" : "");
+    ArrangeLog::instance().begin_session("BitmapArranger");
+
+    ARRANGE_LOG("bed " << bed_w_px << "x" << bed_h_px
+                << " px, res " << params.bitmap_resolution_mm << " mm/px"
+                << ", " << arrangables.size() << " items"
+                << (params.nesting_3d ? ", 3D" : ", 2D")
+                << (params.allow_rotations ? (", rot " + std::to_string((int)std::round(params.rotation_step_rad * 180.0 / PI)) + " deg") : ", no rot")
+                << ", compact=" << params.compaction_mode
+                << (params.allow_multi_materials_on_same_plate ? ", multi-mat" : ", split-mat")
+                << (params.consolidate_plates ? ", consolidate" : ""));
+
+    auto t_total_start = std::chrono::high_resolution_clock::now();
+    auto t_phase_start = t_total_start;
 
     // Consolidate plates: forget existing plate assignments so every item
     // gets re-packed from scratch into the minimum number of plates.
@@ -1020,6 +1072,7 @@ void BitmapArranger::arrange(
         double rotation;
         coord_t inflation;
         int filament_temp_type = -1;
+        std::set<int> extrude_ids; // extruder indices used by this object
     };
 
     std::vector<ItemEntry> entries;
@@ -1033,6 +1086,8 @@ void BitmapArranger::arrange(
         e.rotation = arrangables[i].rotation;
         e.inflation = std::max(inflation, arrangables[i].inflation);
         e.filament_temp_type = arrangables[i].filament_temp_type;
+        e.extrude_ids = std::set<int>(arrangables[i].extrude_ids.begin(),
+                                       arrangables[i].extrude_ids.end());
         entries.push_back(std::move(e));
     }
 
@@ -1042,13 +1097,14 @@ void BitmapArranger::arrange(
         return std::abs(a.poly.area()) > std::abs(b.poly.area());
     });
 
-    // Build rotation candidates — always 5° steps when rotations enabled.
-    // Bitmap rotation is cheap (pixel shuffle from 0° source), so fine granularity is free.
+    // Build rotation candidates from user-selected step size.
+    // Uses params.rotation_step_rad (mapped from UI dropdown: 90°/45°/15°).
+    // Minimum 5° to prevent absurd rotation counts.
     std::vector<double> rotations = {0.};
     if (params.allow_rotations) {
         rotations.clear();
-        double rot_step = PI / 36.; // 5 degrees
-        int n_rot = (int)std::round(2.0 * PI / rot_step);
+        double rot_step = std::max(params.rotation_step_rad, PI / 36.); // minimum 5°
+        int n_rot = std::max(1, (int)std::round(2.0 * PI / rot_step));
         for (int i = 0; i < n_rot; i++)
             rotations.push_back(i * rot_step);
     }
@@ -1157,20 +1213,50 @@ void BitmapArranger::arrange(
     // to find gaps in concave 3D arrangements
     int scan_step_3d = std::max(2, (int)(scaled<coord_t>(2.0) / res));
 
-    // Check whether an item's filament_temp_type is compatible with a plate's
-    // assigned material_group. HighTemp (0) and LowTemp (1) cannot coexist.
-    // HighLowCompatible (2) and unassigned (-1) are compatible with anything.
-    auto is_material_compatible = [&](int plate_group, int item_type) -> bool {
+    // Per-plate tracking of which extruders are on each plate
+    // (for multi-material separation by color/extruder, not just temperature)
+    struct PlateExtruders {
+        std::set<int> extruder_ids;
+    };
+    std::vector<PlateExtruders> plate_extruders(1); // one per plate, grows with plates
+
+    // Check whether an item is compatible with a plate.
+    // When allow_multi_materials is false, checks BOTH:
+    //   1. Temperature compatibility (HighTemp vs LowTemp)
+    //   2. Extruder identity (items must use same extruder set)
+    // Matches the libnest2d path behavior.
+    auto is_material_compatible = [&](int plate_group, int item_type,
+                                      int plate_idx, const std::set<int> &item_extruders) -> bool {
         if (params.allow_multi_materials_on_same_plate)
             return true;
-        if (plate_group < 0 || item_type < 0)
-            return true; // unassigned is compatible with everything
-        // HighLowCompatible (2) and Undefine (3) are compatible with any group
-        if (plate_group >= 2 || item_type >= 2)
-            return true;
-        // Both HighTemp (0) or both LowTemp (1): compatible
-        // One HighTemp and one LowTemp: incompatible
-        return plate_group == item_type;
+
+        // Temperature compatibility
+        if (plate_group >= 0 && item_type >= 0 &&
+            plate_group < 2 && item_type < 2 &&
+            plate_group != item_type)
+            return false;
+
+        // Extruder identity: item's extruders must be a subset of (or superset of)
+        // the plate's extruders, matching the libnest2d behavior.
+        if (plate_idx >= 0 && plate_idx < (int)plate_extruders.size()) {
+            const auto &pe = plate_extruders[plate_idx].extruder_ids;
+            if (!pe.empty() && !item_extruders.empty()) {
+                bool item_subset = std::includes(pe.begin(), pe.end(),
+                                                  item_extruders.begin(), item_extruders.end());
+                bool plate_subset = std::includes(item_extruders.begin(), item_extruders.end(),
+                                                   pe.begin(), pe.end());
+                if (!item_subset && !plate_subset)
+                    return false;
+            }
+        }
+        return true;
+    };
+
+    // Register extruders on a plate after successful placement
+    auto register_extruders = [&](int plate_idx, const std::set<int> &item_extruders) {
+        while (plate_idx >= (int)plate_extruders.size())
+            plate_extruders.push_back({});
+        plate_extruders[plate_idx].extruder_ids.insert(item_extruders.begin(), item_extruders.end());
     };
 
     // Try placing an item on a single plate using SKYLINE placement.
@@ -1344,6 +1430,17 @@ void BitmapArranger::arrange(
             params.progressind(n, " (computing shapes)");
     }
 
+    {
+        auto t_now = std::chrono::high_resolution_clock::now();
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(t_now - t_phase_start).count();
+        int n_3d = 0;
+        for (int i = 0; i < n; i++)
+            if (!base_stacks[i].slices.empty()) n_3d++;
+        ARRANGE_LOG("Phase 1 rasterize: " << us << " us, "
+                    << n << " items (" << n_3d << " 3D)");
+        t_phase_start = t_now;
+    }
+
     // ============================================================
     // PHASE 2: Prepare rotations — rotate each 0° bitmap to all candidate angles
     // ============================================================
@@ -1394,9 +1491,20 @@ void BitmapArranger::arrange(
 
     if (rot_cancelled.load()) return;
 
-    // Report progress from main thread (wxWidgets is not thread-safe)
     if (params.progressind)
         params.progressind(n, " (preparing rotations)");
+
+    {
+        auto t_now = std::chrono::high_resolution_clock::now();
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(t_now - t_phase_start).count();
+        int total_rots = 0;
+        for (int i = 0; i < n; i++)
+            total_rots += (int)std::max(rot_bmps_all[i].size(), rot_stacks_all[i].size());
+        ARRANGE_LOG("Phase 2 rotate: " << us << " us, "
+                    << rotations.size() << " angles x " << n << " items = "
+                    << total_rots << " bitmaps");
+        t_phase_start = t_now;
+    }
 
     // Free the triangle and Z data — no longer needed after rasterization
     for (auto &entry : entries) {
@@ -1491,12 +1599,12 @@ void BitmapArranger::arrange(
             if (use_3d && !rot_stacks_all[i].empty()) {
                 if (is_material_compatible(
                         plates_3d[current_plate].material_group,
-                        entry.filament_temp_type))
+                        entry.filament_temp_type, current_plate, entry.extrude_ids))
                     placed = try_place_on_plate_3d(entry, rot_stacks_all[i], current_plate);
             } else {
                 if (is_material_compatible(
                         plates[current_plate].material_group,
-                        entry.filament_temp_type))
+                        entry.filament_temp_type, current_plate, entry.extrude_ids))
                     placed = try_place_on_plate(entry, rot_bmps_all[i], current_plate);
             }
 
@@ -1504,6 +1612,7 @@ void BitmapArranger::arrange(
                 item_placed[i] = true;
                 placed_count++;
                 any_placed_this_plate = true;
+                register_extruders(current_plate, entry.extrude_ids);
             }
 
             if (params.progressind)
@@ -1532,6 +1641,16 @@ void BitmapArranger::arrange(
         }
     }
     done:
+
+    {
+        auto t_now = std::chrono::high_resolution_clock::now();
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(t_now - t_phase_start).count();
+        int n_plates_placed = use_3d ? (int)plates_3d.size() : (int)plates.size();
+        ARRANGE_LOG("Phase 3 place: " << us << " us, "
+                    << placed_count << " placed, " << failed_count << " failed, "
+                    << n_plates_placed << " plates");
+        t_phase_start = t_now;
+    }
 
     // ============================================================
     // PHASE 4: Compaction — parallel plate search
@@ -1626,8 +1745,9 @@ void BitmapArranger::arrange(
         return std::make_pair(best_x, best_y);
     };
 
-    // Commit a found position: stamp bitmap, update skyline, write arrangable
+    // Commit a found compaction position: stamp bitmap, update skyline, register extruders
     auto commit_compact = [&](int idx, const BitmapItem &bmp, double rot, int plate_idx, int px, int py) {
+        register_extruders(plate_idx, entries[idx].extrude_ids);
         arrangables[entries[idx].orig_idx].translation = {
             effective_bed.min.x() + (coord_t)(px * res) - bmp.offset_x,
             effective_bed.min.y() + (coord_t)(py * res) - bmp.offset_y
@@ -1673,7 +1793,7 @@ void BitmapArranger::arrange(
                     max_item_slices = std::max(max_item_slices, stack.n_slices);
 
                 for (int pi = 0; pi < last_plate && !relocated; pi++) {
-                    if (!is_material_compatible(plates_3d[pi].material_group, entries[idx].filament_temp_type))
+                    if (!is_material_compatible(plates_3d[pi].material_group, entries[idx].filament_temp_type, pi, entries[idx].extrude_ids))
                         continue;
 
                     // Ensure bed covers item height (excludes at all Z levels)
@@ -1712,6 +1832,7 @@ void BitmapArranger::arrange(
                                 arrangables[entries[idx].orig_idx].rotation = rot;
                                 arrangables[entries[idx].orig_idx].bed_idx = pi;
                                 stamp_3d(plates_3d[pi].stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
+                                register_extruders(pi, entries[idx].extrude_ids);
                                 relocated = true;
                                 moved++;
                                 break;
@@ -1729,6 +1850,7 @@ void BitmapArranger::arrange(
                             arrangables[entries[idx].orig_idx].rotation = rot;
                             arrangables[entries[idx].orig_idx].bed_idx = pi;
                             stamp_3d(plates_3d[pi].stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
+                            register_extruders(pi, entries[idx].extrude_ids);
                             relocated = true;
                             moved++;
                             break;
@@ -1779,7 +1901,7 @@ void BitmapArranger::arrange(
                 // Build list of compatible plates
                 std::vector<int> compat_plates;
                 for (int pi = 0; pi < last_plate; pi++) {
-                    if (is_material_compatible(plates[pi].material_group, entries[idx].filament_temp_type))
+                    if (is_material_compatible(plates[pi].material_group, entries[idx].filament_temp_type, pi, entries[idx].extrude_ids))
                         compat_plates.push_back(pi);
                 }
                 if (compat_plates.empty()) continue;
@@ -1903,6 +2025,15 @@ void BitmapArranger::arrange(
                 compacted = false;
             }
         }
+    }
+
+    {
+        auto t_now = std::chrono::high_resolution_clock::now();
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(t_now - t_phase_start).count();
+        int n_plates_after = use_3d ? (int)plates_3d.size() : (int)plates.size();
+        ARRANGE_LOG("Phase 4 compact: " << us << " us, "
+                    << n_plates_after << " plates after compaction");
+        t_phase_start = t_now;
     }
 
     // PHASE 5: Gravity compaction — not yet implemented.
@@ -2049,10 +2180,14 @@ void BitmapArranger::arrange(
     }
 
     int total_plates = params.nesting_3d ? (int)plates_3d.size() : (int)plates.size();
-    BOOST_LOG_TRIVIAL(info) << "BitmapArranger: placed " << placed_count
-                            << "/" << arrangables.size() << " on "
-                            << total_plates << " plate(s)"
-                            << (params.nesting_3d ? " (3D nesting)" : "");
+    {
+        auto t_now = std::chrono::high_resolution_clock::now();
+        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(t_now - t_total_start).count();
+        ARRANGE_LOG("DONE: " << placed_count << "/" << arrangables.size()
+                    << " placed on " << total_plates << " plate(s)"
+                    << ", total " << total_us << " us ("
+                    << (total_us / 1000) << " ms)");
+    }
 }
 
 }} // namespace Slic3r::arrangement
