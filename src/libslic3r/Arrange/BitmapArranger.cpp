@@ -383,12 +383,23 @@ bool BitmapArranger::collides_3d(
     const SliceStack &bed_stack, int bed_w, int bed_w_px, int bed_h,
     const SliceStack &item_stack, int ox, int oy)
 {
-    // Handle collapsed stacks: if slices.size() < n_slices, all Z levels
-    // use slice 0 (the part has no overhangs, all slices are identical).
     bool item_collapsed = (int)item_stack.slices.size() < item_stack.n_slices;
     bool bed_collapsed = (int)bed_stack.slices.size() < bed_stack.n_slices;
 
-    for (int z = 0; z < item_stack.n_slices; z++) {
+    // Fast path: both collapsed → one 2D check covers all Z levels
+    if (item_collapsed && bed_collapsed) {
+        if (!item_stack.slices.empty() && item_stack.slices[0].width_px > 0 &&
+            !bed_stack.slices.empty() && bed_stack.slices[0].width_px > 0) {
+            return collides(bed_stack.slices[0].bits, bed_w, bed_w_px, bed_h,
+                            item_stack.slices[0], ox, oy);
+        }
+        return false;
+    }
+
+    // Check only unique slice combinations
+    int max_z = std::min(item_stack.n_slices,
+                         std::max((int)item_stack.slices.size(), (int)bed_stack.slices.size()));
+    for (int z = 0; z < max_z; z++) {
         int item_z = item_collapsed ? 0 : z;
         int bed_z = bed_collapsed ? 0 : z;
         if (item_z >= (int)item_stack.slices.size()) break;
@@ -1017,7 +1028,10 @@ void BitmapArranger::arrange(
 
     // Coarse step (~1mm): scan the bed in large strides, then refine within
     // one step of the first collision-free spot. Balances speed vs. packing quality.
+    // 2D scan step: 1mm (used for legacy bitmap scanning if needed)
     int scan_step = std::max(1, (int)(scaled<coord_t>(1.0) / res));
+    // 3D scan step: coarser (4mm) since it's the fallback after skyline
+    int scan_step_3d = std::max(2, (int)(scaled<coord_t>(4.0) / res));
 
     // Check whether an item's filament_temp_type is compatible with a plate's
     // assigned material_group. HighTemp (0) and LowTemp (1) cannot coexist.
@@ -1092,7 +1106,7 @@ void BitmapArranger::arrange(
                                       int plate_idx) -> bool {
         auto &bed_stack = plates_3d[plate_idx].stack;
         for (const auto &[stack, rot] : rot_stacks) {
-            auto result = find_placement_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, scan_step);
+            auto result = find_placement_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, scan_step_3d);
             if (result) {
                 auto [px, py] = *result;
                 const auto &s0 = stack.slices[0];
@@ -1294,234 +1308,66 @@ void BitmapArranger::arrange(
     // Falls back to single-threaded when multi-plate is disabled.
     // ============================================================
 
-    if (!params.allow_multi_plate) {
-        // Single-plate mode: simple serial placement, no threading
+    // Plate-centric placement: fill one plate completely (largest to smallest),
+    // then move to the next. Proven reliable — the pipeline threading approach
+    // had vector invalidation races when plates.push_back() was called while
+    // other threads held references into the plates vector.
+    int current_plate = 0;
+
+    for (;;) {
+        bool any_placed_this_plate = false;
+
         for (int i = 0; i < n; i++) {
             if (item_placed[i]) continue;
-            if (params.stopcondition && params.stopcondition()) break;
+            if (params.stopcondition && params.stopcondition()) goto done;
 
             auto &entry = entries[i];
             bool placed = false;
 
             if (use_3d && !rot_stacks_all[i].empty()) {
-                if (is_material_compatible(plates_3d[0].material_group, entry.filament_temp_type))
-                    placed = try_place_on_plate_3d(entry, rot_stacks_all[i], 0);
+                if (is_material_compatible(
+                        use_3d ? plates_3d[current_plate].material_group : -1,
+                        entry.filament_temp_type))
+                    placed = try_place_on_plate_3d(entry, rot_stacks_all[i], current_plate);
             } else {
-                if (is_material_compatible(plates[0].material_group, entry.filament_temp_type))
-                    placed = try_place_on_plate(entry, rot_bmps_all[i], 0);
+                if (is_material_compatible(
+                        plates[current_plate].material_group,
+                        entry.filament_temp_type))
+                    placed = try_place_on_plate(entry, rot_bmps_all[i], current_plate);
             }
 
             if (placed) {
                 item_placed[i] = true;
                 placed_count++;
-            } else {
-                arrangables[entry.orig_idx].bed_idx = -1;
-                item_placed[i] = true;
-                failed_count++;
+                any_placed_this_plate = true;
             }
 
             if (params.progressind)
                 params.progressind(placed_count + failed_count, " (placing parts)");
         }
-    } else {
-        // Multi-plate pipeline: one thread per plate, items flow downhill.
-        // Each plate thread: pull items from inbox, try to place, push rejects to next plate.
-        // Thread-safe queue: simple mutex+vector (items arrive in bursts, not high-frequency).
 
-        struct PlateQueue {
-            std::mutex mtx;
-            std::vector<int> items;        // item indices waiting to be placed
-            bool closed = false;           // upstream plate is done sending
-            std::condition_variable cv;
+        int remaining = 0;
+        for (int i = 0; i < n; i++)
+            if (!item_placed[i]) remaining++;
 
-            void push(int idx) {
-                std::lock_guard<std::mutex> lock(mtx);
-                items.push_back(idx);
-                cv.notify_one();
-            }
+        if (remaining == 0) break;
 
-            void push_batch(const std::vector<int> &batch) {
-                std::lock_guard<std::mutex> lock(mtx);
-                items.insert(items.end(), batch.begin(), batch.end());
-                cv.notify_one();
-            }
-
-            void close() {
-                std::lock_guard<std::mutex> lock(mtx);
-                closed = true;
-                cv.notify_all();
-            }
-
-            // Drain all available items. Returns false when closed and empty.
-            bool drain(std::vector<int> &out) {
-                std::unique_lock<std::mutex> lock(mtx);
-                cv.wait(lock, [&]{ return !items.empty() || closed; });
-                if (items.empty() && closed) return false;
-                out.swap(items);
-                items.clear();
-                return true;
-            }
-        };
-
-        // Plate 0 inbox: all items, largest first
-        auto queue0 = std::make_shared<PlateQueue>();
-        for (int i = 0; i < n; i++) {
-            if (!item_placed[i])
-                queue0->items.push_back(i);
-        }
-        queue0->close(); // plate 0 gets all items upfront
-
-        // Shared state for threads to report results
-        std::mutex result_mutex;
-        std::atomic<bool> stop_flag{false};
-
-        // Thread worker for one plate
-        auto plate_worker = [&](int plate_idx, std::shared_ptr<PlateQueue> inbox,
-                                std::shared_ptr<PlateQueue> outbox) {
-            std::vector<int> batch;
-            while (inbox->drain(batch)) {
-                if (stop_flag.load(std::memory_order_relaxed)) break;
-
-                // Try to place each item on this plate. Items arrive in roughly
-                // largest-first order (inherited from upstream).
-                // Do multiple sweeps: first pass places what fits, second pass
-                // retries smaller items that may fit in gaps from first pass.
-                std::vector<int> rejects;
-
-                bool any_placed = true;
-                while (any_placed && !batch.empty()) {
-                    any_placed = false;
-                    std::vector<int> next_rejects;
-
-                    for (int idx : batch) {
-                        if (stop_flag.load(std::memory_order_relaxed)) break;
-
-                        auto &entry = entries[idx];
-                        bool placed = false;
-
-                        if (use_3d && !rot_stacks_all[idx].empty()) {
-                            if (is_material_compatible(
-                                    plates_3d[plate_idx].material_group, entry.filament_temp_type))
-                                placed = try_place_on_plate_3d(entry, rot_stacks_all[idx], plate_idx);
-                        } else {
-                            if (is_material_compatible(
-                                    plates[plate_idx].material_group, entry.filament_temp_type))
-                                placed = try_place_on_plate(entry, rot_bmps_all[idx], plate_idx);
-                        }
-
-                        if (placed) {
-                            std::lock_guard<std::mutex> lock(result_mutex);
-                            item_placed[idx] = true;
-                            placed_count++;
-                            any_placed = true;
-
-                            if (params.progressind)
-                                params.progressind(placed_count + failed_count, " (placing parts)");
-                        } else {
-                            next_rejects.push_back(idx);
-                        }
-                    }
-                    batch = std::move(next_rejects);
-                }
-
-                // Push rejects downstream
-                if (!batch.empty()) {
-                    if (outbox) {
-                        outbox->push_batch(batch);
-                    } else {
-                        // No outbox yet — these need a new plate
-                        rejects.insert(rejects.end(), batch.begin(), batch.end());
+        if (!any_placed_this_plate) {
+            if (!params.allow_multi_plate ||
+                (use_3d ? (int)plates_3d.size() : (int)plates.size()) >= MAX_PLATES) {
+                for (int i = 0; i < n; i++) {
+                    if (!item_placed[i]) {
+                        arrangables[entries[i].orig_idx].bed_idx = -1;
+                        item_placed[i] = true;
+                        failed_count++;
                     }
                 }
-                batch.clear();
-
-                // Items that need a new plate — push to rejects for the caller to handle
-                if (!rejects.empty() && outbox) {
-                    outbox->push_batch(rejects);
-                } else if (!rejects.empty()) {
-                    // We're the last plate and have no outbox — create one
-                    // This signals the orchestrator to spawn a new plate thread
-                    std::lock_guard<std::mutex> lock(result_mutex);
-                    for (int idx : rejects) {
-                        // Temporarily park as unplaced — orchestrator will route them
-                        // item_placed stays false, they'll be swept up
-                    }
-                }
-            }
-
-            // Close outbox when we're done
-            if (outbox) outbox->close();
-        };
-
-        // Orchestrator: spawn plate threads as needed
-        std::vector<std::thread> threads;
-        std::vector<std::shared_ptr<PlateQueue>> queues;
-        queues.push_back(queue0);
-
-        int n_plate_threads = 0;
-        auto spawn_plate_thread = [&](int plate_idx, std::shared_ptr<PlateQueue> inbox) {
-            // Create outbox for the next plate (lazy — thread fills it if items don't fit)
-            auto outbox = std::make_shared<PlateQueue>();
-            queues.push_back(outbox);
-            threads.emplace_back(plate_worker, plate_idx, inbox, outbox);
-            n_plate_threads++;
-        };
-
-        // Spawn thread for plate 0
-        spawn_plate_thread(0, queue0);
-
-        // Monitor: when a queue gets items and no thread is consuming it, spawn a new plate
-        while (true) {
-            if (params.stopcondition && params.stopcondition()) {
-                stop_flag.store(true);
                 break;
             }
-
-            // Check the last queue — if it has items, we need a new plate + thread
-            auto &last_queue = queues.back();
-            {
-                std::lock_guard<std::mutex> lock(last_queue->mtx);
-                if (!last_queue->items.empty()) {
-                    int next_plate_idx = use_3d ? (int)plates_3d.size() : (int)plates.size();
-                    if (next_plate_idx < MAX_PLATES) {
-                        int new_idx = use_3d ? new_3d_plate() : new_2d_plate();
-                        spawn_plate_thread(new_idx, last_queue);
-                        continue; // re-check immediately
-                    }
-                }
-            }
-
-            // Check if all threads are done
-            bool all_queues_closed_and_empty = true;
-            for (auto &q : queues) {
-                std::lock_guard<std::mutex> lock(q->mtx);
-                if (!q->items.empty() || !q->closed) {
-                    all_queues_closed_and_empty = false;
-                    break;
-                }
-            }
-            if (all_queues_closed_and_empty) break;
-
-            // Brief sleep to avoid busy-wait — threads do the real work
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-
-        // Join all threads
-        stop_flag.store(true);
-        for (auto &q : queues) q->close();
-        for (auto &t : threads) {
-            if (t.joinable()) t.join();
-        }
-
-        // Mark any remaining unplaced items as failed
-        for (int i = 0; i < n; i++) {
-            if (!item_placed[i]) {
-                arrangables[entries[i].orig_idx].bed_idx = -1;
-                item_placed[i] = true;
-                failed_count++;
-            }
+            current_plate = use_3d ? new_3d_plate() : new_2d_plate();
         }
     }
+    done:
 
     // ============================================================
     // PHASE 4: Compaction — configurable strategies to reduce plate count
