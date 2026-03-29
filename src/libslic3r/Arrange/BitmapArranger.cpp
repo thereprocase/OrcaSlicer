@@ -350,29 +350,31 @@ BitmapArranger::SliceStack BitmapArranger::rasterize_slices(
         }
     }
 
-    // Optimization: if all slices have identical triangle sets (no overhangs),
-    // collapse to a single slice. This avoids N×rotations work for simple parts.
-    // Check by comparing triangle counts per slice — if all match slice 0, they're
-    // likely identical (same triangles contribute to every Z range).
-    if (stack.n_slices > 1) {
-        size_t ref_count = slice_tris[0].size();
+    // Optimization: if all slices produce identical bitmaps (no overhangs),
+    // collapse to a single slice. Avoids N×rotations for simple prismatic parts.
+    // Compare actual rasterized bits, not triangle counts — triangle counts differ
+    // even for cylinders because top/bottom face triangles land in different slices.
+    if (stack.n_slices > 1 && !stack.slices[0].bits.empty()) {
         bool all_same = true;
-        for (int s = 1; s < stack.n_slices; s++) {
-            if (slice_tris[s].size() != ref_count) {
+        const auto &ref_bits = stack.slices[0].bits;
+        int ref_w = stack.slices[0].width_px;
+        int ref_h = stack.slices[0].height_px;
+        for (int s = 1; s < stack.n_slices && all_same; s++) {
+            if (stack.slices[s].width_px != ref_w ||
+                stack.slices[s].height_px != ref_h ||
+                stack.slices[s].bits.size() != ref_bits.size()) {
                 all_same = false;
                 break;
             }
+            if (stack.slices[s].bits != ref_bits)
+                all_same = false;
         }
-        if (all_same && ref_count > 0) {
-            // All slices have the same triangles — just keep one and replicate
-            // during collision checks. Store as single-slice stack.
+        if (all_same) {
             BitmapItem s0 = std::move(stack.slices[0]);
             stack.slices.clear();
             stack.slices.push_back(std::move(s0));
-            // Keep n_slices as the original count so collides_3d knows the Z extent,
-            // but the single-slice stack signals "use slice 0 for all Z levels"
-            BOOST_LOG_TRIVIAL(debug) << "BitmapArranger: collapsed " << stack.n_slices
-                                     << " identical slices to 1";
+            BOOST_LOG_TRIVIAL(info) << "BitmapArranger: collapsed " << stack.n_slices
+                                    << " identical slices to 1";
         }
     }
 
@@ -479,31 +481,11 @@ std::optional<std::pair<int,int>> BitmapArranger::find_placement_3d(
     const auto &bed_s0 = bed_stack.slices[0];
     const auto &item_s0 = item_stack.slices[0];
 
-    // Stage 1: skyline on the bottom slice
-    {
-        std::vector<int> sky(bed_w_px, 0);
-        for (int x = 0; x < bed_w_px; x++) {
-            for (int y = bed_h - 1; y >= 0; y--) {
-                int word = x / 64, bit = x % 64;
-                if (bed_s0.bits[(size_t)y * bed_w + word] & (uint64_t(1) << bit)) {
-                    sky[x] = y + 1;
-                    break;
-                }
-            }
-        }
-
-        auto profile = compute_profile(item_s0, bed_h);
-        if (profile.max_y >= 0) {
-            auto result = find_placement_skyline(sky, bed_w_px, bed_h, profile);
-            if (result) {
-                auto [px, py] = *result;
-                if (!collides_3d(bed_stack, bed_w, bed_w_px, bed_h, item_stack, px, py))
-                    return std::make_pair(px, py);
-            }
-        }
-    }
-
-    // Stage 2: center-out scan with 2D pre-filter on slice 0
+    // Skyline stage is now handled by the caller (try_place_on_plate_3d)
+    // which caches the skyline across rotation attempts. This function is
+    // only called as a fallback — go straight to center-out scan.
+    //
+    // Center-out scan with 2D pre-filter on slice 0:
     int cx = max_x / 2, cy = max_y / 2;
     int max_radius = std::max(max_x, max_y);
 
@@ -1100,19 +1082,61 @@ void BitmapArranger::arrange(
         return false;
     };
 
-    // 3D placement: try all rotated stacks on a 3D plate
+    // 3D placement: try all rotated stacks on a 3D plate.
+    // Builds the bottom-slice skyline once per call (shared across rotations).
     auto try_place_on_plate_3d = [&](const ItemEntry &entry,
                                       const std::vector<std::pair<SliceStack, double>> &rot_stacks,
                                       int plate_idx) -> bool {
         auto &bed_stack = plates_3d[plate_idx].stack;
+        if (bed_stack.slices.empty()) return false;
+
+        // Build skyline from bottom slice once — reused across all rotation attempts
+        const auto &bed_s0 = bed_stack.slices[0];
+        std::vector<int> sky(bed_w_px, 0);
+        for (int x = 0; x < bed_w_px; x++) {
+            for (int y = bed_h_px - 1; y >= 0; y--) {
+                int word = x / 64, bit = x % 64;
+                if (bed_s0.bits[(size_t)y * bed_w_words + word] & (uint64_t(1) << bit)) {
+                    sky[x] = y + 1;
+                    break;
+                }
+            }
+        }
+
         for (const auto &[stack, rot] : rot_stacks) {
-            auto result = find_placement_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, scan_step_3d);
+            if (stack.slices.empty()) continue;
+            const auto &item_s0 = stack.slices[0];
+            if (item_s0.width_px <= 0 || item_s0.height_px <= 0) continue;
+
+            // Use cached skyline for fast placement on bottom slice
+            auto profile = compute_profile(item_s0, bed_h_px);
+            if (profile.max_y < 0) continue;
+
+            auto result = find_placement_skyline(sky, bed_w_px, bed_h_px, profile);
             if (result) {
                 auto [px, py] = *result;
-                const auto &s0 = stack.slices[0];
+                // Verify with full 3D collision
+                if (!collides_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py)) {
+                    arrangables[entry.orig_idx].translation = {
+                        effective_bed.min.x() + (coord_t)(px * res) - item_s0.offset_x,
+                        effective_bed.min.y() + (coord_t)(py * res) - item_s0.offset_y
+                    };
+                    arrangables[entry.orig_idx].rotation = rot;
+                    arrangables[entry.orig_idx].bed_idx = plate_idx;
+                    stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
+                    if (plates_3d[plate_idx].material_group < 0)
+                        plates_3d[plate_idx].material_group = entry.filament_temp_type;
+                    return true;
+                }
+            }
+
+            // Skyline failed or 3D collision at skyline position — try center-out fallback
+            auto fallback = find_placement_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, scan_step_3d);
+            if (fallback) {
+                auto [px, py] = *fallback;
                 arrangables[entry.orig_idx].translation = {
-                    effective_bed.min.x() + (coord_t)(px * res) - s0.offset_x,
-                    effective_bed.min.y() + (coord_t)(py * res) - s0.offset_y
+                    effective_bed.min.x() + (coord_t)(px * res) - item_s0.offset_x,
+                    effective_bed.min.y() + (coord_t)(py * res) - item_s0.offset_y
                 };
                 arrangables[entry.orig_idx].rotation = rot;
                 arrangables[entry.orig_idx].bed_idx = plate_idx;
