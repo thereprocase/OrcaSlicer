@@ -147,6 +147,9 @@ struct ArrangeParams {
     bool  nesting_3d                          = false;
     float slice_height_mm                     = 12.7f;
     float z_clearance_mm                      = 2.0f;
+    int   compaction_mode                     = 3;  // 0=none, 1=coarse bitmap, 2=reverse skyline, 3=both
+    bool  gravity_compact                     = false; // slide parts toward Y=0 to tighten layout
+    bool  best_fit_compact                    = true;  // try all plates, pick lowest Y (vs first-fit)
     float bed_shrink_x = 1;
     float bed_shrink_y = 1;
     float brim_skirt_distance = 0;

@@ -504,6 +504,9 @@ public:
         int   purge_pad_edge       = 0;      // 0=front, 1=back, 2=left, 3=right
         float purge_pad_mm         = 5.f;    // mm to exclude (0-20 range)
         float bitmap_resolution_mm = 0.5f;  // mm per pixel (0.1-2.0)
+        int   compaction_mode      = 3;    // 0=none, 1=coarse bitmap, 2=reverse skyline, 3=both
+        bool  gravity_compact      = false;
+        bool  best_fit_compact     = true;
         bool  nesting_3d           = false;
         float slice_height_mm      = 12.7f;
         float z_clearance_mm       = 2.0f;
