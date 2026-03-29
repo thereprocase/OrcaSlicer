@@ -5892,12 +5892,12 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         imgui->text(_L("Resolution"));
         ImGui::SameLine(1.2 * cursor_slider_left);
         ImGui::PushItemWidth(window_width - slider_icon_width);
-        bool res_changed = imgui->bbl_slider_float_style("##bitmap_res", &settings.bitmap_resolution_mm, 0.1f, 2.0f, "%.1f");
+        bool res_changed = imgui->bbl_slider_float_style("##bitmap_res", &settings.bitmap_resolution_mm, 0.3f, 2.0f, "%.1f");
         ImGui::SameLine(window_width - slider_icon_width + 1.3 * cursor_slider_left);
         ImGui::PushItemWidth(1.5 * slider_icon_width);
-        bool res_input = ImGui::BBLDragFloat("##bitmap_res_input", &settings.bitmap_resolution_mm, 0.1f, 0.1f, 2.0f, "%.1f");
+        bool res_input = ImGui::BBLDragFloat("##bitmap_res_input", &settings.bitmap_resolution_mm, 0.1f, 0.3f, 2.0f, "%.1f");
         if (res_changed || res_input) {
-            settings.bitmap_resolution_mm = std::clamp(settings.bitmap_resolution_mm, 0.1f, 2.0f);
+            settings.bitmap_resolution_mm = std::clamp(settings.bitmap_resolution_mm, 0.3f, 2.0f);
             settings_out.bitmap_resolution_mm = settings.bitmap_resolution_mm;
             appcfg->set("arrange", "bitmap_resolution_mm", float_to_string_decimal_point(settings_out.bitmap_resolution_mm));
             settings_changed = true;
@@ -6135,18 +6135,43 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     }
 
     ImGui::Separator();
-    // Debug version tag — helps confirm which build is running during testing
-    if (settings_out.use_concave_hulls) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 0.8f));
-        imgui->text("bitmap arranger dev");
-        ImGui::PopStyleColor();
-    }
+    imgui->text_colored(ImVec4(0.5f, 0.5f, 0.5f, 0.7f), "bitmap arranger dev");
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(15.0f, 10.0f));
     if (imgui->button(_L("Arrange"))) {
         wxGetApp().plater()->set_prepare_state(Job::PREPARE_STATE_DEFAULT);
         wxGetApp().plater()->arrange();
     }
 
+    ImGui::SameLine();
+
+    if (imgui->button(_L("Defaults"))) {
+        settings.bitmap_resolution_mm = 1.0f;
+        settings.compaction_mode = 3;
+        settings.best_fit_compact = true;
+        settings.rotation_step_deg = 15;
+        settings.enable_rotation = true;
+        settings.nesting_3d = false;
+        settings.slice_height_mm = 10.0f;
+        settings.z_clearance_mm = 2.0f;
+        settings.avoid_purge_pad = false;
+        settings.purge_pad_mm = 5.0f;
+        settings.purge_pad_edge = 0;
+
+        settings_out = settings;
+        // Save all to config
+        appcfg->set("arrange", "bitmap_resolution_mm", float_to_string_decimal_point(settings_out.bitmap_resolution_mm));
+        appcfg->set("arrange", "compaction_mode", std::to_string(settings_out.compaction_mode));
+        appcfg->set("arrange", "best_fit_compact", settings_out.best_fit_compact ? "1" : "0");
+        appcfg->set("arrange", rot_key.c_str(), settings_out.enable_rotation ? "1" : "0");
+        appcfg->set("arrange", "rotation_step_deg_fff", std::to_string(settings_out.rotation_step_deg));
+        appcfg->set("arrange", "nesting_3d", settings_out.nesting_3d ? "1" : "0");
+        appcfg->set("arrange", "slice_height_mm", float_to_string_decimal_point(settings_out.slice_height_mm));
+        appcfg->set("arrange", "z_clearance_mm", float_to_string_decimal_point(settings_out.z_clearance_mm));
+        appcfg->set("arrange", "avoid_purge_pad", settings_out.avoid_purge_pad ? "1" : "0");
+        appcfg->set("arrange", "purge_pad_mm", float_to_string_decimal_point(settings_out.purge_pad_mm));
+        appcfg->set("arrange", "purge_pad_edge", std::to_string(settings_out.purge_pad_edge));
+        settings_changed = true;
+    }
     ImGui::SameLine();
 
     if (imgui->button(_L("Reset"))) {

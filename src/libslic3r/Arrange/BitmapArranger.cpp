@@ -1157,6 +1157,7 @@ void BitmapArranger::arrange(
 
     struct PlateState3D {
         SliceStack stack;
+        std::vector<int> skyline;  // cached from bottom slice; updated incrementally after stamp_3d
         int material_group = -1;
         int free_px = 0; // based on slice 0
     };
@@ -1201,6 +1202,17 @@ void BitmapArranger::arrange(
         s0.width_px = bed_w_px;
         s0.height_px = bed_h_px;
         stamp_excludes(s0.bits);
+        // Initialize skyline from exclude-stamped bottom slice
+        p3d.skyline.assign(bed_w_px, 0);
+        for (int x = 0; x < bed_w_px; x++) {
+            for (int y = bed_h_px - 1; y >= 0; y--) {
+                int word = x / 64, bit = x % 64;
+                if (s0.bits[(size_t)y * bed_w_words + word] & (uint64_t(1) << bit)) {
+                    p3d.skyline[x] = y + 1;
+                    break;
+                }
+            }
+        }
         plates_3d.push_back(std::move(p3d));
     }
 
@@ -1446,18 +1458,8 @@ void BitmapArranger::arrange(
         if (max_item_slices > 0)
             ensure_bed_height(bed_stack, max_item_slices);
 
-        // Build skyline from bottom slice once
-        const auto &bed_s0 = bed_stack.slices[0];
-        std::vector<int> sky(bed_w_px, 0);
-        for (int x = 0; x < bed_w_px; x++) {
-            for (int y = bed_h_px - 1; y >= 0; y--) {
-                int word = x / 64, bit = x % 64;
-                if (bed_s0.bits[(size_t)y * bed_w_words + word] & (uint64_t(1) << bit)) {
-                    sky[x] = y + 1;
-                    break;
-                }
-            }
-        }
+        // Use cached skyline from PlateState3D (maintained incrementally)
+        const auto &sky = plates_3d[plate_idx].skyline;
 
         // Per-rotation skyline: each rotation gets its own skyline search with
         // its own width constraint. Collect all valid placements, pick lowest Y
@@ -1497,6 +1499,14 @@ void BitmapArranger::arrange(
             arrangables[entry.orig_idx].rotation = rot;
             arrangables[entry.orig_idx].bed_idx = plate_idx;
             stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, best_cx, best_cy, stamp_excludes);
+            // Update cached skyline incrementally from placed item's bottom slice
+            auto profile = compute_profile(item_s0, bed_h_px);
+            for (const auto &[col, top] : profile.top_pairs) {
+                int c = best_cx + col;
+                int v = best_cy + top;
+                if (c < bed_w_px && v > plates_3d[plate_idx].skyline[c])
+                    plates_3d[plate_idx].skyline[c] = v;
+            }
             if (plates_3d[plate_idx].material_group < 0)
                 plates_3d[plate_idx].material_group = entry.filament_temp_type;
             return true;
@@ -1516,6 +1526,14 @@ void BitmapArranger::arrange(
                 arrangables[entry.orig_idx].rotation = rot;
                 arrangables[entry.orig_idx].bed_idx = plate_idx;
                 stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
+                // Update cached skyline incrementally from placed item's bottom slice
+                auto prof = compute_profile(item_s0, bed_h_px);
+                for (const auto &[col, top] : prof.top_pairs) {
+                    int c = px + col;
+                    int v = py + top;
+                    if (c < bed_w_px && v > plates_3d[plate_idx].skyline[c])
+                        plates_3d[plate_idx].skyline[c] = v;
+                }
                 if (plates_3d[plate_idx].material_group < 0)
                     plates_3d[plate_idx].material_group = entry.filament_temp_type;
                 return true;
@@ -1794,6 +1812,17 @@ void BitmapArranger::arrange(
         s0.width_px = bed_w_px;
         s0.height_px = bed_h_px;
         stamp_excludes(s0.bits);
+        // Initialize skyline from exclude-stamped bottom slice
+        p3d.skyline.assign(bed_w_px, 0);
+        for (int x = 0; x < bed_w_px; x++) {
+            for (int y = bed_h_px - 1; y >= 0; y--) {
+                int word = x / 64, bit = x % 64;
+                if (s0.bits[(size_t)y * bed_w_words + word] & (uint64_t(1) << bit)) {
+                    p3d.skyline[x] = y + 1;
+                    break;
+                }
+            }
+        }
         p3d.stack.slices.push_back(std::move(s0));
         int idx = (int)plates_3d.size();
         plates_3d.push_back(std::move(p3d));
@@ -1919,6 +1948,14 @@ void BitmapArranger::arrange(
                                 arrangables[entry.orig_idx].rotation = rot;
                                 arrangables[entry.orig_idx].bed_idx = pi;
                                 stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
+                                // Update cached skyline incrementally
+                                auto prof = compute_profile(item_s0, bed_h_px);
+                                for (const auto &[col, top] : prof.top_pairs) {
+                                    int c = px + col;
+                                    int v = py + top;
+                                    if (c < bed_w_px && v > plates_3d[pi].skyline[c])
+                                        plates_3d[pi].skyline[c] = v;
+                                }
                                 if (plates_3d[pi].material_group < 0)
                                     plates_3d[pi].material_group = entry.filament_temp_type;
                                 register_extruders(pi, entry.extrude_ids);
@@ -2146,23 +2183,11 @@ void BitmapArranger::arrange(
                         const auto &item_s0 = stack.slices[0];
                         if (item_s0.width_px <= 0 || item_s0.height_px <= 0) continue;
 
-                        // Build skyline from bed's bottom slice
-                        const auto &bed_s0 = plates_3d[pi].stack.slices[0];
-                        std::vector<int> sky(bed_w_px, 0);
-                        for (int x = 0; x < bed_w_px; x++) {
-                            for (int y = bed_h_px - 1; y >= 0; y--) {
-                                int word = x / 64, bit = x % 64;
-                                if (bed_s0.bits[(size_t)y * bed_w_words + word] & (uint64_t(1) << bit)) {
-                                    sky[x] = y + 1;
-                                    break;
-                                }
-                            }
-                        }
-
+                        // Use cached skyline from PlateState3D
                         auto profile = compute_profile(item_s0, bed_h_px);
                         if (profile.max_y < 0) continue;
 
-                        auto result = find_placement_skyline(sky, bed_w_px, bed_h_px, profile);
+                        auto result = find_placement_skyline(plates_3d[pi].skyline, bed_w_px, bed_h_px, profile);
                         if (result) {
                             auto [px, py] = *result;
                             if (!collides_3d(plates_3d[pi].stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py)) {
@@ -2173,6 +2198,13 @@ void BitmapArranger::arrange(
                                 arrangables[entries[idx].orig_idx].rotation = rot;
                                 arrangables[entries[idx].orig_idx].bed_idx = pi;
                                 stamp_3d(plates_3d[pi].stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
+                                // Update cached skyline incrementally
+                                for (const auto &[col, top] : profile.top_pairs) {
+                                    int c = px + col;
+                                    int v = py + top;
+                                    if (c < bed_w_px && v > plates_3d[pi].skyline[c])
+                                        plates_3d[pi].skyline[c] = v;
+                                }
                                 register_extruders(pi, entries[idx].extrude_ids);
                                 relocated = true;
                                 moved++;
@@ -2191,6 +2223,13 @@ void BitmapArranger::arrange(
                             arrangables[entries[idx].orig_idx].rotation = rot;
                             arrangables[entries[idx].orig_idx].bed_idx = pi;
                             stamp_3d(plates_3d[pi].stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
+                            // Update cached skyline incrementally
+                            for (const auto &[col, top] : profile.top_pairs) {
+                                int c = px + col;
+                                int v = py + top;
+                                if (c < bed_w_px && v > plates_3d[pi].skyline[c])
+                                    plates_3d[pi].skyline[c] = v;
+                            }
                             register_extruders(pi, entries[idx].extrude_ids);
                             relocated = true;
                             moved++;
