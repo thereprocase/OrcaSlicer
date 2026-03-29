@@ -1224,10 +1224,10 @@ void BitmapArranger::arrange(
 
             if (last_plate_items.empty()) break;
 
-            // Use bitmap collision scanning (not skyline) for compaction.
-            // Skyline already said "no" for these items — the gaps are BELOW
-            // the skyline in concave regions. Bitmap scanning finds them.
-            int scan_step_compact = std::max(1, (int)(scaled<coord_t>(1.0) / res));
+            // Compaction: fast coarse bitmap scan to find gaps below the skyline.
+            // Use a big stride (4mm) — we just need ANY valid spot, not optimal.
+            // Only runs on a handful of items so total cost is minimal.
+            int compact_step = std::max(2, (int)(scaled<coord_t>(4.0) / res));
 
             int moved = 0;
             for (int idx : last_plate_items) {
@@ -1238,32 +1238,38 @@ void BitmapArranger::arrange(
                     if (!is_material_compatible(plates[pi].material_group, entry.filament_temp_type))
                         continue;
 
-                    // Try each rotation variant with bitmap scanning
                     for (const auto &[bmp, rot] : rot_bmps_all[idx]) {
                         if (bmp.width_px <= 0 || bmp.height_px <= 0) continue;
-                        auto result = find_placement(plates[pi].bits, bed_w_words, bed_w_px, bed_h_px,
-                                                     bmp, scan_step_compact);
-                        if (result) {
-                            auto [px, py] = *result;
-                            arrangables[entry.orig_idx].translation = {
-                                effective_bed.min.x() + (coord_t)(px * res) - bmp.offset_x,
-                                effective_bed.min.y() + (coord_t)(py * res) - bmp.offset_y
-                            };
-                            arrangables[entry.orig_idx].rotation = rot;
-                            arrangables[entry.orig_idx].bed_idx = pi;
-                            stamp(plates[pi].bits, bed_w_words, bed_w_px, bed_h_px, bmp, px, py);
-                            // Update skyline for this plate
-                            auto profile = compute_profile(bmp, bed_h_px);
-                            for (const auto &[col, top] : profile.top_pairs) {
-                                int c = px + col;
-                                int v = py + top;
-                                if (c < bed_w_px && v > plates[pi].skyline[c])
-                                    plates[pi].skyline[c] = v;
+                        int max_x = bed_w_px - bmp.width_px;
+                        int max_y = bed_h_px - bmp.height_px;
+                        if (max_x < 0 || max_y < 0) continue;
+
+                        // Fast grid scan — check every compact_step position
+                        bool found = false;
+                        for (int y = 0; y <= max_y && !found; y += compact_step) {
+                            for (int x = 0; x <= max_x && !found; x += compact_step) {
+                                if (!collides(plates[pi].bits, bed_w_words, bed_w_px, bed_h_px, bmp, x, y)) {
+                                    arrangables[entry.orig_idx].translation = {
+                                        effective_bed.min.x() + (coord_t)(x * res) - bmp.offset_x,
+                                        effective_bed.min.y() + (coord_t)(y * res) - bmp.offset_y
+                                    };
+                                    arrangables[entry.orig_idx].rotation = rot;
+                                    arrangables[entry.orig_idx].bed_idx = pi;
+                                    stamp(plates[pi].bits, bed_w_words, bed_w_px, bed_h_px, bmp, x, y);
+                                    auto profile = compute_profile(bmp, bed_h_px);
+                                    for (const auto &[col, top] : profile.top_pairs) {
+                                        int c = x + col;
+                                        int v = y + top;
+                                        if (c < bed_w_px && v > plates[pi].skyline[c])
+                                            plates[pi].skyline[c] = v;
+                                    }
+                                    relocated = true;
+                                    moved++;
+                                    found = true;
+                                }
                             }
-                            relocated = true;
-                            moved++;
-                            break;
                         }
+                        if (relocated) break;
                     }
                     if (relocated) break;
                 }
