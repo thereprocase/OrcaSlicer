@@ -1029,6 +1029,8 @@ void BitmapArranger::arrange(
     const ArrangeParams &params)
 {
     coord_t res = scaled<coord_t>(std::clamp(params.bitmap_resolution_mm, 0.1f, 2.0f));
+    if (res < scaled<coord_t>(0.3))
+        res = scaled<coord_t>(0.3);
     coord_t inflation = params.min_obj_distance / 2;
 
     BoundingBox effective_bed = bed;
@@ -1135,7 +1137,7 @@ void BitmapArranger::arrange(
                 ep.rotate(excl.rotation);
                 ep.translate(excl.translation.x() - effective_bed.min.x(),
                              excl.translation.y() - effective_bed.min.y());
-                auto bmp = rasterize(ep, res, res); // 1-pixel inflation for safety margin
+                auto bmp = rasterize(ep, scaled<coord_t>(1.0), res); // 1mm physical padding around exclusion zones (resolution-dependent)
                 int ox = (int)std::floor((double)bmp.offset_x / res);
                 int oy = (int)std::floor((double)bmp.offset_y / res);
                 stamp(bits, bed_w_words, bed_w_px, bed_h_px, bmp, ox, oy);

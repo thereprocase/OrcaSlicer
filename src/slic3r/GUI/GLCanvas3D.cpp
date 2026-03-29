@@ -1145,10 +1145,19 @@ void GLCanvas3D::load_arrange_settings()
     if (!en_consolidate_str.empty())
         m_arrange_settings_fff.consolidate_plates = (en_consolidate_str == "1" || en_consolidate_str == "true");
 
+    // Guard against malformed config values (e.g. "true"/"false" where a
+    // number is expected). Keeps the struct default on parse failure.
+    auto safe_stof = [](const std::string& s, float fallback) -> float {
+        try { return std::stof(s); } catch (...) { return fallback; }
+    };
+    auto safe_stoi = [](const std::string& s, int fallback) -> int {
+        try { return std::stoi(s); } catch (...) { return fallback; }
+    };
+
     std::string rot_step_str =
         wxGetApp().app_config->get("arrange", "rotation_step_deg_fff");
     if (!rot_step_str.empty())
-        m_arrange_settings_fff.rotation_step_deg = std::stoi(rot_step_str);
+        m_arrange_settings_fff.rotation_step_deg = safe_stoi(rot_step_str, 45);
 
     std::string purge_pad_str = wxGetApp().app_config->get("arrange", "avoid_purge_pad");
     if (!purge_pad_str.empty())
@@ -1156,15 +1165,15 @@ void GLCanvas3D::load_arrange_settings()
 
     std::string purge_edge_str = wxGetApp().app_config->get("arrange", "purge_pad_edge");
     if (!purge_edge_str.empty())
-        m_arrange_settings_fff.purge_pad_edge = std::stoi(purge_edge_str);
+        m_arrange_settings_fff.purge_pad_edge = safe_stoi(purge_edge_str, 0);
 
     std::string purge_mm_str = wxGetApp().app_config->get("arrange", "purge_pad_mm");
     if (!purge_mm_str.empty())
-        m_arrange_settings_fff.purge_pad_mm = std::stof(purge_mm_str);
+        m_arrange_settings_fff.purge_pad_mm = safe_stof(purge_mm_str, 5.0f);
 
     std::string bitmap_res_str = wxGetApp().app_config->get("arrange", "bitmap_resolution_mm");
     if (!bitmap_res_str.empty())
-        m_arrange_settings_fff.bitmap_resolution_mm = std::stof(bitmap_res_str);
+        m_arrange_settings_fff.bitmap_resolution_mm = safe_stof(bitmap_res_str, 1.0f);
 
     std::string nesting_3d_str = wxGetApp().app_config->get("arrange", "nesting_3d");
     if (!nesting_3d_str.empty())
@@ -1172,15 +1181,15 @@ void GLCanvas3D::load_arrange_settings()
 
     std::string slice_h_str = wxGetApp().app_config->get("arrange", "slice_height_mm");
     if (!slice_h_str.empty())
-        m_arrange_settings_fff.slice_height_mm = std::stof(slice_h_str);
+        m_arrange_settings_fff.slice_height_mm = safe_stof(slice_h_str, 10.0f);
 
     std::string z_clear_str = wxGetApp().app_config->get("arrange", "z_clearance_mm");
     if (!z_clear_str.empty())
-        m_arrange_settings_fff.z_clearance_mm = std::stof(z_clear_str);
+        m_arrange_settings_fff.z_clearance_mm = safe_stof(z_clear_str, 2.0f);
 
     std::string compact_mode_str = wxGetApp().app_config->get("arrange", "compaction_mode");
     if (!compact_mode_str.empty())
-        m_arrange_settings_fff.compaction_mode = std::stoi(compact_mode_str);
+        m_arrange_settings_fff.compaction_mode = safe_stoi(compact_mode_str, 3);
 
     std::string best_fit_str = wxGetApp().app_config->get("arrange", "best_fit_compact");
     if (!best_fit_str.empty())
@@ -6055,7 +6064,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     // ====== ROTATION ======
     if (imgui->bbl_checkbox(_L("Auto rotate"), settings.enable_rotation)) {
         settings_out.enable_rotation = settings.enable_rotation;
-        appcfg->set("arrange", rot_key.c_str(), settings_out.enable_rotation);
+        appcfg->set("arrange", rot_key.c_str(), settings_out.enable_rotation ? "1" : "0");
         settings_changed = true;
     }
 
@@ -6088,7 +6097,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     // ====== MATERIAL SEPARATION ======
     if (imgui->bbl_checkbox(_L("Allow multiple materials on same plate"), settings.allow_multi_materials_on_same_plate)) {
         settings_out.allow_multi_materials_on_same_plate = settings.allow_multi_materials_on_same_plate;
-        appcfg->set("arrange", multi_material_key.c_str(), settings_out.allow_multi_materials_on_same_plate );
+        appcfg->set("arrange", multi_material_key.c_str(), settings_out.allow_multi_materials_on_same_plate ? "1" : "0");
         settings_changed = true;
     }
     if (ImGui::IsItemHovered())
