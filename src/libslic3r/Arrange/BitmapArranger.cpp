@@ -1616,8 +1616,102 @@ void BitmapArranger::arrange(
         }
     };
 
-    // Run compaction if enabled (works for both 2D and 3D modes)
-    if (plates.size() > 1 && params.compaction_mode > 0) {
+    // Run compaction if enabled
+    // 3D compaction: try to relocate items from the last 3D plate onto earlier plates
+    if (use_3d && plates_3d.size() > 1 && params.compaction_mode > 0) {
+        bool compacted = true;
+        while (compacted && plates_3d.size() > 1) {
+            compacted = false;
+            int last_plate = (int)plates_3d.size() - 1;
+
+            std::vector<int> last_plate_items;
+            for (int i = n - 1; i >= 0; i--) {
+                if (!item_placed[i]) continue;
+                if (arrangables[entries[i].orig_idx].bed_idx == last_plate)
+                    last_plate_items.push_back(i);
+            }
+            if (last_plate_items.empty()) break;
+
+            int moved = 0;
+            for (int idx : last_plate_items) {
+                if (params.stopcondition && params.stopcondition()) break;
+                if (rot_stacks_all[idx].empty()) continue;
+
+                bool relocated = false;
+                for (int pi = 0; pi < last_plate && !relocated; pi++) {
+                    if (!is_material_compatible(plates_3d[pi].material_group, entries[idx].filament_temp_type))
+                        continue;
+
+                    // Try each rotation on this plate
+                    for (const auto &[stack, rot] : rot_stacks_all[idx]) {
+                        if (stack.slices.empty()) continue;
+                        const auto &item_s0 = stack.slices[0];
+                        if (item_s0.width_px <= 0 || item_s0.height_px <= 0) continue;
+
+                        // Build skyline from bed's bottom slice
+                        const auto &bed_s0 = plates_3d[pi].stack.slices[0];
+                        std::vector<int> sky(bed_w_px, 0);
+                        for (int x = 0; x < bed_w_px; x++) {
+                            for (int y = bed_h_px - 1; y >= 0; y--) {
+                                int word = x / 64, bit = x % 64;
+                                if (bed_s0.bits[(size_t)y * bed_w_words + word] & (uint64_t(1) << bit)) {
+                                    sky[x] = y + 1;
+                                    break;
+                                }
+                            }
+                        }
+
+                        auto profile = compute_profile(item_s0, bed_h_px);
+                        if (profile.max_y < 0) continue;
+
+                        auto result = find_placement_skyline(sky, bed_w_px, bed_h_px, profile);
+                        if (result) {
+                            auto [px, py] = *result;
+                            if (!collides_3d(plates_3d[pi].stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py)) {
+                                arrangables[entries[idx].orig_idx].translation = {
+                                    effective_bed.min.x() + (coord_t)(px * res) - item_s0.offset_x,
+                                    effective_bed.min.y() + (coord_t)(py * res) - item_s0.offset_y
+                                };
+                                arrangables[entries[idx].orig_idx].rotation = rot;
+                                arrangables[entries[idx].orig_idx].bed_idx = pi;
+                                stamp_3d(plates_3d[pi].stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
+                                relocated = true;
+                                moved++;
+                                break;
+                            }
+                        }
+
+                        // Skyline failed — try center-out fallback
+                        auto fallback = find_placement_3d(plates_3d[pi].stack, bed_w_words, bed_w_px, bed_h_px, stack, scan_step_3d);
+                        if (fallback) {
+                            auto [px, py] = *fallback;
+                            arrangables[entries[idx].orig_idx].translation = {
+                                effective_bed.min.x() + (coord_t)(px * res) - item_s0.offset_x,
+                                effective_bed.min.y() + (coord_t)(py * res) - item_s0.offset_y
+                            };
+                            arrangables[entries[idx].orig_idx].rotation = rot;
+                            arrangables[entries[idx].orig_idx].bed_idx = pi;
+                            stamp_3d(plates_3d[pi].stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
+                            relocated = true;
+                            moved++;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (moved > 0 && moved == (int)last_plate_items.size()) {
+                plates_3d.pop_back();
+                compacted = true;
+                BOOST_LOG_TRIVIAL(info) << "BitmapArranger: 3D compacted — removed plate " << last_plate;
+            } else {
+                compacted = false;
+            }
+        }
+    }
+
+    // 2D compaction
+    if (!use_3d && plates.size() > 1 && params.compaction_mode > 0) {
         bool compacted = true;
         while (compacted && plates.size() > 1) {
             compacted = false;
@@ -1782,45 +1876,82 @@ void BitmapArranger::arrange(
     // PHASE 6: Overlap safety check — paranoid failsafe
     // ============================================================
     // Re-rasterize all placed items per plate and verify no pixel overlaps.
-    // If any overlap is found, move the offending item to a new plate.
-    // This should never trigger — if it does, there's a bug upstream.
-    // But overlapping parts on a 14-hour print is a catastrophic failure,
-    // so we check anyway. Cost: O(items × item_pixels), negligible.
+    // If any overlap is found, mark the item as unarranged (Phase 7 rescues it).
+    // Handles both 2D and 3D modes.
     {
         int n_plates_check = use_3d ? (int)plates_3d.size() : (int)plates.size();
-        // Rebuild bed bitmaps from scratch per plate
         for (int pi = 0; pi < n_plates_check; pi++) {
-            std::vector<uint64_t> verify_bits(bed_w_words * bed_h_px, 0);
-            stamp_excludes(verify_bits);
+            if (use_3d) {
+                // 3D overlap check: rebuild a verification SliceStack
+                SliceStack verify_stack;
+                verify_stack.n_slices = 1;
+                BitmapItem vs0;
+                vs0.bits.assign(bed_w_words * bed_h_px, 0);
+                vs0.width_words = bed_w_words;
+                vs0.width_px = bed_w_px;
+                vs0.height_px = bed_h_px;
+                stamp_excludes(vs0.bits);
+                verify_stack.slices.push_back(std::move(vs0));
 
-            for (int i = 0; i < n; i++) {
-                if (!item_placed[i]) continue;
-                int item_plate = arrangables[entries[i].orig_idx].bed_idx;
-                if (item_plate != pi) continue;
-                if (rot_bmps_all[i].empty()) continue;
+                for (int i = 0; i < n; i++) {
+                    if (!item_placed[i]) continue;
+                    int item_plate = arrangables[entries[i].orig_idx].bed_idx;
+                    if (item_plate != pi) continue;
+                    if (rot_stacks_all[i].empty()) continue;
 
-                // Find the bitmap matching the committed rotation
-                double cur_rot = arrangables[entries[i].orig_idx].rotation;
-                const BitmapItem *cur_bmp = nullptr;
-                for (const auto &[bmp, rot] : rot_bmps_all[i]) {
-                    if (std::abs(rot - cur_rot) < 0.01) { cur_bmp = &bmp; break; }
+                    // Find the stack matching the committed rotation
+                    double cur_rot = arrangables[entries[i].orig_idx].rotation;
+                    const SliceStack *cur_stack = nullptr;
+                    for (const auto &[stack, rot] : rot_stacks_all[i]) {
+                        if (std::abs(rot - cur_rot) < 0.01) { cur_stack = &stack; break; }
+                    }
+                    if (!cur_stack || cur_stack->slices.empty()) continue;
+                    const auto &s0 = cur_stack->slices[0];
+                    if (s0.width_px <= 0) continue;
+
+                    coord_t tx = arrangables[entries[i].orig_idx].translation.x();
+                    coord_t ty = arrangables[entries[i].orig_idx].translation.y();
+                    int px = (int)((tx + s0.offset_x - effective_bed.min.x()) / res);
+                    int py = (int)((ty + s0.offset_y - effective_bed.min.y()) / res);
+
+                    if (collides_3d(verify_stack, bed_w_words, bed_w_px, bed_h_px, *cur_stack, px, py)) {
+                        BOOST_LOG_TRIVIAL(error) << "BitmapArranger: 3D OVERLAP detected for item "
+                                                 << entries[i].orig_idx << " on plate " << pi;
+                        arrangables[entries[i].orig_idx].bed_idx = -1;
+                    } else {
+                        stamp_3d(verify_stack, bed_w_words, bed_w_px, bed_h_px, *cur_stack, px, py, stamp_excludes);
+                    }
                 }
-                if (!cur_bmp || cur_bmp->width_px <= 0) continue;
+            } else {
+                // 2D overlap check
+                std::vector<uint64_t> verify_bits(bed_w_words * bed_h_px, 0);
+                stamp_excludes(verify_bits);
 
-                // Compute pixel position from translation
-                coord_t tx = arrangables[entries[i].orig_idx].translation.x();
-                coord_t ty = arrangables[entries[i].orig_idx].translation.y();
-                int px = (int)((tx + cur_bmp->offset_x - effective_bed.min.x()) / res);
-                int py = (int)((ty + cur_bmp->offset_y - effective_bed.min.y()) / res);
+                for (int i = 0; i < n; i++) {
+                    if (!item_placed[i]) continue;
+                    int item_plate = arrangables[entries[i].orig_idx].bed_idx;
+                    if (item_plate != pi) continue;
+                    if (rot_bmps_all[i].empty()) continue;
 
-                if (collides(verify_bits, bed_w_words, bed_w_px, bed_h_px, *cur_bmp, px, py)) {
-                    // Overlap detected — mark as unarranged so the GUI shows it as failed
-                    BOOST_LOG_TRIVIAL(error) << "BitmapArranger: OVERLAP detected for item "
-                                             << entries[i].orig_idx << " on plate " << pi
-                                             << " — marking unarranged as failsafe";
-                    arrangables[entries[i].orig_idx].bed_idx = -1;
-                } else {
-                    stamp(verify_bits, bed_w_words, bed_w_px, bed_h_px, *cur_bmp, px, py);
+                    double cur_rot = arrangables[entries[i].orig_idx].rotation;
+                    const BitmapItem *cur_bmp = nullptr;
+                    for (const auto &[bmp, rot] : rot_bmps_all[i]) {
+                        if (std::abs(rot - cur_rot) < 0.01) { cur_bmp = &bmp; break; }
+                    }
+                    if (!cur_bmp || cur_bmp->width_px <= 0) continue;
+
+                    coord_t tx = arrangables[entries[i].orig_idx].translation.x();
+                    coord_t ty = arrangables[entries[i].orig_idx].translation.y();
+                    int px = (int)((tx + cur_bmp->offset_x - effective_bed.min.x()) / res);
+                    int py = (int)((ty + cur_bmp->offset_y - effective_bed.min.y()) / res);
+
+                    if (collides(verify_bits, bed_w_words, bed_w_px, bed_h_px, *cur_bmp, px, py)) {
+                        BOOST_LOG_TRIVIAL(error) << "BitmapArranger: OVERLAP detected for item "
+                                                 << entries[i].orig_idx << " on plate " << pi;
+                        arrangables[entries[i].orig_idx].bed_idx = -1;
+                    } else {
+                        stamp(verify_bits, bed_w_words, bed_w_px, bed_h_px, *cur_bmp, px, py);
+                    }
                 }
             }
         }
