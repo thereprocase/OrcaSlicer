@@ -931,75 +931,113 @@ void BitmapArranger::arrange(
     }
 
     // ============================================================
-    // PHASE 3: Place parts — center-out, first-fit across plates
+    // PHASE 3: Place parts — PLATE-CENTRIC filling
+    // Fill one plate completely (largest to smallest), then move on.
+    // Once the smallest remaining item can't fit, the plate is full.
+    // No backtracking, no re-scanning closed plates.
     // ============================================================
     int placed_count = 0;
     int failed_count = 0;
+
+    // Track which items still need placement
+    std::vector<bool> item_placed(n, false);
     for (int i = 0; i < n; i++) {
-        auto &entry = entries[i];
-        auto &rot_bmps = rot_bmps_all[i];
-        bool placed = false;
-
-        if (rot_bmps.empty() && rot_stacks_all[i].empty()) {
-            arrangables[entry.orig_idx].bed_idx = -1;
+        if (rot_bmps_all[i].empty() && rot_stacks_all[i].empty()) {
+            arrangables[entries[i].orig_idx].bed_idx = -1;
+            item_placed[i] = true;
             failed_count++;
-            continue;
         }
-
-        if (params.nesting_3d && !rot_stacks_all[i].empty()) {
-            // 3D placement path
-            for (int pi = 0; pi < (int)plates_3d.size(); pi++) {
-                if (!is_material_compatible(plates_3d[pi].material_group, entry.filament_temp_type))
-                    continue;
-                if (try_place_on_plate_3d(entry, rot_stacks_all[i], pi)) { placed = true; break; }
-            }
-            if (!placed && params.allow_multi_plate && (int)plates_3d.size() < MAX_PLATES) {
-                PlateState3D p3d;
-                p3d.stack.n_slices = 1;
-                p3d.stack.slices.push_back(BitmapItem());
-                auto &s0 = p3d.stack.slices[0];
-                s0.bits.assign(bed_w_words * bed_h_px, 0);
-                s0.width_words = bed_w_words;
-                s0.width_px = bed_w_px;
-                s0.height_px = bed_h_px;
-                stamp_excludes(s0.bits);
-                int new_idx = (int)plates_3d.size();
-                plates_3d.push_back(std::move(p3d));
-                placed = try_place_on_plate_3d(entry, rot_stacks_all[i], new_idx);
-                if (!placed) plates_3d.pop_back();
-            }
-        } else {
-            // Existing 2D placement path
-            for (int pi = 0; pi < (int)plates.size(); pi++) {
-                if (!is_material_compatible(plates[pi].material_group, entry.filament_temp_type))
-                    continue;
-                if (plates[pi].free_px < item_est_px[i])
-                    continue;
-                if (try_place_on_plate(entry, rot_bmps, pi)) { placed = true; break; }
-            }
-
-            if (!placed && params.allow_multi_plate && (int)plates.size() < MAX_PLATES) {
-                int new_idx = (int)plates.size();
-                plates.push_back({std::vector<uint64_t>(bed_w_words * bed_h_px, 0), -1, 0});
-                stamp_excludes(plates[new_idx].bits);
-                plates[new_idx].free_px = count_free_px(plates[new_idx].bits);
-                placed = try_place_on_plate(entry, rot_bmps, new_idx);
-                if (!placed) plates.pop_back();
-            }
-        }
-
-        if (!placed) {
-            arrangables[entry.orig_idx].bed_idx = -1;
-            failed_count++;
-        } else {
-            placed_count++;
-        }
-
-        if (params.progressind)
-            params.progressind(placed_count + failed_count, " (placing parts)");
-        if (params.stopcondition && params.stopcondition())
-            break;
     }
+
+    // Helper to create a new 2D plate
+    auto new_2d_plate = [&]() -> int {
+        int idx = (int)plates.size();
+        plates.push_back({std::vector<uint64_t>(bed_w_words * bed_h_px, 0), -1, 0});
+        stamp_excludes(plates[idx].bits);
+        plates[idx].free_px = count_free_px(plates[idx].bits);
+        return idx;
+    };
+
+    // Helper to create a new 3D plate
+    auto new_3d_plate = [&]() -> int {
+        PlateState3D p3d;
+        p3d.stack.n_slices = 1;
+        BitmapItem s0;
+        s0.bits.assign(bed_w_words * bed_h_px, 0);
+        s0.width_words = bed_w_words;
+        s0.width_px = bed_w_px;
+        s0.height_px = bed_h_px;
+        stamp_excludes(s0.bits);
+        p3d.stack.slices.push_back(std::move(s0));
+        int idx = (int)plates_3d.size();
+        plates_3d.push_back(std::move(p3d));
+        return idx;
+    };
+
+    bool use_3d = params.nesting_3d;
+    int current_plate = use_3d ? 0 : 0; // first plate already exists
+
+    for (;;) {
+        bool any_placed_this_plate = false;
+        bool smallest_failed = false;
+
+        // Sweep through all remaining items (already sorted largest-first)
+        for (int i = 0; i < n; i++) {
+            if (item_placed[i]) continue;
+            if (params.stopcondition && params.stopcondition()) goto done;
+
+            auto &entry = entries[i];
+            bool placed = false;
+
+            if (use_3d && !rot_stacks_all[i].empty()) {
+                if (!is_material_compatible(plates_3d[current_plate].material_group, entry.filament_temp_type))
+                    continue;
+                placed = try_place_on_plate_3d(entry, rot_stacks_all[i], current_plate);
+            } else {
+                if (!is_material_compatible(plates[current_plate].material_group, entry.filament_temp_type))
+                    continue;
+                placed = try_place_on_plate(entry, rot_bmps_all[i], current_plate);
+            }
+
+            if (placed) {
+                item_placed[i] = true;
+                placed_count++;
+                any_placed_this_plate = true;
+            }
+            // If not placed, skip — a smaller item might still fit
+
+            if (params.progressind)
+                params.progressind(placed_count + failed_count, " (placing parts)");
+        }
+
+        // Check: did we place anything this sweep? If not, plate is full.
+        // Also check: are there remaining items?
+        int remaining = 0;
+        for (int i = 0; i < n; i++)
+            if (!item_placed[i]) remaining++;
+
+        if (remaining == 0) break; // all placed
+
+        if (!any_placed_this_plate) {
+            // Nothing fit on this plate. If multi-plate, create a new one.
+            if (!params.allow_multi_plate || (use_3d ? (int)plates_3d.size() : (int)plates.size()) >= MAX_PLATES) {
+                // Can't create more plates — mark remaining as unarranged
+                for (int i = 0; i < n; i++) {
+                    if (!item_placed[i]) {
+                        arrangables[entries[i].orig_idx].bed_idx = -1;
+                        item_placed[i] = true;
+                        failed_count++;
+                    }
+                }
+                break;
+            }
+            current_plate = use_3d ? new_3d_plate() : new_2d_plate();
+        }
+        // If we placed things but some remain, sweep the same plate again —
+        // smaller items might now fit in gaps left by the items we just placed.
+        // But if nothing new was placed, we already move to a new plate above.
+    }
+    done:
 
     int total_plates = params.nesting_3d ? (int)plates_3d.size() : (int)plates.size();
     BOOST_LOG_TRIVIAL(info) << "BitmapArranger: placed " << placed_count
