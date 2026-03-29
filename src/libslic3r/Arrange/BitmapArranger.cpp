@@ -61,7 +61,7 @@ namespace {
 constexpr size_t MAX_BITMAP_WORDS = 64'000'000u;
 
 // Build version for debug — update each commit during development
-static const char* BITMAP_ARRANGE_VERSION = "dev-92189a7b8e";
+static const char* BITMAP_ARRANGE_VERSION = "dev-cbef94e14d";
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -1177,7 +1177,7 @@ void BitmapArranger::arrange(
                 ep.rotate(excl.rotation);
                 ep.translate(excl.translation.x() - effective_bed.min.x(),
                              excl.translation.y() - effective_bed.min.y());
-                auto bmp = rasterize(ep, 0, res);
+                auto bmp = rasterize(ep, res, res); // 1-pixel inflation for safety margin
                 int ox = (int)std::floor((double)bmp.offset_x / res);
                 int oy = (int)std::floor((double)bmp.offset_y / res);
                 stamp(bits, bed_w_words, bed_w_px, bed_h_px, bmp, ox, oy);
@@ -1510,108 +1510,70 @@ void BitmapArranger::arrange(
             }
         }
 
-        // Try all rotations' skyline positions, pick best Y across all rotations
-        // at each of top-K candidate X positions.
-        // Use the WIDEST rotation for candidate generation so the X constraint
-        // is safe for all rotations. Per-rotation bounds checks reject rotations
-        // that don't fit at a given candidate position.
-        {
-            // Find the widest rotation to build the envelope profile
-            int max_w = 0, widest_ri = -1;
-            for (size_t ri = 0; ri < rot_stacks.size(); ri++) {
-                const auto &[stack, rot] = rot_stacks[ri];
-                if (stack.slices.empty()) continue;
-                const auto &s0 = stack.slices[0];
-                if (s0.width_px > max_w) { max_w = s0.width_px; widest_ri = (int)ri; }
-            }
+        // Per-rotation skyline: each rotation gets its own skyline search with
+        // its own width constraint. Collect all valid placements, pick lowest Y
+        // (base tight to cluster, overhang inboard). If skyline fails for all
+        // rotations, try center-out fallback per rotation.
+        int best_cx = -1, best_cy = INT_MAX, best_ri = -1;
 
-            if (widest_ri >= 0 && max_w > 0) {
-                const auto &widest_s0 = rot_stacks[widest_ri].first.slices[0];
-                auto envelope_profile = compute_profile(widest_s0, bed_h_px);
-                if (envelope_profile.max_y >= 0) {
-                    auto candidates = find_skyline_topk(sky, envelope_profile, 5);
+        for (size_t ri = 0; ri < rot_stacks.size(); ri++) {
+            const auto &[stack, rot] = rot_stacks[ri];
+            if (stack.slices.empty()) continue;
+            const auto &item_s0 = stack.slices[0];
+            if (item_s0.width_px <= 0 || item_s0.height_px <= 0) continue;
 
-                    for (auto [cx, cy] : candidates) {
-                        int best_y = INT_MAX;
-                        int best_ri = -1;
+            auto profile = compute_profile(item_s0, bed_h_px);
+            if (profile.max_y < 0) continue;
 
-                        for (size_t ri = 0; ri < rot_stacks.size(); ri++) {
-                            const auto &[stack, rot] = rot_stacks[ri];
-                            if (stack.slices.empty()) continue;
-                            const auto &item_s0 = stack.slices[0];
-                            if (item_s0.width_px <= 0) continue;
-
-                            // Per-rotation bounds check: this rotation must fit
-                            // within the bed at this candidate X position
-                            if (cx + item_s0.width_px > bed_w_px) continue;
-
-                            auto profile = compute_profile(item_s0, bed_h_px);
-                            if (profile.max_y < 0) continue;
-
-                            // Compute this rotation's Y at candidate X
-                            int ry = 0;
-                            for (int c = 0; c < profile.bw; c++) {
-                                int diff = sky[cx + c] - profile.bottom[c];
-                                if (diff > ry) ry = diff;
-                            }
-                            if (ry < 0) ry = 0;
-                            if (ry > profile.max_y) continue;
-                            if (ry + item_s0.height_px > bed_h_px) continue;
-
-                            if (ry < best_y) {
-                                // Verify with 3D collision at this rotation's Y
-                                if (!collides_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, cx, ry)) {
-                                    best_y = ry;
-                                    best_ri = (int)ri;
-                                }
-                            }
-                        }
-
-                        if (best_ri >= 0) {
-                            const auto &[stack, rot] = rot_stacks[best_ri];
-                            const auto &item_s0 = stack.slices[0];
-                            auto profile = compute_profile(item_s0, bed_h_px);
-
-                            coord_t tx = effective_bed.min.x() + (coord_t)(cx * res) - item_s0.offset_x;
-                            coord_t ty = effective_bed.min.y() + (coord_t)(best_y * res) - item_s0.offset_y;
-                            arrangables[entry.orig_idx].translation = {tx, ty};
-                            arrangables[entry.orig_idx].rotation = rot;
-                            arrangables[entry.orig_idx].bed_idx = plate_idx;
-                            stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, cx, best_y, stamp_excludes);
-                            if (plates_3d[plate_idx].material_group < 0)
-                                plates_3d[plate_idx].material_group = entry.filament_temp_type;
-
-                            // Boundary debug: check if any slice extends past bed
-                            for (int sz = 0; sz < (int)stack.slices.size(); sz++) {
-                                const auto &sl = stack.slices[sz];
-                                if (sl.width_px <= 0) continue;
-                                coord_t right = tx + sl.offset_x + (coord_t)(sl.width_px * res) - effective_bed.min.x();
-                                coord_t top_edge = ty + sl.offset_y + (coord_t)(sl.height_px * res) - effective_bed.min.y();
-                                coord_t bed_right = effective_bed.max.x() - effective_bed.min.x();
-                                coord_t bed_top = effective_bed.max.y() - effective_bed.min.y();
-                                if (right > bed_right || top_edge > bed_top) {
-                                    ARRANGE_LOG("3D BOUNDARY WARNING: item " << entry.orig_idx
-                                        << " slice " << sz << " extends past bed"
-                                        << " right=" << (double)right/1000000. << "mm"
-                                        << " bed_right=" << (double)bed_right/1000000. << "mm"
-                                        << " top=" << (double)top_edge/1000000. << "mm"
-                                        << " bed_top=" << (double)bed_top/1000000. << "mm"
-                                        << " cx=" << cx << " best_y=" << best_y
-                                        << " s0_offset=(" << (double)item_s0.offset_x/1000000.
-                                        << "," << (double)item_s0.offset_y/1000000. << ")"
-                                        << " s0_size=" << item_s0.width_px << "x" << item_s0.height_px);
-                                    break;
-                                }
-                            }
-
-                            return true;
-                        }
-                    }
+            auto result = find_placement_skyline(sky, bed_w_px, bed_h_px, profile);
+            if (result) {
+                auto [px, py] = *result;
+                if (px + item_s0.width_px > bed_w_px) continue;
+                if (py + item_s0.height_px > bed_h_px) continue;
+                if (py < best_cy && !collides_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py)) {
+                    best_cx = px;
+                    best_cy = py;
+                    best_ri = (int)ri;
                 }
             }
         }
 
-        // All skyline candidates failed — item is a reject for batch Pass 2
+        if (best_ri >= 0) {
+            const auto &[stack, rot] = rot_stacks[best_ri];
+            const auto &item_s0 = stack.slices[0];
+            arrangables[entry.orig_idx].translation = {
+                effective_bed.min.x() + (coord_t)(best_cx * res) - item_s0.offset_x,
+                effective_bed.min.y() + (coord_t)(best_cy * res) - item_s0.offset_y
+            };
+            arrangables[entry.orig_idx].rotation = rot;
+            arrangables[entry.orig_idx].bed_idx = plate_idx;
+            stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, best_cx, best_cy, stamp_excludes);
+            if (plates_3d[plate_idx].material_group < 0)
+                plates_3d[plate_idx].material_group = entry.filament_temp_type;
+            return true;
+        }
+
+        // Skyline failed all rotations — center-out fallback per rotation
+        for (const auto &[stack, rot] : rot_stacks) {
+            if (stack.slices.empty()) continue;
+            auto result = find_placement_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, scan_step_3d);
+            if (result) {
+                auto [px, py] = *result;
+                const auto &item_s0 = stack.slices[0];
+                arrangables[entry.orig_idx].translation = {
+                    effective_bed.min.x() + (coord_t)(px * res) - item_s0.offset_x,
+                    effective_bed.min.y() + (coord_t)(py * res) - item_s0.offset_y
+                };
+                arrangables[entry.orig_idx].rotation = rot;
+                arrangables[entry.orig_idx].bed_idx = plate_idx;
+                stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
+                if (plates_3d[plate_idx].material_group < 0)
+                    plates_3d[plate_idx].material_group = entry.filament_temp_type;
+                return true;
+            }
+        }
+
+        // All failed — reject for batch Pass 2
         return false;
     };
 
