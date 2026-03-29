@@ -54,6 +54,11 @@ private:
     // into the bitmap — same as GPU rasterization. No Clipper, O(triangles × pixels_per_tri).
     static BitmapItem rasterize_triangles(const Points &tri_verts, coord_t inflation, coord_t res);
 
+    // Rotate a bitmap by an arbitrary angle. Always rotates from the source bitmap
+    // (not iteratively) to avoid cumulative quality loss. Uses reverse-mapping with
+    // nearest-neighbor sampling. The rotated bitmap may be larger than the source.
+    static BitmapItem rotate_bitmap(const BitmapItem &src, double angle_rad, coord_t res);
+
     // Rasterize onto the bed bitmap (stamp an item at position).
     // bed_w = width in 64-bit words, bed_w_px = width in pixels (for bounds).
     static void stamp(std::vector<uint64_t> &bed_bits,

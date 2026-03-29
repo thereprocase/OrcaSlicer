@@ -234,6 +234,63 @@ BitmapArranger::BitmapItem BitmapArranger::rasterize_triangles(
     return item;
 }
 
+BitmapArranger::BitmapItem BitmapArranger::rotate_bitmap(
+    const BitmapItem &src, double angle_rad, coord_t res)
+{
+    if (src.width_px <= 0 || src.height_px <= 0)
+        return src;
+
+    double cos_a = std::cos(angle_rad), sin_a = std::sin(angle_rad);
+
+    // Compute the bounding box of the rotated source bitmap.
+    // The four corners of the source, rotated, give the new extents.
+    double hw = src.width_px * 0.5, hh = src.height_px * 0.5;
+    double corners_x[4] = { -hw, hw, hw, -hw };
+    double corners_y[4] = { -hh, -hh, hh, hh };
+    double min_x = 1e18, max_x = -1e18, min_y = 1e18, max_y = -1e18;
+    for (int i = 0; i < 4; i++) {
+        double rx = corners_x[i] * cos_a - corners_y[i] * sin_a;
+        double ry = corners_x[i] * sin_a + corners_y[i] * cos_a;
+        min_x = std::min(min_x, rx); max_x = std::max(max_x, rx);
+        min_y = std::min(min_y, ry); max_y = std::max(max_y, ry);
+    }
+
+    BitmapItem dst;
+    dst.width_px = (int)std::ceil(max_x - min_x) + 1;
+    dst.height_px = (int)std::ceil(max_y - min_y) + 1;
+    dst.width_words = (dst.width_px + 63) / 64;
+    dst.bits.assign(dst.width_words * dst.height_px, 0);
+
+    // New offset: rotate the source center and compute the new BB min in scaled coords.
+    double src_cx = src.offset_x + hw * res;
+    double src_cy = src.offset_y + hh * res;
+    // The center stays the same after rotation (we rotate around the object's own center)
+    dst.offset_x = (coord_t)(src_cx - (dst.width_px * 0.5) * res);
+    dst.offset_y = (coord_t)(src_cy - (dst.height_px * 0.5) * res);
+
+    // Reverse mapping: for each destination pixel, find the source pixel.
+    // Rotate the destination coordinate backwards by -angle to find the source.
+    double dst_cx = dst.width_px * 0.5;
+    double dst_cy = dst.height_px * 0.5;
+
+    for (int dy = 0; dy < dst.height_px; dy++) {
+        double fy = dy - dst_cy;
+        for (int dx = 0; dx < dst.width_px; dx++) {
+            double fx = dx - dst_cx;
+            // Inverse rotation
+            int sx = (int)(fx * cos_a + fy * sin_a + hw);
+            int sy = (int)(-fx * sin_a + fy * cos_a + hh);
+            if (sx >= 0 && sx < src.width_px && sy >= 0 && sy < src.height_px) {
+                if (src.bits[(size_t)sy * src.width_words + sx / 64] & (uint64_t(1) << (sx % 64))) {
+                    dst.bits[(size_t)dy * dst.width_words + dx / 64] |= (uint64_t(1) << (dx % 64));
+                }
+            }
+        }
+    }
+
+    return dst;
+}
+
 void BitmapArranger::stamp(
     std::vector<uint64_t> &bed_bits, int bed_w, int bed_w_px, int bed_h,
     const BitmapItem &item, int ox, int oy)
@@ -344,23 +401,47 @@ std::optional<std::pair<int,int>> BitmapArranger::find_placement(
     const std::vector<uint64_t> &bed_bits, int bed_w, int bed_w_px, int bed_h,
     const BitmapItem &item, int step)
 {
-    // Coarse scan with refinement
-    for (int y = 0; y <= bed_h - item.height_px; y += step) {
-        for (int x = 0; x <= bed_w_px - item.width_px; x += step) {
-            if (!collides(bed_bits, bed_w, bed_w_px, bed_h, item, x, y)) {
-                // Refine: find tightest bottom-left placement within one step
-                int best_x = x, best_y = y;
-                for (int ry = std::max(0, y - step + 1); ry <= y; ry++) {
-                    for (int rx = std::max(0, x - step + 1); rx <= x; rx++) {
-                        if (!collides(bed_bits, bed_w, bed_w_px, bed_h, item, rx, ry)) {
-                            best_x = rx;
-                            best_y = ry;
-                            goto found;
+    // Center-out scan: try positions closest to bed center first.
+    // This distributes parts naturally from the middle instead of packing into a corner.
+    int max_x = bed_w_px - item.width_px;
+    int max_y = bed_h - item.height_px;
+    if (max_x < 0 || max_y < 0) return std::nullopt;
+
+    int cx = max_x / 2;  // center of valid placement range
+    int cy = max_y / 2;
+
+    // Spiral outward from center in coarse steps
+    int max_radius = std::max(max_x, max_y);
+    for (int r = 0; r <= max_radius; r += step) {
+        // Scan a square ring at distance r from center
+        int y_lo = std::max(0, cy - r);
+        int y_hi = std::min(max_y, cy + r);
+        int x_lo = std::max(0, cx - r);
+        int x_hi = std::min(max_x, cx + r);
+
+        for (int y = y_lo; y <= y_hi; y += step) {
+            for (int x = x_lo; x <= x_hi; x += step) {
+                // Only check positions on the ring perimeter (skip interior, already checked)
+                if (r > step && x > x_lo + step && x < x_hi - step &&
+                    y > y_lo + step && y < y_hi - step)
+                    continue;
+
+                if (!collides(bed_bits, bed_w, bed_w_px, bed_h, item, x, y)) {
+                    // Refine within one step for tightest center-ward placement
+                    int best_x = x, best_y = y;
+                    int best_dist = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+                    for (int ry = std::max(0, y - step + 1); ry <= std::min(max_y, y + step - 1); ry++) {
+                        for (int rx = std::max(0, x - step + 1); rx <= std::min(max_x, x + step - 1); rx++) {
+                            int d = (rx - cx) * (rx - cx) + (ry - cy) * (ry - cy);
+                            if (d < best_dist && !collides(bed_bits, bed_w, bed_w_px, bed_h, item, rx, ry)) {
+                                best_x = rx;
+                                best_y = ry;
+                                best_dist = d;
+                            }
                         }
                     }
+                    return std::make_pair(best_x, best_y);
                 }
-                found:
-                return std::make_pair(best_x, best_y);
             }
         }
     }
@@ -443,12 +524,13 @@ void BitmapArranger::arrange(
         return std::abs(a.poly.area()) > std::abs(b.poly.area());
     });
 
-    // Build rotation candidates
+    // Build rotation candidates — always 5° steps when rotations enabled.
+    // Bitmap rotation is cheap (pixel shuffle from 0° source), so fine granularity is free.
     std::vector<double> rotations = {0.};
     if (params.allow_rotations) {
-        double rot_step = std::max(params.rotation_step_rad, PI / 36.); // min 5 degrees
         rotations.clear();
-        int n_rot = std::max(1, (int)std::round(2.0 * PI / rot_step));
+        double rot_step = PI / 36.; // 5 degrees
+        int n_rot = (int)std::round(2.0 * PI / rot_step);
         for (int i = 0; i < n_rot; i++)
             rotations.push_back(i * rot_step);
     }
@@ -519,47 +601,14 @@ void BitmapArranger::arrange(
     };
 
     // Try placing an item on a single plate.
-    // Uses direct point rasterization for concave mode (no Clipper),
-    // or ExPolygon rasterization for convex mode.
-    auto try_place_on_plate = [&](const ItemEntry &entry, int plate_idx) -> bool {
+    // Rasterizes once at 0°, then rotates the BITMAP for each angle (no re-rasterization).
+    // Each rotated bitmap is generated from the 0° original — never iteratively.
+    auto try_place_on_plate = [&](const ItemEntry &entry,
+                                  const std::vector<std::pair<BitmapItem, double>> &rot_bmps,
+                                  int plate_idx) -> bool {
         auto &bits = plates[plate_idx].bits;
-        for (double rot : rotations) {
-            BitmapItem bmp;
-            if (!entry.concave_triangles.empty()) {
-                // Concave mode: rotate the raw points, rasterize directly into bitmap.
-                Points rotated_pts = entry.concave_triangles;
-                BOOST_LOG_TRIVIAL(warning) << "BitmapArranger: item " << entry.orig_idx
-                    << " concave_triangles=" << rotated_pts.size()
-                    << " rot=" << rot << " inflation=" << entry.inflation;
-                if (std::abs(rot) > 1e-6) {
-                    double cos_r = std::cos(rot), sin_r = std::sin(rot);
-                    for (Point &p : rotated_pts) {
-                        coord_t x = (coord_t)(p.x() * cos_r - p.y() * sin_r);
-                        coord_t y = (coord_t)(p.x() * sin_r + p.y() * cos_r);
-                        p = {x, y};
-                    }
-                }
-                bmp = rasterize_triangles(rotated_pts, entry.inflation, res);
-            } else {
-                // Convex mode: rotate the ExPolygon, rasterize via scanline.
-                ExPolygon rotated = entry.poly;
-                rotated.rotate(rot);
-                bmp = rasterize(rotated, entry.inflation, res);
-            }
+        for (const auto &[bmp, rot] : rot_bmps) {
             if (bmp.width_px <= 0 || bmp.height_px <= 0) continue;
-
-            // Count set bits to verify bitmap is populated
-            int set_bits = 0;
-            for (auto w : bmp.bits) {
-                #ifdef _MSC_VER
-                set_bits += (int)__popcnt64(w);
-                #else
-                set_bits += __builtin_popcountll(w);
-                #endif
-            }
-            BOOST_LOG_TRIVIAL(warning) << "BitmapArranger: bmp " << bmp.width_px << "x" << bmp.height_px
-                << " set_bits=" << set_bits << "/" << (bmp.width_px * bmp.height_px)
-                << " offset=(" << unscaled(bmp.offset_x) << "," << unscaled(bmp.offset_y) << ")mm";
 
             auto result = find_placement(bits, bed_w_words, bed_w_px, bed_h_px, bmp, scan_step);
             if (result) {
@@ -598,18 +647,51 @@ void BitmapArranger::arrange(
     for (auto &entry : entries) {
         bool placed = false;
 
-        // Estimate item pixel count from bounding box for quick plate skip
-        BoundingBox item_bb = get_extents(entry.poly);
-        int item_est_px = (int)((double)(item_bb.max.x() - item_bb.min.x()) / res + 1) *
-                          (int)((double)(item_bb.max.y() - item_bb.min.y()) / res + 1);
+        // Build rotated bitmaps for this item — rasterize ONCE at 0°,
+        // then rotate the bitmap for each angle. Each rotation is from the
+        // 0° original (never iterative) so no cumulative quality loss.
+        std::vector<std::pair<BitmapItem, double>> rot_bmps;
+        {
+            BitmapItem base_bmp;
+            if (!entry.concave_triangles.empty()) {
+                base_bmp = rasterize_triangles(entry.concave_triangles, entry.inflation, res);
+            } else {
+                base_bmp = rasterize(entry.poly, entry.inflation, res);
+            }
+
+            if (base_bmp.width_px > 0 && base_bmp.height_px > 0) {
+                rot_bmps.push_back({base_bmp, 0.});
+                // Generate rotated variants from the 0° base
+                for (size_t ri = 1; ri < rotations.size(); ri++) {
+                    auto rbmp = rotate_bitmap(base_bmp, rotations[ri], res);
+                    if (rbmp.width_px > 0 && rbmp.height_px > 0)
+                        rot_bmps.push_back({std::move(rbmp), rotations[ri]});
+                }
+            }
+        }
+
+        if (rot_bmps.empty()) {
+            arrangables[entry.orig_idx].bed_idx = -1;
+            failed_count++;
+            continue;
+        }
+
+        // Estimate item pixel count from the 0° bitmap for quick plate skip
+        int item_est_px = 0;
+        for (auto w : rot_bmps[0].first.bits) {
+            #ifdef _MSC_VER
+            item_est_px += (int)__popcnt64(w);
+            #else
+            item_est_px += __builtin_popcountll(w);
+            #endif
+        }
 
         for (int pi = 0; pi < (int)plates.size(); pi++) {
             if (!is_material_compatible(plates[pi].material_group, entry.filament_temp_type))
                 continue;
-            // Skip plates that clearly don't have enough free space
             if (plates[pi].free_px < item_est_px)
                 continue;
-            if (try_place_on_plate(entry, pi)) { placed = true; break; }
+            if (try_place_on_plate(entry, rot_bmps, pi)) { placed = true; break; }
         }
 
         if (!placed && params.allow_multi_plate && (int)plates.size() < MAX_PLATES) {
@@ -617,7 +699,7 @@ void BitmapArranger::arrange(
             plates.push_back({std::vector<uint64_t>(bed_w_words * bed_h_px, 0), -1, 0});
             stamp_excludes(plates[new_idx].bits);
             plates[new_idx].free_px = count_free_px(plates[new_idx].bits);
-            placed = try_place_on_plate(entry, new_idx);
+            placed = try_place_on_plate(entry, rot_bmps, new_idx);
             if (!placed) plates.pop_back();
         }
 
