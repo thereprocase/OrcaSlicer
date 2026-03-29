@@ -2,6 +2,10 @@
 #include "libslic3r/ClipperUtils.hpp"
 
 #include <boost/log/trivial.hpp>
+#include <tbb/parallel_for.h>
+#include <tbb/blocked_range.h>
+#include <atomic>
+#include <mutex>
 
 // Coordinate systems used in this module:
 //   Scaled coords (coord_t): Slic3r internal units. 1mm = scaled(1.0).
@@ -1207,32 +1211,38 @@ void BitmapArranger::arrange(
     // PHASE 4: Compaction — configurable strategies to reduce plate count
     // ============================================================
 
-    // Helper: try to place an item on a plate using adaptive-stride bitmap scan.
-    // Stride scales with item bounding box: large items use fine stride (few positions),
-    // small items use coarse stride (many positions but gaps are plentiful).
-    // Based on tournament-winning quadtree/adaptive approach.
-    auto try_compact_bitmap = [&](int idx, const BitmapItem &bmp, double rot, int plate_idx) -> bool {
+    // ============================================================
+    // PHASE 4: Compaction — parallel plate search
+    // ============================================================
+    // For each item on the last plate, search all earlier plates in parallel
+    // (one TBB task per plate). Each task is read-only on plate state — it
+    // finds a valid position and reports it. The main thread picks the best
+    // result and commits (stamps) sequentially. This is safe because:
+    //   - Find phase: reads plate bits (immutable during search)
+    //   - Commit phase: writes plate bits (serial, one item at a time)
+
+    // Read-only position finder for bitmap scan (no side effects)
+    auto find_compact_bitmap = [&](const BitmapItem &bmp, int plate_idx)
+        -> std::optional<std::pair<int,int>>
+    {
         int max_x = bed_w_px - bmp.width_px;
         int max_y = bed_h_px - bmp.height_px;
-        if (max_x < 0 || max_y < 0) return false;
+        if (max_x < 0 || max_y < 0) return std::nullopt;
 
-        // Adaptive stride: scale with position space
         int pos_space = (max_x + 1) * (max_y + 1);
         int step;
         if (pos_space < 40000)       step = std::max(2, (int)(scaled<coord_t>(2.0) / res));
         else if (pos_space < 120000) step = std::max(2, (int)(scaled<coord_t>(4.0) / res));
         else                         step = std::max(2, (int)(scaled<coord_t>(6.0) / res));
 
-        // Precompute row-level free pixel counts for band rejection
         int item_px = 0;
         for (int py = 0; py < bmp.height_px; py++)
             for (int wx = 0; wx < bmp.width_words; wx++) {
                 uint64_t w = bmp.bits[(size_t)py * bmp.width_words + wx];
-                while (w) { item_px++; w &= w - 1; } // popcount
+                while (w) { item_px++; w &= w - 1; }
             }
 
         for (int y = 0; y <= max_y; y += step) {
-            // Band free-pixel check: skip if rows can't possibly hold the item
             int band_free = 0;
             for (int dy = 0; dy < bmp.height_px && band_free < item_px; dy++) {
                 for (int wx = 0; wx < bed_w_words; wx++) {
@@ -1244,39 +1254,24 @@ void BitmapArranger::arrange(
             if (band_free < item_px) continue;
 
             for (int x = 0; x <= max_x; x += step) {
-                if (!collides(plates[plate_idx].bits, bed_w_words, bed_w_px, bed_h_px, bmp, x, y)) {
-                    arrangables[entries[idx].orig_idx].translation = {
-                        effective_bed.min.x() + (coord_t)(x * res) - bmp.offset_x,
-                        effective_bed.min.y() + (coord_t)(y * res) - bmp.offset_y
-                    };
-                    arrangables[entries[idx].orig_idx].rotation = rot;
-                    arrangables[entries[idx].orig_idx].bed_idx = plate_idx;
-                    stamp(plates[plate_idx].bits, bed_w_words, bed_w_px, bed_h_px, bmp, x, y);
-                    auto prof = compute_profile(bmp, bed_h_px);
-                    for (const auto &[col, top] : prof.top_pairs) {
-                        int c = x + col;
-                        int v = y + top;
-                        if (c < bed_w_px && v > plates[plate_idx].skyline[c])
-                            plates[plate_idx].skyline[c] = v;
-                    }
-                    return true;
-                }
+                if (!collides(plates[plate_idx].bits, bed_w_words, bed_w_px, bed_h_px, bmp, x, y))
+                    return std::make_pair(x, y);
             }
         }
-        return false;
+        return std::nullopt;
     };
 
-    // Helper: try to place using reverse skyline (scan from bottom, find lowest free row per column)
-    auto try_compact_reverse_skyline = [&](int idx, const BitmapItem &bmp, double rot, int plate_idx) -> bool {
-        if (bmp.width_px <= 0 || bmp.height_px <= 0) return false;
+    // Read-only position finder for reverse skyline (no side effects)
+    auto find_compact_reverse_skyline = [&](const BitmapItem &bmp, int plate_idx)
+        -> std::optional<std::pair<int,int>>
+    {
+        if (bmp.width_px <= 0 || bmp.height_px <= 0) return std::nullopt;
         auto profile = compute_profile(bmp, bed_h_px);
-        if (profile.max_y < 0) return false;
+        if (profile.max_y < 0) return std::nullopt;
 
-        // Compute reverse skyline: lowest free pixel per column
         std::vector<int> rev_sky(bed_w_px, 0);
         for (int x = 0; x < bed_w_px; x++) {
-            rev_sky[x] = plates[plate_idx].skyline[x]; // start from forward skyline
-            // Scan downward for any gap
+            rev_sky[x] = plates[plate_idx].skyline[x];
             for (int y = 0; y < plates[plate_idx].skyline[x]; y++) {
                 int word = x / 64, bit = x % 64;
                 if (!(plates[plate_idx].bits[(size_t)y * bed_w_words + word] & (uint64_t(1) << bit))) {
@@ -1286,12 +1281,11 @@ void BitmapArranger::arrange(
             }
         }
 
-        // Slide item top profile across reverse skyline
         int n_pos = bed_w_px - profile.bw + 1;
-        if (n_pos <= 0) return false;
+        if (n_pos <= 0) return std::nullopt;
 
         int best_x = -1, best_y = INT_MAX;
-        for (int x = 0; x < n_pos; x += 8) { // stride 8
+        for (int x = 0; x < n_pos; x += 8) {
             int y = 0;
             for (int c = 0; c < profile.bw; c++) {
                 int diff = rev_sky[x + c] - profile.bottom[c];
@@ -1303,31 +1297,32 @@ void BitmapArranger::arrange(
             }
         }
 
-        if (best_x < 0 || best_y > profile.max_y) return false;
-
-        // Verify with bitmap collision
+        if (best_x < 0 || best_y > profile.max_y) return std::nullopt;
         if (collides(plates[plate_idx].bits, bed_w_words, bed_w_px, bed_h_px, bmp, best_x, best_y))
-            return false;
+            return std::nullopt;
 
+        return std::make_pair(best_x, best_y);
+    };
+
+    // Commit a found position: stamp bitmap, update skyline, write arrangable
+    auto commit_compact = [&](int idx, const BitmapItem &bmp, double rot, int plate_idx, int px, int py) {
         arrangables[entries[idx].orig_idx].translation = {
-            effective_bed.min.x() + (coord_t)(best_x * res) - bmp.offset_x,
-            effective_bed.min.y() + (coord_t)(best_y * res) - bmp.offset_y
+            effective_bed.min.x() + (coord_t)(px * res) - bmp.offset_x,
+            effective_bed.min.y() + (coord_t)(py * res) - bmp.offset_y
         };
         arrangables[entries[idx].orig_idx].rotation = rot;
         arrangables[entries[idx].orig_idx].bed_idx = plate_idx;
-        stamp(plates[plate_idx].bits, bed_w_words, bed_w_px, bed_h_px, bmp, best_x, best_y);
-        for (const auto &[col, top] : profile.top_pairs) {
-            int c = best_x + col;
-            int v = best_y + top;
+        stamp(plates[plate_idx].bits, bed_w_words, bed_w_px, bed_h_px, bmp, px, py);
+        auto prof = compute_profile(bmp, bed_h_px);
+        for (const auto &[col, top] : prof.top_pairs) {
+            int c = px + col;
+            int v = py + top;
             if (c < bed_w_px && v > plates[plate_idx].skyline[c])
                 plates[plate_idx].skyline[c] = v;
         }
-        return true;
     };
 
     // Run compaction if enabled (works for both 2D and 3D modes)
-    // For 3D mode, compaction uses 2D bitmap collision on the bottom slice —
-    // if the bottom slice doesn't collide, the item fits (conservative but fast).
     if (plates.size() > 1 && params.compaction_mode > 0) {
         bool compacted = true;
         while (compacted && plates.size() > 1) {
@@ -1344,78 +1339,135 @@ void BitmapArranger::arrange(
 
             int moved = 0;
             for (int idx : last_plate_items) {
+                if (params.stopcondition && params.stopcondition()) break;
+
+                // Collect all (bmp, rot) candidates for this item
+                struct Candidate { const BitmapItem *bmp; double rot; size_t ri; };
+                std::vector<Candidate> candidates;
+                for (size_t ri = 0; ri < rot_bmps_all[idx].size(); ri++) {
+                    const auto &[bmp, rot] = rot_bmps_all[idx][ri];
+                    if (bmp.width_px > 0 && bmp.height_px > 0)
+                        candidates.push_back({&bmp, rot, ri});
+                }
+                if (candidates.empty()) continue;
+
+                // Build list of compatible plates
+                std::vector<int> compat_plates;
+                for (int pi = 0; pi < last_plate; pi++) {
+                    if (is_material_compatible(plates[pi].material_group, entries[idx].filament_temp_type))
+                        compat_plates.push_back(pi);
+                }
+                if (compat_plates.empty()) continue;
+
+                // Result structure for parallel search
+                struct SearchResult {
+                    int plate_idx = -1;
+                    int px = 0, py = 0;
+                    size_t ri = 0;
+                    double rot = 0;
+                };
+
                 bool relocated = false;
 
-                // Best-fit: try all plates, pick lowest Y. First-fit: take first match.
-                int best_plate = -1, best_y_score = INT_MAX;
-                int best_bmp_idx = -1;
-                double best_rot = 0;
+                // Parallel search across plates — each plate searched independently.
+                // For first-fit: use atomic flag so threads stop early once any plate succeeds.
+                // For best-fit: collect all results, pick lowest Y.
+                if (params.best_fit_compact) {
+                    // Best-fit: search all plates in parallel, collect results
+                    std::vector<SearchResult> results(compat_plates.size());
+                    std::atomic<bool> any_found{false};
 
-                for (int pi = 0; pi < last_plate; pi++) {
-                    if (!is_material_compatible(plates[pi].material_group, entries[idx].filament_temp_type))
-                        continue;
-
-                    for (size_t ri = 0; ri < rot_bmps_all[idx].size(); ri++) {
-                        const auto &[bmp, rot] = rot_bmps_all[idx][ri];
-                        if (bmp.width_px <= 0 || bmp.height_px <= 0) continue;
-
-                        bool found = false;
-
-                        // Strategy 2: reverse skyline
-                        if (params.compaction_mode == 2 || params.compaction_mode == 3) {
-                            // For best-fit we'd need to not commit yet — but reverse skyline
-                            // commits on success. For now, use first-fit with reverse skyline.
-                            if (!params.best_fit_compact) {
-                                if (try_compact_reverse_skyline(idx, bmp, rot, pi)) {
-                                    relocated = true;
-                                    moved++;
-                                    found = true;
-                                }
-                            }
-                        }
-
-                        // Strategy 1: coarse bitmap scan
-                        if (!found && (params.compaction_mode == 1 || params.compaction_mode == 3)) {
-                            if (!params.best_fit_compact) {
-                                if (try_compact_bitmap(idx, bmp, rot, pi)) {
-                                    relocated = true;
-                                    moved++;
-                                    found = true;
-                                }
-                            }
-                        }
-
-                        // For best-fit: just check skyline placement Y without committing
-                        if (params.best_fit_compact && !relocated) {
-                            auto profile = compute_profile(bmp, bed_h_px);
-                            if (profile.max_y >= 0) {
-                                auto result = find_placement_skyline(plates[pi].skyline, bed_w_px, bed_h_px, profile);
-                                if (result) {
-                                    auto [px, py] = *result;
-                                    if (py < best_y_score) {
-                                        best_y_score = py;
-                                        best_plate = pi;
-                                        best_bmp_idx = (int)ri;
-                                        best_rot = rot;
+                    tbb::parallel_for(tbb::blocked_range<size_t>(0, compat_plates.size()),
+                        [&](const tbb::blocked_range<size_t> &range) {
+                            for (size_t pi_idx = range.begin(); pi_idx < range.end(); pi_idx++) {
+                                int pi = compat_plates[pi_idx];
+                                for (const auto &cand : candidates) {
+                                    std::optional<std::pair<int,int>> pos;
+                                    if (params.compaction_mode >= 2)
+                                        pos = find_compact_reverse_skyline(*cand.bmp, pi);
+                                    if (!pos && params.compaction_mode != 2)
+                                        pos = find_compact_bitmap(*cand.bmp, pi);
+                                    if (pos) {
+                                        results[pi_idx] = {pi, pos->first, pos->second, cand.ri, cand.rot};
+                                        any_found.store(true, std::memory_order_relaxed);
+                                        break; // found on this plate, try next plate for best-fit
                                     }
                                 }
                             }
                         }
+                    );
 
-                        if (relocated) break;
+                    if (any_found.load()) {
+                        // Pick lowest Y among all results
+                        int best_idx = -1, best_y = INT_MAX;
+                        for (size_t i = 0; i < results.size(); i++) {
+                            if (results[i].plate_idx >= 0 && results[i].py < best_y) {
+                                best_y = results[i].py;
+                                best_idx = (int)i;
+                            }
+                        }
+                        if (best_idx >= 0) {
+                            auto &r = results[best_idx];
+                            // Re-verify (plate may have changed if another item was committed)
+                            const auto &bmp = *candidates[0].bmp; // use matching ri
+                            for (const auto &cand : candidates) {
+                                if (cand.ri == r.ri) {
+                                    if (!collides(plates[r.plate_idx].bits, bed_w_words, bed_w_px, bed_h_px,
+                                                  *cand.bmp, r.px, r.py)) {
+                                        commit_compact(idx, *cand.bmp, r.rot, r.plate_idx, r.px, r.py);
+                                        relocated = true;
+                                        moved++;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
                     }
-                    if (relocated) break;
-                }
+                } else {
+                    // First-fit: stop as soon as any plate succeeds
+                    std::atomic<bool> found_flag{false};
+                    SearchResult winner;
+                    std::mutex winner_mutex;
 
-                // Best-fit: commit the best placement found
-                if (!relocated && params.best_fit_compact && best_plate >= 0) {
-                    const auto &[bmp, rot] = rot_bmps_all[idx][best_bmp_idx];
-                    // Try reverse skyline first, then bitmap scan on the best plate
-                    if (params.compaction_mode >= 2)
-                        relocated = try_compact_reverse_skyline(idx, bmp, rot, best_plate);
-                    if (!relocated && params.compaction_mode != 2)
-                        relocated = try_compact_bitmap(idx, bmp, rot, best_plate);
-                    if (relocated) moved++;
+                    tbb::parallel_for(tbb::blocked_range<size_t>(0, compat_plates.size()),
+                        [&](const tbb::blocked_range<size_t> &range) {
+                            for (size_t pi_idx = range.begin(); pi_idx < range.end(); pi_idx++) {
+                                if (found_flag.load(std::memory_order_relaxed)) return;
+                                int pi = compat_plates[pi_idx];
+                                for (const auto &cand : candidates) {
+                                    if (found_flag.load(std::memory_order_relaxed)) return;
+                                    std::optional<std::pair<int,int>> pos;
+                                    if (params.compaction_mode >= 2)
+                                        pos = find_compact_reverse_skyline(*cand.bmp, pi);
+                                    if (!pos && params.compaction_mode != 2)
+                                        pos = find_compact_bitmap(*cand.bmp, pi);
+                                    if (pos) {
+                                        std::lock_guard<std::mutex> lock(winner_mutex);
+                                        if (!found_flag.load()) {
+                                            winner = {pi, pos->first, pos->second, cand.ri, cand.rot};
+                                            found_flag.store(true, std::memory_order_release);
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    );
+
+                    if (found_flag.load()) {
+                        for (const auto &cand : candidates) {
+                            if (cand.ri == winner.ri) {
+                                // Re-verify after parallel search
+                                if (!collides(plates[winner.plate_idx].bits, bed_w_words, bed_w_px, bed_h_px,
+                                              *cand.bmp, winner.px, winner.py)) {
+                                    commit_compact(idx, *cand.bmp, winner.rot, winner.plate_idx, winner.px, winner.py);
+                                    relocated = true;
+                                    moved++;
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
             }
 
