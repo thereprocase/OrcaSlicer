@@ -641,34 +641,73 @@ void BitmapArranger::arrange(
     };
 
     constexpr int MAX_PLATES = 100;
+    int n = (int)entries.size();
 
+    // ============================================================
+    // PHASE 1: Compute shapes — rasterize each item's triangles at 0°
+    // ============================================================
+    std::vector<BitmapItem> base_bitmaps(n);
+    for (int i = 0; i < n; i++) {
+        auto &entry = entries[i];
+        if (!entry.concave_triangles.empty()) {
+            base_bitmaps[i] = rasterize_triangles(entry.concave_triangles, entry.inflation, res);
+        } else {
+            base_bitmaps[i] = rasterize(entry.poly, entry.inflation, res);
+        }
+        if (params.progressind)
+            params.progressind(i + 1, " (computing shapes)");
+        if (params.stopcondition && params.stopcondition())
+            return;
+    }
+
+    // ============================================================
+    // PHASE 2: Prepare rotations — rotate each 0° bitmap to all candidate angles
+    // ============================================================
+    // rot_bmps_all[i] = vector of (BitmapItem, angle) for item i
+    std::vector<std::vector<std::pair<BitmapItem, double>>> rot_bmps_all(n);
+    for (int i = 0; i < n; i++) {
+        auto &base = base_bitmaps[i];
+        if (base.width_px <= 0 || base.height_px <= 0) continue;
+
+        rot_bmps_all[i].push_back({base, 0.});
+        for (size_t ri = 1; ri < rotations.size(); ri++) {
+            auto rbmp = rotate_bitmap(base, rotations[ri], res);
+            if (rbmp.width_px > 0 && rbmp.height_px > 0)
+                rot_bmps_all[i].push_back({std::move(rbmp), rotations[ri]});
+        }
+
+        if (params.progressind)
+            params.progressind(i + 1, " (preparing rotations)");
+        if (params.stopcondition && params.stopcondition())
+            return;
+    }
+
+    // Free the triangle data — no longer needed after rasterization
+    for (auto &entry : entries)
+        entry.concave_triangles.clear();
+
+    // Precompute pixel count estimates for quick plate skip
+    std::vector<int> item_est_px(n, 0);
+    for (int i = 0; i < n; i++) {
+        if (rot_bmps_all[i].empty()) continue;
+        for (auto w : rot_bmps_all[i][0].first.bits) {
+            #ifdef _MSC_VER
+            item_est_px[i] += (int)__popcnt64(w);
+            #else
+            item_est_px[i] += __builtin_popcountll(w);
+            #endif
+        }
+    }
+
+    // ============================================================
+    // PHASE 3: Place parts — center-out, first-fit across plates
+    // ============================================================
     int placed_count = 0;
     int failed_count = 0;
-    for (auto &entry : entries) {
+    for (int i = 0; i < n; i++) {
+        auto &entry = entries[i];
+        auto &rot_bmps = rot_bmps_all[i];
         bool placed = false;
-
-        // Build rotated bitmaps for this item — rasterize ONCE at 0°,
-        // then rotate the bitmap for each angle. Each rotation is from the
-        // 0° original (never iterative) so no cumulative quality loss.
-        std::vector<std::pair<BitmapItem, double>> rot_bmps;
-        {
-            BitmapItem base_bmp;
-            if (!entry.concave_triangles.empty()) {
-                base_bmp = rasterize_triangles(entry.concave_triangles, entry.inflation, res);
-            } else {
-                base_bmp = rasterize(entry.poly, entry.inflation, res);
-            }
-
-            if (base_bmp.width_px > 0 && base_bmp.height_px > 0) {
-                rot_bmps.push_back({base_bmp, 0.});
-                // Generate rotated variants from the 0° base
-                for (size_t ri = 1; ri < rotations.size(); ri++) {
-                    auto rbmp = rotate_bitmap(base_bmp, rotations[ri], res);
-                    if (rbmp.width_px > 0 && rbmp.height_px > 0)
-                        rot_bmps.push_back({std::move(rbmp), rotations[ri]});
-                }
-            }
-        }
 
         if (rot_bmps.empty()) {
             arrangables[entry.orig_idx].bed_idx = -1;
@@ -676,20 +715,10 @@ void BitmapArranger::arrange(
             continue;
         }
 
-        // Estimate item pixel count from the 0° bitmap for quick plate skip
-        int item_est_px = 0;
-        for (auto w : rot_bmps[0].first.bits) {
-            #ifdef _MSC_VER
-            item_est_px += (int)__popcnt64(w);
-            #else
-            item_est_px += __builtin_popcountll(w);
-            #endif
-        }
-
         for (int pi = 0; pi < (int)plates.size(); pi++) {
             if (!is_material_compatible(plates[pi].material_group, entry.filament_temp_type))
                 continue;
-            if (plates[pi].free_px < item_est_px)
+            if (plates[pi].free_px < item_est_px[i])
                 continue;
             if (try_place_on_plate(entry, rot_bmps, pi)) { placed = true; break; }
         }
@@ -710,10 +739,8 @@ void BitmapArranger::arrange(
             placed_count++;
         }
 
-        if (params.progressind) {
-            // Arg is treated as progress numerator by ArrangeJob's callback
-            params.progressind(placed_count + failed_count, "");
-        }
+        if (params.progressind)
+            params.progressind(placed_count + failed_count, " (placing parts)");
         if (params.stopcondition && params.stopcondition())
             break;
     }
