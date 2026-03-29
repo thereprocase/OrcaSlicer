@@ -291,6 +291,151 @@ BitmapArranger::BitmapItem BitmapArranger::rotate_bitmap(
     return dst;
 }
 
+// ============================================================
+// 3D-aware nesting: Z-slice collision
+// ============================================================
+
+BitmapArranger::SliceStack BitmapArranger::rasterize_slices(
+    const Points &tri_verts, const std::vector<float> &tri_z,
+    coord_t inflation, coord_t res,
+    float slice_height_mm, float z_clearance_mm)
+{
+    SliceStack stack;
+    if (tri_verts.size() < 3 || tri_z.size() != tri_verts.size()) return stack;
+
+    // Find max Z to determine number of slices
+    float max_z = 0;
+    for (float z : tri_z) max_z = std::max(max_z, z);
+    stack.n_slices = std::max(1, (int)std::ceil(max_z / slice_height_mm));
+
+    // Bin triangles into slices. Each triangle goes to every slice its Z range
+    // intersects, padded by z_clearance.
+    std::vector<Points> slice_tris(stack.n_slices);
+    for (size_t ti = 0; ti + 2 < tri_verts.size(); ti += 3) {
+        float z_min = std::min({tri_z[ti], tri_z[ti + 1], tri_z[ti + 2]});
+        float z_max = std::max({tri_z[ti], tri_z[ti + 1], tri_z[ti + 2]});
+        int s_lo = std::max(0, (int)((z_min - z_clearance_mm) / slice_height_mm));
+        int s_hi = std::min(stack.n_slices - 1, (int)((z_max + z_clearance_mm) / slice_height_mm));
+        for (int s = s_lo; s <= s_hi; s++) {
+            slice_tris[s].push_back(tri_verts[ti]);
+            slice_tris[s].push_back(tri_verts[ti + 1]);
+            slice_tris[s].push_back(tri_verts[ti + 2]);
+        }
+    }
+
+    // Rasterize each slice using the existing triangle rasterizer
+    stack.slices.resize(stack.n_slices);
+    for (int s = 0; s < stack.n_slices; s++) {
+        if (!slice_tris[s].empty())
+            stack.slices[s] = rasterize_triangles(slice_tris[s], inflation, res);
+    }
+
+    return stack;
+}
+
+bool BitmapArranger::collides_3d(
+    const SliceStack &bed_stack, int bed_w, int bed_w_px, int bed_h,
+    const SliceStack &item_stack, int ox, int oy)
+{
+    int check_slices = std::min(bed_stack.n_slices, item_stack.n_slices);
+    for (int z = 0; z < check_slices; z++) {
+        if (item_stack.slices[z].width_px <= 0) continue;
+        if (bed_stack.slices[z].width_px <= 0) continue;
+        if (collides(bed_stack.slices[z].bits, bed_w, bed_w_px, bed_h,
+                     item_stack.slices[z], ox, oy))
+            return true;
+    }
+    // If item has more slices than bed, those upper slices are free — no collision
+    return false;
+}
+
+void BitmapArranger::stamp_3d(
+    SliceStack &bed_stack, int bed_w, int bed_w_px, int bed_h,
+    const SliceStack &item_stack, int ox, int oy)
+{
+    // Extend bed stack if item is taller
+    while (bed_stack.n_slices < item_stack.n_slices) {
+        bed_stack.slices.push_back({}); // empty slice
+        bed_stack.n_slices++;
+    }
+    for (int z = 0; z < item_stack.n_slices; z++) {
+        if (item_stack.slices[z].width_px <= 0) continue;
+        if (bed_stack.slices[z].bits.empty()) {
+            // Initialize this bed slice bitmap
+            int bed_w_words_local = (bed_w_px + 63) / 64;
+            bed_stack.slices[z].bits.assign(bed_w_words_local * bed_h, 0);
+            bed_stack.slices[z].width_words = bed_w_words_local;
+            bed_stack.slices[z].width_px = bed_w_px;
+            bed_stack.slices[z].height_px = bed_h;
+        }
+        stamp(bed_stack.slices[z].bits, bed_stack.slices[z].width_words,
+              bed_w_px, bed_h, item_stack.slices[z], ox, oy);
+    }
+}
+
+std::optional<std::pair<int,int>> BitmapArranger::find_placement_3d(
+    const SliceStack &bed_stack, int bed_w, int bed_w_px, int bed_h,
+    const SliceStack &item_stack, int step)
+{
+    // Center-out scan, same as 2D but using 3D collision
+    // Use the largest slice's dimensions for bounds
+    int item_w = 0, item_h = 0;
+    for (const auto &s : item_stack.slices) {
+        item_w = std::max(item_w, s.width_px);
+        item_h = std::max(item_h, s.height_px);
+    }
+    int max_x = bed_w_px - item_w;
+    int max_y = bed_h - item_h;
+    if (max_x < 0 || max_y < 0) return std::nullopt;
+
+    int cx = max_x / 2, cy = max_y / 2;
+    int max_radius = std::max(max_x, max_y);
+
+    for (int r = 0; r <= max_radius; r += step) {
+        int y_lo = std::max(0, cy - r), y_hi = std::min(max_y, cy + r);
+        int x_lo = std::max(0, cx - r), x_hi = std::min(max_x, cx + r);
+
+        for (int y = y_lo; y <= y_hi; y += step) {
+            for (int x = x_lo; x <= x_hi; x += step) {
+                if (r > step && x > x_lo + step && x < x_hi - step &&
+                    y > y_lo + step && y < y_hi - step)
+                    continue;
+
+                if (!collides_3d(bed_stack, bed_w, bed_w_px, bed_h, item_stack, x, y)) {
+                    // Refine for tightest center-ward placement
+                    int best_x = x, best_y = y;
+                    int best_dist = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+                    for (int ry = std::max(0, y - step + 1); ry <= std::min(max_y, y + step - 1); ry++) {
+                        for (int rx = std::max(0, x - step + 1); rx <= std::min(max_x, x + step - 1); rx++) {
+                            int d = (rx - cx) * (rx - cx) + (ry - cy) * (ry - cy);
+                            if (d < best_dist && !collides_3d(bed_stack, bed_w, bed_w_px, bed_h, item_stack, rx, ry)) {
+                                best_x = rx; best_y = ry; best_dist = d;
+                            }
+                        }
+                    }
+                    return std::make_pair(best_x, best_y);
+                }
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+BitmapArranger::SliceStack BitmapArranger::rotate_stack(
+    const SliceStack &src, double angle_rad, coord_t res)
+{
+    SliceStack dst;
+    dst.n_slices = src.n_slices;
+    dst.slices.reserve(src.n_slices);
+    for (const auto &slice : src.slices) {
+        if (slice.width_px > 0)
+            dst.slices.push_back(rotate_bitmap(slice, angle_rad, res));
+        else
+            dst.slices.push_back({});
+    }
+    return dst;
+}
+
 void BitmapArranger::stamp(
     std::vector<uint64_t> &bed_bits, int bed_w, int bed_w_px, int bed_h,
     const BitmapItem &item, int ox, int oy)
@@ -499,7 +644,8 @@ void BitmapArranger::arrange(
     struct ItemEntry {
         size_t orig_idx;
         ExPolygon poly;            // convex hull (for fallback / display)
-        Points concave_triangles;     // raw projected points (for bitmap rasterization)
+        Points concave_triangles;  // projected triangle verts (3 per tri)
+        std::vector<float> concave_z; // Z coords parallel to concave_triangles
         double rotation;
         coord_t inflation;
         int filament_temp_type = -1;
@@ -512,6 +658,7 @@ void BitmapArranger::arrange(
         e.orig_idx = i;
         e.poly = arrangables[i].poly;
         e.concave_triangles = std::move(arrangables[i].concave_triangles);
+        e.concave_z = std::move(arrangables[i].concave_z);
         e.rotation = arrangables[i].rotation;
         e.inflation = std::max(inflation, arrangables[i].inflation);
         e.filament_temp_type = arrangables[i].filament_temp_type;
@@ -560,6 +707,13 @@ void BitmapArranger::arrange(
         int material_group = -1; // filament_temp_type of first item placed; -1 = unassigned
         int free_px = 0;         // approximate free pixel count for quick skip
     };
+
+    struct PlateState3D {
+        SliceStack stack;
+        int material_group = -1;
+        int free_px = 0; // based on slice 0
+    };
+
     int total_bed_px = bed_w_px * bed_h_px;
 
     auto count_free_px = [&](const std::vector<uint64_t> &bits) -> int {
@@ -579,6 +733,20 @@ void BitmapArranger::arrange(
     plates.push_back({std::vector<uint64_t>(bed_w_words * bed_h_px, 0), -1, 0});
     stamp_excludes(plates[0].bits);
     plates[0].free_px = count_free_px(plates[0].bits);
+
+    std::vector<PlateState3D> plates_3d;
+    if (params.nesting_3d) {
+        PlateState3D p3d;
+        p3d.stack.n_slices = 1;
+        p3d.stack.slices.push_back(BitmapItem());
+        auto &s0 = p3d.stack.slices[0];
+        s0.bits.assign(bed_w_words * bed_h_px, 0);
+        s0.width_words = bed_w_words;
+        s0.width_px = bed_w_px;
+        s0.height_px = bed_h_px;
+        stamp_excludes(s0.bits);
+        plates_3d.push_back(std::move(p3d));
+    }
 
     // Coarse step (~1mm): scan the bed in large strides, then refine within
     // one step of the first collision-free spot. Balances speed vs. packing quality.
@@ -640,6 +808,31 @@ void BitmapArranger::arrange(
         return false;
     };
 
+    // 3D placement: try all rotated stacks on a 3D plate
+    auto try_place_on_plate_3d = [&](const ItemEntry &entry,
+                                      const std::vector<std::pair<SliceStack, double>> &rot_stacks,
+                                      int plate_idx) -> bool {
+        auto &bed_stack = plates_3d[plate_idx].stack;
+        for (const auto &[stack, rot] : rot_stacks) {
+            auto result = find_placement_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, scan_step);
+            if (result) {
+                auto [px, py] = *result;
+                const auto &s0 = stack.slices[0];
+                arrangables[entry.orig_idx].translation = {
+                    effective_bed.min.x() + (coord_t)(px * res) - s0.offset_x,
+                    effective_bed.min.y() + (coord_t)(py * res) - s0.offset_y
+                };
+                arrangables[entry.orig_idx].rotation = rot;
+                arrangables[entry.orig_idx].bed_idx = plate_idx;
+                stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py);
+                if (plates_3d[plate_idx].material_group < 0)
+                    plates_3d[plate_idx].material_group = entry.filament_temp_type;
+                return true;
+            }
+        }
+        return false;
+    };
+
     constexpr int MAX_PLATES = 100;
     int n = (int)entries.size();
 
@@ -647,9 +840,17 @@ void BitmapArranger::arrange(
     // PHASE 1: Compute shapes — rasterize each item's triangles at 0°
     // ============================================================
     std::vector<BitmapItem> base_bitmaps(n);
+    std::vector<SliceStack> base_stacks(n);
     for (int i = 0; i < n; i++) {
         auto &entry = entries[i];
-        if (!entry.concave_triangles.empty()) {
+        if (params.nesting_3d && !entry.concave_z.empty()) {
+            // 3D path: rasterize into a multi-slice stack
+            base_stacks[i] = rasterize_slices(entry.concave_triangles, entry.concave_z,
+                                              entry.inflation, res,
+                                              params.slice_height_mm, params.z_clearance_mm);
+            // Also produce a 2D bitmap for pixel-count estimates
+            base_bitmaps[i] = rasterize_triangles(entry.concave_triangles, entry.inflation, res);
+        } else if (!entry.concave_triangles.empty()) {
             base_bitmaps[i] = rasterize_triangles(entry.concave_triangles, entry.inflation, res);
         } else {
             base_bitmaps[i] = rasterize(entry.poly, entry.inflation, res);
@@ -665,15 +866,31 @@ void BitmapArranger::arrange(
     // ============================================================
     // rot_bmps_all[i] = vector of (BitmapItem, angle) for item i
     std::vector<std::vector<std::pair<BitmapItem, double>>> rot_bmps_all(n);
+    // rot_stacks_all[i] = vector of (SliceStack, angle) for 3D items
+    std::vector<std::vector<std::pair<SliceStack, double>>> rot_stacks_all(n);
     for (int i = 0; i < n; i++) {
-        auto &base = base_bitmaps[i];
-        if (base.width_px <= 0 || base.height_px <= 0) continue;
+        if (!base_stacks[i].slices.empty()) {
+            // 3D item: rotate the stack instead of the bitmap
+            rot_stacks_all[i].push_back({base_stacks[i], 0.});
+            for (size_t ri = 1; ri < rotations.size(); ri++) {
+                auto rstack = rotate_stack(base_stacks[i], rotations[ri], res);
+                rot_stacks_all[i].push_back({std::move(rstack), rotations[ri]});
+            }
+            // Still build 2D rotations for pixel-count estimates
+            auto &base = base_bitmaps[i];
+            if (base.width_px > 0 && base.height_px > 0) {
+                rot_bmps_all[i].push_back({base, 0.});
+            }
+        } else {
+            auto &base = base_bitmaps[i];
+            if (base.width_px <= 0 || base.height_px <= 0) continue;
 
-        rot_bmps_all[i].push_back({base, 0.});
-        for (size_t ri = 1; ri < rotations.size(); ri++) {
-            auto rbmp = rotate_bitmap(base, rotations[ri], res);
-            if (rbmp.width_px > 0 && rbmp.height_px > 0)
-                rot_bmps_all[i].push_back({std::move(rbmp), rotations[ri]});
+            rot_bmps_all[i].push_back({base, 0.});
+            for (size_t ri = 1; ri < rotations.size(); ri++) {
+                auto rbmp = rotate_bitmap(base, rotations[ri], res);
+                if (rbmp.width_px > 0 && rbmp.height_px > 0)
+                    rot_bmps_all[i].push_back({std::move(rbmp), rotations[ri]});
+            }
         }
 
         if (params.progressind)
@@ -682,9 +899,11 @@ void BitmapArranger::arrange(
             return;
     }
 
-    // Free the triangle data — no longer needed after rasterization
-    for (auto &entry : entries)
+    // Free the triangle and Z data — no longer needed after rasterization
+    for (auto &entry : entries) {
         entry.concave_triangles.clear();
+        entry.concave_z.clear();
+    }
 
     // Precompute pixel count estimates for quick plate skip
     std::vector<int> item_est_px(n, 0);
@@ -709,27 +928,52 @@ void BitmapArranger::arrange(
         auto &rot_bmps = rot_bmps_all[i];
         bool placed = false;
 
-        if (rot_bmps.empty()) {
+        if (rot_bmps.empty() && rot_stacks_all[i].empty()) {
             arrangables[entry.orig_idx].bed_idx = -1;
             failed_count++;
             continue;
         }
 
-        for (int pi = 0; pi < (int)plates.size(); pi++) {
-            if (!is_material_compatible(plates[pi].material_group, entry.filament_temp_type))
-                continue;
-            if (plates[pi].free_px < item_est_px[i])
-                continue;
-            if (try_place_on_plate(entry, rot_bmps, pi)) { placed = true; break; }
-        }
+        if (params.nesting_3d && !rot_stacks_all[i].empty()) {
+            // 3D placement path
+            for (int pi = 0; pi < (int)plates_3d.size(); pi++) {
+                if (!is_material_compatible(plates_3d[pi].material_group, entry.filament_temp_type))
+                    continue;
+                if (try_place_on_plate_3d(entry, rot_stacks_all[i], pi)) { placed = true; break; }
+            }
+            if (!placed && params.allow_multi_plate && (int)plates_3d.size() < MAX_PLATES) {
+                PlateState3D p3d;
+                p3d.stack.n_slices = 1;
+                p3d.stack.slices.push_back(BitmapItem());
+                auto &s0 = p3d.stack.slices[0];
+                s0.bits.assign(bed_w_words * bed_h_px, 0);
+                s0.width_words = bed_w_words;
+                s0.width_px = bed_w_px;
+                s0.height_px = bed_h_px;
+                stamp_excludes(s0.bits);
+                int new_idx = (int)plates_3d.size();
+                plates_3d.push_back(std::move(p3d));
+                placed = try_place_on_plate_3d(entry, rot_stacks_all[i], new_idx);
+                if (!placed) plates_3d.pop_back();
+            }
+        } else {
+            // Existing 2D placement path
+            for (int pi = 0; pi < (int)plates.size(); pi++) {
+                if (!is_material_compatible(plates[pi].material_group, entry.filament_temp_type))
+                    continue;
+                if (plates[pi].free_px < item_est_px[i])
+                    continue;
+                if (try_place_on_plate(entry, rot_bmps, pi)) { placed = true; break; }
+            }
 
-        if (!placed && params.allow_multi_plate && (int)plates.size() < MAX_PLATES) {
-            int new_idx = (int)plates.size();
-            plates.push_back({std::vector<uint64_t>(bed_w_words * bed_h_px, 0), -1, 0});
-            stamp_excludes(plates[new_idx].bits);
-            plates[new_idx].free_px = count_free_px(plates[new_idx].bits);
-            placed = try_place_on_plate(entry, rot_bmps, new_idx);
-            if (!placed) plates.pop_back();
+            if (!placed && params.allow_multi_plate && (int)plates.size() < MAX_PLATES) {
+                int new_idx = (int)plates.size();
+                plates.push_back({std::vector<uint64_t>(bed_w_words * bed_h_px, 0), -1, 0});
+                stamp_excludes(plates[new_idx].bits);
+                plates[new_idx].free_px = count_free_px(plates[new_idx].bits);
+                placed = try_place_on_plate(entry, rot_bmps, new_idx);
+                if (!placed) plates.pop_back();
+            }
         }
 
         if (!placed) {
@@ -745,9 +989,11 @@ void BitmapArranger::arrange(
             break;
     }
 
+    int total_plates = params.nesting_3d ? (int)plates_3d.size() : (int)plates.size();
     BOOST_LOG_TRIVIAL(info) << "BitmapArranger: placed " << placed_count
                             << "/" << arrangables.size() << " on "
-                            << plates.size() << " plate(s)";
+                            << total_plates << " plate(s)"
+                            << (params.nesting_3d ? " (3D nesting)" : "");
 }
 
 }} // namespace Slic3r::arrangement

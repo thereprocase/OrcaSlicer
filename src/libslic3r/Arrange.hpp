@@ -84,6 +84,9 @@ struct ArrangePolygon {
     /// consumed by BitmapArranger which scanline-fills each triangle into the
     /// collision bitmap — same as GPU rasterization but on CPU. No Clipper needed.
     Points concave_triangles;
+    /// Z coordinates of triangle vertices (parallel to concave_triangles).
+    /// Used for 3D-aware nesting to assign triangles to Z slices.
+    std::vector<float> concave_z;
 
     /// Optional setter function which can store arbitrary data in its closure
     std::function<void(const ArrangePolygon&)> setter = nullptr;
@@ -141,6 +144,9 @@ struct ArrangeParams {
     int   purge_pad_edge                      = 0;      // 0=front, 1=back, 2=left, 3=right
     float purge_pad_mm                        = 5.f;
     float bitmap_resolution_mm                = 0.5f;
+    bool  nesting_3d                          = false;
+    float slice_height_mm                     = 12.7f;
+    float z_clearance_mm                      = 2.0f;
     float bed_shrink_x = 1;
     float bed_shrink_y = 1;
     float brim_skirt_distance = 0;

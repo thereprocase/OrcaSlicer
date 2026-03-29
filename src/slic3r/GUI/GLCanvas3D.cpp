@@ -1166,6 +1166,18 @@ void GLCanvas3D::load_arrange_settings()
     if (!bitmap_res_str.empty())
         m_arrange_settings_fff.bitmap_resolution_mm = std::stof(bitmap_res_str);
 
+    std::string nesting_3d_str = wxGetApp().app_config->get("arrange", "nesting_3d");
+    if (!nesting_3d_str.empty())
+        m_arrange_settings_fff.nesting_3d = (nesting_3d_str == "1" || nesting_3d_str == "true");
+
+    std::string slice_h_str = wxGetApp().app_config->get("arrange", "slice_height_mm");
+    if (!slice_h_str.empty())
+        m_arrange_settings_fff.slice_height_mm = std::stof(slice_h_str);
+
+    std::string z_clear_str = wxGetApp().app_config->get("arrange", "z_clearance_mm");
+    if (!z_clear_str.empty())
+        m_arrange_settings_fff.z_clearance_mm = std::stof(z_clear_str);
+
     //BBS: add specific arrange settings
     m_arrange_settings_fff_seq_print.is_seq_print = true;
 }
@@ -5954,6 +5966,58 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         if (!settings_out.use_concave_hulls) imgui->disabled_end();
     }
 
+    {
+        if (!settings_out.use_concave_hulls) imgui->disabled_begin(true);
+
+        if (imgui->bbl_checkbox(_L("3D-aware nesting"), settings.nesting_3d)) {
+            settings_out.nesting_3d = settings.nesting_3d;
+            appcfg->set("arrange", "nesting_3d", settings_out.nesting_3d ? "1" : "0");
+            settings_changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", _u8L("Check collisions at multiple Z heights.\n"
+                                         "Parts with overhangs can share XY space when their\n"
+                                         "Z ranges don't conflict. Slower but packs taller parts better.").c_str());
+
+        {
+            if (!settings_out.nesting_3d) imgui->disabled_begin(true);
+
+            ImGui::AlignTextToFramePadding();
+            imgui->text(_L("Slice height"));
+            ImGui::SameLine(1.2 * cursor_slider_left);
+            ImGui::PushItemWidth(window_width - slider_icon_width);
+            bool sh_changed = imgui->bbl_slider_float_style("##slice_height", &settings.slice_height_mm, 2.f, 50.f, "%4.1f");
+            ImGui::SameLine(window_width - slider_icon_width + 1.3 * cursor_slider_left);
+            ImGui::PushItemWidth(1.5 * slider_icon_width);
+            bool sh_input = ImGui::BBLDragFloat("##slice_h_input", &settings.slice_height_mm, 0.5f, 2.f, 50.f, "%.1f");
+            if (sh_changed || sh_input) {
+                settings.slice_height_mm = std::clamp(settings.slice_height_mm, 2.f, 50.f);
+                settings_out.slice_height_mm = settings.slice_height_mm;
+                appcfg->set("arrange", "slice_height_mm", float_to_string_decimal_point(settings_out.slice_height_mm));
+                settings_changed = true;
+            }
+
+            ImGui::AlignTextToFramePadding();
+            imgui->text(_L("Z clearance"));
+            ImGui::SameLine(1.2 * cursor_slider_left);
+            ImGui::PushItemWidth(window_width - slider_icon_width);
+            bool zc_changed = imgui->bbl_slider_float_style("##z_clearance", &settings.z_clearance_mm, 0.f, 10.f, "%3.1f");
+            ImGui::SameLine(window_width - slider_icon_width + 1.3 * cursor_slider_left);
+            ImGui::PushItemWidth(1.5 * slider_icon_width);
+            bool zc_input = ImGui::BBLDragFloat("##z_clear_input", &settings.z_clearance_mm, 0.1f, 0.f, 10.f, "%.1f");
+            if (zc_changed || zc_input) {
+                settings.z_clearance_mm = std::clamp(settings.z_clearance_mm, 0.f, 10.f);
+                settings_out.z_clearance_mm = settings.z_clearance_mm;
+                appcfg->set("arrange", "z_clearance_mm", float_to_string_decimal_point(settings_out.z_clearance_mm));
+                settings_changed = true;
+            }
+
+            if (!settings_out.nesting_3d) imgui->disabled_end();
+        }
+
+        if (!settings_out.use_concave_hulls) imgui->disabled_end();
+    }
+
     ImGui::Separator();
     if (imgui->bbl_checkbox(_L("Auto rotate for arrangement"), settings.enable_rotation)) {
         settings_out.enable_rotation = settings.enable_rotation;
@@ -6057,6 +6121,9 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         appcfg->set("arrange", "purge_pad_edge", std::to_string(settings_out.purge_pad_edge));
         appcfg->set("arrange", "purge_pad_mm", float_to_string_decimal_point(settings_out.purge_pad_mm));
         appcfg->set("arrange", "bitmap_resolution_mm", float_to_string_decimal_point(settings_out.bitmap_resolution_mm));
+        appcfg->set("arrange", "nesting_3d", settings_out.nesting_3d ? "1" : "0");
+        appcfg->set("arrange", "slice_height_mm", float_to_string_decimal_point(settings_out.slice_height_mm));
+        appcfg->set("arrange", "z_clearance_mm", float_to_string_decimal_point(settings_out.z_clearance_mm));
         settings_changed = true;
     }
     ImGui::PopStyleVar(1);

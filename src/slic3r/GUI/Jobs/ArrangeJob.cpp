@@ -788,6 +788,9 @@ arrangement::ArrangeParams init_arrange_params(Plater *p)
     params.purge_pad_edge                      = settings.purge_pad_edge;
     params.purge_pad_mm                        = settings.purge_pad_mm;
     params.bitmap_resolution_mm                = settings.bitmap_resolution_mm;
+    params.nesting_3d                          = settings.nesting_3d;
+    params.slice_height_mm                     = settings.slice_height_mm;
+    params.z_clearance_mm                      = settings.z_clearance_mm;
 
     int state = p->get_prepare_state();
     if (state == Job::JobPrepareState::PREPARE_STATE_MENU) {

@@ -37,6 +37,12 @@ public:
         coord_t offset_y = 0;
     };
 
+    // 3D slice stack — one 2D bitmap per Z slice.
+    struct SliceStack {
+        std::vector<BitmapItem> slices;
+        int n_slices = 0;
+    };
+
     // Run the bitmap arrangement.
     // Modifies arrangables in-place (translation, rotation, bed_idx).
     static void arrange(
@@ -70,12 +76,39 @@ private:
                          int bed_w, int bed_w_px, int bed_h,
                          const BitmapItem &item, int ox, int oy);
 
-    // Find best placement for an item on the bed using bottom-left-fill.
+    // Find best placement for an item on the bed using center-out scan.
     static std::optional<std::pair<int,int>> find_placement(
         const std::vector<uint64_t> &bed_bits,
         int bed_w, int bed_w_px, int bed_h,
         const BitmapItem &item,
         int step);
+
+    // 3D collision: check all Z slices. Returns true if ANY slice collides.
+    static bool collides_3d(const SliceStack &bed_stack,
+                            int bed_w, int bed_w_px, int bed_h,
+                            const SliceStack &item_stack, int ox, int oy);
+
+    // 3D stamp: stamp all Z slices.
+    static void stamp_3d(SliceStack &bed_stack,
+                         int bed_w, int bed_w_px, int bed_h,
+                         const SliceStack &item_stack, int ox, int oy);
+
+    // 3D find_placement: center-out scan with per-slice collision.
+    static std::optional<std::pair<int,int>> find_placement_3d(
+        const SliceStack &bed_stack,
+        int bed_w, int bed_w_px, int bed_h,
+        const SliceStack &item_stack,
+        int step);
+
+    // Rotate a slice stack: rotate each slice independently from 0° source.
+    static SliceStack rotate_stack(const SliceStack &src, double angle_rad, coord_t res);
+
+    // Build a slice stack from projected triangles with Z info.
+    // tri_data: every 3 consecutive entries = {Point2D, Point2D, Point2D} for one triangle
+    // tri_z: every 3 consecutive floats = {z0, z1, z2} for the same triangle's vertex Z coords
+    static SliceStack rasterize_slices(const Points &tri_verts, const std::vector<float> &tri_z,
+                                       coord_t inflation, coord_t res,
+                                       float slice_height_mm, float z_clearance_mm);
 };
 
 }} // namespace Slic3r::arrangement
