@@ -79,6 +79,12 @@ struct ArrangePolygon {
     // If only a zero is there, no rotation is allowed
     std::vector<double> allowed_rotations = {0.};
 
+    /// Projected 2D triangle vertices for direct bitmap rasterization (concave mode).
+    /// Every 3 consecutive Points form one triangle. Set during prepare(),
+    /// consumed by BitmapArranger which scanline-fills each triangle into the
+    /// collision bitmap — same as GPU rasterization but on CPU. No Clipper needed.
+    Points concave_triangles;
+
     /// Optional setter function which can store arbitrary data in its closure
     std::function<void(const ArrangePolygon&)> setter = nullptr;
 
@@ -127,6 +133,14 @@ struct ArrangeParams {
     bool  avoid_extrusion_cali_region         = true;
     bool  is_seq_print                        = false;
     bool  align_to_y_axis                     = false;
+    bool  use_concave_hulls                   = false;
+    bool  allow_multi_plate                   = true;
+    bool  consolidate_plates                  = false;
+    double rotation_step_rad                  = PI / 4.;
+    bool  avoid_purge_pad                     = false;
+    int   purge_pad_edge                      = 0;      // 0=front, 1=back, 2=left, 3=right
+    float purge_pad_mm                        = 5.f;
+    float bitmap_resolution_mm                = 0.5f;
     float bed_shrink_x = 1;
     float bed_shrink_y = 1;
     float brim_skirt_distance = 0;
@@ -172,6 +186,17 @@ struct ArrangeParams {
         ret += "\"clearance_height_to_lid\":" + std::to_string(clearance_height_to_lid) + ",";
         ret += "\"clearance_radius\":" + std::to_string(clearance_radius) + ",";
         ret += "\"printable_height\":" + std::to_string(printable_height) + ",";
+        ret += "\"use_concave_hulls\":" + std::to_string(use_concave_hulls) + ",";
+        ret += "\"allow_multi_plate\":" + std::to_string(allow_multi_plate) + ",";
+        ret += "\"consolidate_plates\":" + std::to_string(consolidate_plates) + ",";
+        ret += "\"rotation_step_rad\":" + std::to_string(rotation_step_rad) + ",";
+        ret += "\"align_to_y_axis\":" + std::to_string(align_to_y_axis) + ",";
+        ret += "\"avoid_purge_pad\":" + std::to_string(avoid_purge_pad) + ",";
+        ret += "\"purge_pad_edge\":" + std::to_string(purge_pad_edge) + ",";
+        ret += "\"purge_pad_mm\":" + std::to_string(purge_pad_mm) + ",";
+        ret += "\"bitmap_resolution_mm\":" + std::to_string(bitmap_resolution_mm) + ",";
+        ret.pop_back();
+        ret += "}";
         return ret;
     }
 
@@ -190,9 +215,9 @@ Points get_shrink_bedpts(const DynamicPrintConfig* print_cfg, const ArrangeParam
 /**
  * \brief Arranges the input polygons.
  *
- * WARNING: Currently, only convex polygons are supported by the libnest2d
- * library which is used to do the arrangement. This might change in the future
- * this is why the interface contains a general polygon capable to have holes.
+ * When use_concave_hulls is set in ArrangeParams, the BitmapArranger is
+ * used instead of libnest2d, enabling tighter packing for irregular
+ * shapes (crescents, L-brackets, U-channels).
  *
  * \param items Input vector of ArrangePolygons. The transformation, rotation
  * and bin_idx fields will be changed after the call finished and can be used
@@ -203,7 +228,7 @@ template<class TBed> void arrange(ArrangePolygons &items, const ArrangePolygons 
 // A dispatch function that determines the bed shape from a set of points.
 template<> void arrange(ArrangePolygons &items, const ArrangePolygons &excludes, const Points &bed, const ArrangeParams &params);
 
-extern template void arrange(ArrangePolygons &items, const ArrangePolygons &excludes, const BoundingBox &bed, const ArrangeParams &params);
+template<> void arrange(ArrangePolygons &items, const ArrangePolygons &excludes, const BoundingBox &bed, const ArrangeParams &params);
 extern template void arrange(ArrangePolygons &items, const ArrangePolygons &excludes, const CircleBed &bed, const ArrangeParams &params);
 extern template void arrange(ArrangePolygons &items, const ArrangePolygons &excludes, const Polygon &bed, const ArrangeParams &params);
 extern template void arrange(ArrangePolygons &items, const ArrangePolygons &excludes, const InfiniteBed &bed, const ArrangeParams &params);

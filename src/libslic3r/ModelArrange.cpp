@@ -89,9 +89,9 @@ void duplicate_objects(Model &model, size_t copies_num)
 
 // Set up arrange polygon for a ModelInstance and Wipe tower
 template<class T>
-arrangement::ArrangePolygon get_arrange_poly(T obj, const Slic3r::DynamicPrintConfig& config)
+arrangement::ArrangePolygon get_arrange_poly(T obj, const Slic3r::DynamicPrintConfig& config, bool use_concave)
 {
-    ArrangePolygon ap = obj.get_arrange_polygon(config);
+    ArrangePolygon ap = obj.get_arrange_polygon(config, use_concave);
     //BBS: always set bed_idx to 0 to use original transforms with no bed_idx
     //if this object is not arranged, it can keep the original transforms
     //ap.bed_idx        = ap.translation.x() / bed_stride_x(plater);
@@ -111,14 +111,14 @@ arrangement::ArrangePolygon get_arrange_poly(T obj, const Slic3r::DynamicPrintCo
 }
 
 template<>
-arrangement::ArrangePolygon get_arrange_poly(ModelInstance* inst, const Slic3r::DynamicPrintConfig& config)
+arrangement::ArrangePolygon get_arrange_poly(ModelInstance* inst, const Slic3r::DynamicPrintConfig& config, bool use_concave)
 {
-    return get_arrange_poly(PtrWrapper{ inst },config);
+    return get_arrange_poly(PtrWrapper{ inst }, config, use_concave);
 }
 
-ArrangePolygon get_instance_arrange_poly(ModelInstance* instance, const Slic3r::DynamicPrintConfig& config)
+ArrangePolygon get_instance_arrange_poly(ModelInstance* instance, const Slic3r::DynamicPrintConfig& config, bool use_concave)
 {
-    ArrangePolygon ap = get_arrange_poly(PtrWrapper{ instance }, config);
+    ArrangePolygon ap = get_arrange_poly(PtrWrapper{ instance }, config, use_concave);
 
     //BBS: add temperature information
     if (config.has("curr_bed_type")) {

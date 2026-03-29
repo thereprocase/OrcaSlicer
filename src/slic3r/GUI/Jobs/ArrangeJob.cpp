@@ -104,7 +104,7 @@ ArrangePolygon ArrangeJob::prepare_arrange_polygon(void* model_instance)
 {
     ModelInstance* instance = (ModelInstance*)model_instance;
     const Slic3r::DynamicPrintConfig& config = wxGetApp().preset_bundle->full_config();
-    return get_instance_arrange_poly(instance, config);
+    return get_instance_arrange_poly(instance, config, params.use_concave_hulls);
 }
 
 void ArrangeJob::prepare_selected() {
@@ -780,6 +780,14 @@ arrangement::ArrangeParams init_arrange_params(Plater *p)
     params.is_seq_print                        = settings.is_seq_print;
     params.min_obj_distance                    = scaled(settings.distance);
     params.align_to_y_axis                     = settings.align_to_y_axis;
+    params.use_concave_hulls                   = settings.use_concave_hulls;
+    params.allow_multi_plate                   = settings.allow_multi_plate;
+    params.consolidate_plates                  = settings.consolidate_plates;
+    params.rotation_step_rad                   = settings.rotation_step_deg * PI / 180.0;
+    params.avoid_purge_pad                     = settings.avoid_purge_pad;
+    params.purge_pad_edge                      = settings.purge_pad_edge;
+    params.purge_pad_mm                        = settings.purge_pad_mm;
+    params.bitmap_resolution_mm                = settings.bitmap_resolution_mm;
 
     int state = p->get_prepare_state();
     if (state == Job::JobPrepareState::PREPARE_STATE_MENU) {

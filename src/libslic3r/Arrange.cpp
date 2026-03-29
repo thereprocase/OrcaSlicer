@@ -1,4 +1,5 @@
 #include "Arrange.hpp"
+#include "Arrange/BitmapArranger.hpp"
 #include "Print.hpp"
 #include "BoundingBox.hpp"
 #include "libslic3r.h"
@@ -292,11 +293,16 @@ void fill_config(PConf& pcfg, const ArrangeParams &params) {
         pcfg.alignment = PConf::Alignment::DONT_ALIGN;
 
 
-    // Try 4 angles (45 degree step) and find the one with min cost
-    if (params.allow_rotations)
-        pcfg.rotations = {0., PI / 4., PI/2, 3. * PI / 4. };
-    else
+    if (params.allow_rotations) {
+        pcfg.rotations.clear();
+        double rot_step = std::max(params.rotation_step_rad, PI / 36.);
+        for (double a = 0.; a < PI; a += rot_step)
+            pcfg.rotations.push_back(a);
+        if (pcfg.rotations.empty())
+            pcfg.rotations = {0.};
+    } else {
         pcfg.rotations = {0.};
+    }
 
     // The accuracy of optimization.
     // Goes from 0.0 to 1.0 and scales performance as well
@@ -1116,12 +1122,52 @@ void arrange(ArrangePolygons &      items,
     });
 }
 
+// BoundingBox specialization: can use bitmap arranger for concave hulls
+template<>
+void arrange(ArrangePolygons &      arrangables,
+             const ArrangePolygons &excludes,
+             const BoundingBox &    bed,
+             const ArrangeParams &  params)
+{
+    if (params.use_concave_hulls && !params.is_seq_print) {
+        BitmapArranger::arrange(arrangables, excludes, bed, params);
+        return;
+    }
+
+    // Fall through to libnest2d path
+    namespace clppr = Slic3r::ClipperLib;
+    std::vector<Item> items, fixeditems;
+    items.reserve(arrangables.size());
+
+    for (ArrangePolygon &arrangeable : arrangables)
+        process_arrangeable(arrangeable, items);
+
+    for (const ArrangePolygon &fixed: excludes)
+        process_arrangeable(fixed, fixeditems);
+
+    for (Item &itm : fixeditems) itm.inflate(scaled(-2. * EPSILON));
+
+    _arrange(items, fixeditems, to_nestbin(bed), params, params.progressind, params.stopcondition);
+
+    for(size_t i = 0; i < items.size(); ++i) {
+        Point tr = items[i].translation();
+        arrangables[i].translation = {coord_t(tr.x()), coord_t(tr.y())};
+        arrangables[i].rotation    = items[i].rotation();
+        arrangables[i].bed_idx     = items[i].binId();
+        arrangables[i].itemid      = items[i].itemId();
+    }
+}
+
 template<class BedT>
 void arrange(ArrangePolygons &      arrangables,
              const ArrangePolygons &excludes,
              const BedT &           bed,
              const ArrangeParams &  params)
 {
+    if (params.use_concave_hulls) {
+        BOOST_LOG_TRIVIAL(warning) << "BitmapArranger: concave hulls only supported for rectangular beds, falling back to convex";
+    }
+
     namespace clppr = Slic3r::ClipperLib;
 
     std::vector<Item> items, fixeditems;
@@ -1146,7 +1192,7 @@ void arrange(ArrangePolygons &      arrangables,
     }
 }
 
-template void arrange(ArrangePolygons &items, const ArrangePolygons &excludes, const BoundingBox &bed, const ArrangeParams &params);
+// BoundingBox specialization is defined above (with bitmap arranger support)
 template void arrange(ArrangePolygons &items, const ArrangePolygons &excludes, const CircleBed &bed, const ArrangeParams &params);
 template void arrange(ArrangePolygons &items, const ArrangePolygons &excludes, const Polygon &bed, const ArrangeParams &params);
 template void arrange(ArrangePolygons &items, const ArrangePolygons &excludes, const InfiniteBed &bed, const ArrangeParams &params);

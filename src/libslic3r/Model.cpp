@@ -20,6 +20,7 @@
 
 #include "libslic3r/Geometry/ConvexHull.hpp"
 
+#include <cmath>
 #include <float.h>
 
 #include <boost/algorithm/string/predicate.hpp>
@@ -1701,6 +1702,32 @@ Polygon ModelObject::convex_hull_2d(const Transform3d& trafo_instance) const
 #endif
 }
 
+ExPolygons ModelObject::concave_hull_2d(const Transform3d& trafo_instance) const
+{
+    // Collect projected 2D points from mesh vertices using the existing fast utility.
+    // Returns Points directly — no Clipper, no polygon booleans, O(vertices).
+    Points pts;
+    for (const ModelVolume *v : this->volumes) {
+        if (!v->is_model_part())
+            continue;
+        its_collect_mesh_projection_points_above(
+            v->mesh().its,
+            (trafo_instance * v->get_matrix()).cast<float>(),
+            0.0f, pts);
+    }
+
+    if (pts.empty())
+        return {};
+
+    // Return the convex hull as a fallback ExPolygon.
+    // The REAL concave silhouette is built by BitmapArranger directly from
+    // the raw points — no ExPolygon intermediate needed for the bitmap path.
+    // This ExPolygon is only used for display/libnest2d fallback.
+    ExPolygon ep;
+    ep.contour = Geometry::convex_hull(std::move(pts));
+    return {ep};
+}
+
 void ModelObject::center_around_origin(bool include_modifiers)
 {
     // calculate the displacements needed to
@@ -3288,25 +3315,42 @@ double ModelInstance::get_auto_brim_width() const
     return get_auto_brim_width(DeltaT, adhcoeff);
 }
 
-void ModelInstance::get_arrange_polygon(void *ap, const Slic3r::DynamicPrintConfig &config_global) const
+void ModelInstance::get_arrange_polygon(void *ap, const Slic3r::DynamicPrintConfig &config_global, bool use_concave) const
 {
-//    static const double SIMPLIFY_TOLERANCE_MM = 0.1;
-
     Vec3d rotation = get_rotation();
     rotation.z()   = 0.;
     Geometry::Transformation t(m_transformation);
     t.set_offset(get_offset().z() * Vec3d::UnitZ());
     t.set_rotation(rotation);
-    Polygon p = get_object()->convex_hull_2d(t.get_matrix());
-
-//    if (!p.points.empty()) {
-//        Polygons pp{p};
-//        pp = p.simplify(scaled<double>(SIMPLIFY_TOLERANCE_MM));
-//        if (!pp.empty()) p = pp.front();
-//    }
 
     arrangement::ArrangePolygon& ret = *(arrangement::ArrangePolygon*)ap;
-    ret.poly.contour = std::move(p);
+
+    // Always use fast convex hull during prepare() (main thread).
+    // Defer expensive concave silhouette to background thread via callback.
+    ret.poly.contour = get_object()->convex_hull_2d(t.get_matrix());
+
+    if (use_concave) {
+        // Project each mesh triangle's 3 vertices to 2D and store them.
+        // BitmapArranger scanline-fills each triangle directly into the collision
+        // bitmap — like GPU rasterization but on CPU. No Clipper, instant.
+        for (const ModelVolume *v : object->volumes) {
+            if (!v->is_model_part()) continue;
+            const indexed_triangle_set &its = v->mesh().its;
+            Transform3f trafo = (t.get_matrix() * v->get_matrix()).cast<float>();
+            ret.concave_triangles.reserve(ret.concave_triangles.size() + its.indices.size() * 3);
+            for (const stl_triangle_vertex_indices &tri : its.indices) {
+                Vec3f p0 = trafo * its.vertices[tri(0)];
+                Vec3f p1 = trafo * its.vertices[tri(1)];
+                Vec3f p2 = trafo * its.vertices[tri(2)];
+                // Skip triangles entirely below the bed
+                if (p0.z() < 0 && p1.z() < 0 && p2.z() < 0)
+                    continue;
+                ret.concave_triangles.emplace_back(scaled<coord_t>(p0.x()), scaled<coord_t>(p0.y()));
+                ret.concave_triangles.emplace_back(scaled<coord_t>(p1.x()), scaled<coord_t>(p1.y()));
+                ret.concave_triangles.emplace_back(scaled<coord_t>(p2.x()), scaled<coord_t>(p2.y()));
+            }
+        }
+    }
     ret.translation  = Vec2crd{scaled(get_offset(X)), scaled(get_offset(Y))};
     ret.rotation     = get_rotation(Z);
 

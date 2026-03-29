@@ -1130,6 +1130,42 @@ void GLCanvas3D::load_arrange_settings()
     if (!en_rot_sla_str.empty())
         m_arrange_settings_sla.enable_rotation = (en_rot_sla_str == "1" || en_rot_sla_str == "true");
 
+    std::string en_concave_str =
+        wxGetApp().app_config->get("arrange", "use_concave_hulls");
+    if (!en_concave_str.empty())
+        m_arrange_settings_fff.use_concave_hulls = (en_concave_str == "1" || en_concave_str == "true");
+
+    std::string en_multi_plate_str =
+        wxGetApp().app_config->get("arrange", "allow_multi_plate");
+    if (!en_multi_plate_str.empty())
+        m_arrange_settings_fff.allow_multi_plate = (en_multi_plate_str == "1" || en_multi_plate_str == "true");
+
+    std::string en_consolidate_str =
+        wxGetApp().app_config->get("arrange", "consolidate_plates");
+    if (!en_consolidate_str.empty())
+        m_arrange_settings_fff.consolidate_plates = (en_consolidate_str == "1" || en_consolidate_str == "true");
+
+    std::string rot_step_str =
+        wxGetApp().app_config->get("arrange", "rotation_step_deg_fff");
+    if (!rot_step_str.empty())
+        m_arrange_settings_fff.rotation_step_deg = std::stoi(rot_step_str);
+
+    std::string purge_pad_str = wxGetApp().app_config->get("arrange", "avoid_purge_pad");
+    if (!purge_pad_str.empty())
+        m_arrange_settings_fff.avoid_purge_pad = (purge_pad_str == "1" || purge_pad_str == "true");
+
+    std::string purge_edge_str = wxGetApp().app_config->get("arrange", "purge_pad_edge");
+    if (!purge_edge_str.empty())
+        m_arrange_settings_fff.purge_pad_edge = std::stoi(purge_edge_str);
+
+    std::string purge_mm_str = wxGetApp().app_config->get("arrange", "purge_pad_mm");
+    if (!purge_mm_str.empty())
+        m_arrange_settings_fff.purge_pad_mm = std::stof(purge_mm_str);
+
+    std::string bitmap_res_str = wxGetApp().app_config->get("arrange", "bitmap_resolution_mm");
+    if (!bitmap_res_str.empty())
+        m_arrange_settings_fff.bitmap_resolution_mm = std::stof(bitmap_res_str);
+
     //BBS: add specific arrange settings
     m_arrange_settings_fff_seq_print.is_seq_print = true;
 }
@@ -5807,10 +5843,150 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     imgui->text(_L("0 means auto spacing."));
 
     ImGui::Separator();
+
+    std::string concave_key = "use_concave_hulls";
+    if (imgui->bbl_checkbox(_L("Use actual part shape for arrangement"), settings.use_concave_hulls)) {
+        settings_out.use_concave_hulls = settings.use_concave_hulls;
+        appcfg->set("arrange", concave_key.c_str(), settings_out.use_concave_hulls ? "1" : "0");
+        settings_changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", _u8L("Use each part's actual outline instead of its convex hull.\n"
+                                     "Produces tighter packing for concave shapes (crescents, L-brackets, U-channels)\n"
+                                     "at the cost of slightly longer computation.\n"
+                                     "Not available in Print-by-Object mode (falls back to standard arrangement).\n"
+                                     "Also known as concave hull mode.").c_str());
+
+    {
+        std::string multi_plate_key = "allow_multi_plate";
+        if (!settings_out.use_concave_hulls) imgui->disabled_begin(true);
+
+        if (imgui->bbl_checkbox(_L("Fill multiple plates"), settings.allow_multi_plate)) {
+            settings_out.allow_multi_plate = settings.allow_multi_plate;
+            appcfg->set("arrange", multi_plate_key.c_str(), settings_out.allow_multi_plate ? "1" : "0");
+            settings_changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", _u8L("When enabled, parts that don't fit on the current plate\n"
+                                         "overflow onto additional plates automatically.").c_str());
+
+        std::string consolidate_key = "consolidate_plates";
+        if (imgui->bbl_checkbox(_L("Consolidate plates"), settings.consolidate_plates)) {
+            settings_out.consolidate_plates = settings.consolidate_plates;
+            appcfg->set("arrange", consolidate_key.c_str(), settings_out.consolidate_plates ? "1" : "0");
+            settings_changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", _u8L("Re-pack all objects from all plates into the fewest plates possible.\n"
+                                         "Useful after removing objects or changing spacing.").c_str());
+
+        if (!settings_out.use_concave_hulls) imgui->disabled_end();
+    }
+
+    ImGui::Separator();
+
+    std::string purge_pad_key = "avoid_purge_pad";
+    if (imgui->bbl_checkbox(_L("Reserve purge zone"), settings.avoid_purge_pad)) {
+        settings_out.avoid_purge_pad = settings.avoid_purge_pad;
+        appcfg->set("arrange", purge_pad_key.c_str(), settings_out.avoid_purge_pad ? "1" : "0");
+        settings_changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", _u8L("Reserve a strip along one edge of the bed for the purge/prime line.\n"
+                                     "Parts will not be placed in this zone.").c_str());
+
+    {
+        if (!settings_out.avoid_purge_pad) imgui->disabled_begin(true);
+
+        // Edge selector
+        const char* edge_labels[] = { "Front", "Back", "Left", "Right" };
+        ImGui::AlignTextToFramePadding();
+        imgui->text(_L("Purge edge"));
+        ImGui::SameLine(1.2 * cursor_slider_left);
+        ImGui::PushItemWidth(window_width);
+        if (ImGui::Combo("##purge_edge", &settings.purge_pad_edge, edge_labels, 4)) {
+            settings_out.purge_pad_edge = settings.purge_pad_edge;
+            appcfg->set("arrange", "purge_pad_edge", std::to_string(settings_out.purge_pad_edge));
+            settings_changed = true;
+        }
+        ImGui::PopItemWidth();
+
+        // Pad size slider
+        ImGui::AlignTextToFramePadding();
+        imgui->text(_L("Pad size"));
+        ImGui::SameLine(1.2 * cursor_slider_left);
+        ImGui::PushItemWidth(window_width - slider_icon_width);
+        bool pad_changed = imgui->bbl_slider_float_style("##purge_pad_mm", &settings.purge_pad_mm, 0.f, 20.0f, "%3.1f");
+        ImGui::SameLine(window_width - slider_icon_width + 1.3 * cursor_slider_left);
+        ImGui::PushItemWidth(1.5 * slider_icon_width);
+        bool pad_input = ImGui::BBLDragFloat("##purge_pad_input", &settings.purge_pad_mm, 0.1f, 0.0f, 20.0f, "%.1f");
+        if (pad_changed || pad_input) {
+            settings.purge_pad_mm = std::clamp(settings.purge_pad_mm, 0.f, 20.f);
+            settings_out.purge_pad_mm = settings.purge_pad_mm;
+            appcfg->set("arrange", "purge_pad_mm", float_to_string_decimal_point(settings_out.purge_pad_mm));
+            settings_changed = true;
+        }
+
+        if (!settings_out.avoid_purge_pad) imgui->disabled_end();
+    }
+
+    {
+        if (!settings_out.use_concave_hulls) imgui->disabled_begin(true);
+
+        ImGui::AlignTextToFramePadding();
+        imgui->text(_L("Resolution"));
+        ImGui::SameLine(1.2 * cursor_slider_left);
+        ImGui::PushItemWidth(window_width - slider_icon_width);
+        bool res_changed = imgui->bbl_slider_float_style("##bitmap_res", &settings.bitmap_resolution_mm, 0.1f, 2.0f, "%4.2f");
+        ImGui::SameLine(window_width - slider_icon_width + 1.3 * cursor_slider_left);
+        ImGui::PushItemWidth(1.5 * slider_icon_width);
+        bool res_input = ImGui::BBLDragFloat("##bitmap_res_input", &settings.bitmap_resolution_mm, 0.05f, 0.1f, 2.0f, "%.2f");
+        if (res_changed || res_input) {
+            settings.bitmap_resolution_mm = std::clamp(settings.bitmap_resolution_mm, 0.1f, 2.0f);
+            settings_out.bitmap_resolution_mm = settings.bitmap_resolution_mm;
+            appcfg->set("arrange", "bitmap_resolution_mm", float_to_string_decimal_point(settings_out.bitmap_resolution_mm));
+            settings_changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", _u8L("Bitmap resolution in mm/pixel. Lower = more precise but slower.\n"
+                                         "0.5 is recommended. 0.1 for fine detail, 2.0 for speed.").c_str());
+
+        if (!settings_out.use_concave_hulls) imgui->disabled_end();
+    }
+
+    ImGui::Separator();
     if (imgui->bbl_checkbox(_L("Auto rotate for arrangement"), settings.enable_rotation)) {
         settings_out.enable_rotation = settings.enable_rotation;
         appcfg->set("arrange", rot_key.c_str(), settings_out.enable_rotation);
         settings_changed = true;
+    }
+
+    {
+        std::string rot_step_key = "rotation_step_deg_fff";
+        if (!settings_out.enable_rotation) imgui->disabled_begin(true);
+
+        const char* rot_step_labels[] = { "90\xC2\xB0 (4 orientations)", "45\xC2\xB0 (8 orientations)", "15\xC2\xB0 (24 orientations)" };
+        const int rot_step_values[] = { 90, 45, 15 };
+        int rot_step_idx = 1;
+        for (int i = 0; i < 3; i++)
+            if (rot_step_values[i] == settings.rotation_step_deg) rot_step_idx = i;
+
+        ImGui::AlignTextToFramePadding();
+        imgui->text(_L("Rotation step"));
+        ImGui::SameLine(1.2 * cursor_slider_left);
+        ImGui::PushItemWidth(window_width);
+        if (ImGui::Combo("##rotation_step", &rot_step_idx, rot_step_labels, 3)) {
+            settings.rotation_step_deg = rot_step_values[rot_step_idx];
+            settings_out.rotation_step_deg = settings.rotation_step_deg;
+            appcfg->set("arrange", rot_step_key.c_str(), std::to_string(settings_out.rotation_step_deg));
+            settings_changed = true;
+        }
+        ImGui::PopItemWidth();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", _u8L("Finer steps find better interlocking arrangements for concave parts,\n"
+                                         "but increase arrange time. 90\xC2\xB0 is fastest; 15\xC2\xB0 gives the best packing.").c_str());
+
+        if (!settings_out.enable_rotation) imgui->disabled_end();
     }
 
     if (imgui->bbl_checkbox(_L("Allow multiple materials on same plate"), settings.allow_multi_materials_on_same_plate)) {
@@ -5873,6 +6049,14 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         appcfg->set("arrange", dist_key, float_to_string_decimal_point(settings_out.distance));
         appcfg->set("arrange", rot_key, settings_out.enable_rotation ? "1" : "0");
         appcfg->set("arrange", align_to_y_axis_key, settings_out.align_to_y_axis ? "1" : "0");
+        appcfg->set("arrange", "use_concave_hulls", settings_out.use_concave_hulls ? "1" : "0");
+        appcfg->set("arrange", "allow_multi_plate", settings_out.allow_multi_plate ? "1" : "0");
+        appcfg->set("arrange", "consolidate_plates", settings_out.consolidate_plates ? "1" : "0");
+        appcfg->set("arrange", "rotation_step_deg_fff", std::to_string(settings_out.rotation_step_deg));
+        appcfg->set("arrange", "avoid_purge_pad", settings_out.avoid_purge_pad ? "1" : "0");
+        appcfg->set("arrange", "purge_pad_edge", std::to_string(settings_out.purge_pad_edge));
+        appcfg->set("arrange", "purge_pad_mm", float_to_string_decimal_point(settings_out.purge_pad_mm));
+        appcfg->set("arrange", "bitmap_resolution_mm", float_to_string_decimal_point(settings_out.bitmap_resolution_mm));
         settings_changed = true;
     }
     ImGui::PopStyleVar(1);

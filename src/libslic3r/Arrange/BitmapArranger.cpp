@@ -1,0 +1,644 @@
+#include "BitmapArranger.hpp"
+#include "libslic3r/ClipperUtils.hpp"
+
+#include <boost/log/trivial.hpp>
+
+// Coordinate systems used in this module:
+//   Scaled coords (coord_t): Slic3r internal units. 1mm = scaled(1.0).
+//   Pixel coords (int): px = (scaled_coord - bed_origin) / resolution.
+//     Pixel (0,0) = effective bed min corner (after purge pad shrink).
+//   Placement: ArrangePolygon.translation = bed_min + (px * res) - item_bb_min
+//     Applied AFTER ArrangePolygon.rotation.
+
+// 64M words * 8 bytes = 512MB max bitmap allocation per plate
+constexpr size_t MAX_BITMAP_WORDS = 64'000'000u;
+
+#ifdef _MSC_VER
+#include <intrin.h>
+// Count trailing zeros. Precondition: x != 0 (callers must guard).
+static inline int ctz64(uint64_t x) {
+    unsigned long idx;
+    if (!_BitScanForward64(&idx, x)) return 0;
+    return (int)idx;
+}
+#else
+// Count trailing zeros. Precondition: x != 0 (callers must guard).
+static inline int ctz64(uint64_t x) { return x ? __builtin_ctzll(x) : 0; }
+#endif
+
+namespace Slic3r { namespace arrangement {
+
+BitmapArranger::BitmapItem BitmapArranger::rasterize(
+    const ExPolygon &poly, coord_t inflation, coord_t res)
+{
+    BitmapItem item;
+
+    // Inflate the polygon for spacing
+    ExPolygons inflated;
+    if (inflation > 0)
+        inflated = offset_ex(poly, inflation);
+    else
+        inflated = {poly};
+
+    if (inflated.empty())
+        return item;
+
+    const ExPolygon &ep = inflated.front();
+    BoundingBox bb = get_extents(ep);
+
+    item.offset_x = bb.min.x();
+    item.offset_y = bb.min.y();
+    // +1 prevents the rightmost/topmost edge of the polygon from being clipped
+    item.width_px  = (int)std::ceil((double)(bb.max.x() - bb.min.x()) / res) + 1;
+    item.height_px = (int)std::ceil((double)(bb.max.y() - bb.min.y()) / res) + 1;
+
+    // Degenerate polygon after inflation can produce negative dimensions
+    if (item.width_px <= 0 || item.height_px <= 0) {
+        item.width_px = item.height_px = item.width_words = 0;
+        return item;
+    }
+
+    item.width_words = (item.width_px + 63) / 64;
+
+    item.bits.assign(item.width_words * item.height_px, 0);
+
+    // Scanline rasterization
+    std::vector<coord_t> x_intersections;
+    for (int py = 0; py < item.height_px; py++) {
+        coord_t y = bb.min.y() + (coord_t)(py * res + res / 2);
+
+        // Collect x-intersections with all edges (contour + holes)
+        x_intersections.clear();
+
+        auto scan_ring = [&](const Polygon &ring) {
+            size_t n = ring.points.size();
+            for (size_t i = 0; i < n; i++) {
+                const Point &p0 = ring.points[i];
+                const Point &p1 = ring.points[(i + 1) % n];
+                if ((p0.y() <= y && p1.y() > y) || (p1.y() <= y && p0.y() > y)) {
+                    double t = (double)(y - p0.y()) / (double)(p1.y() - p0.y());
+                    coord_t x = p0.x() + (coord_t)(t * (p1.x() - p0.x()));
+                    x_intersections.push_back(x);
+                }
+            }
+        };
+
+        scan_ring(ep.contour);
+        for (const Polygon &hole : ep.holes)
+            scan_ring(hole);
+
+        std::sort(x_intersections.begin(), x_intersections.end());
+
+        // Fill between pairs of intersections (even-odd rule)
+        for (size_t i = 0; i + 1 < x_intersections.size(); i += 2) {
+            int px_start = std::max(0, (int)((x_intersections[i] - bb.min.x()) / res));
+            int px_end   = std::min(item.width_px - 1,
+                                    (int)((x_intersections[i + 1] - bb.min.x()) / res));
+            int sw = px_start / 64, ew = px_end / 64;
+            int sb = px_start % 64, eb = px_end % 64;
+            if (sw == ew) {
+                uint64_t mask = ((uint64_t(2) << eb) - 1) & ~((uint64_t(1) << sb) - 1);
+                item.bits[py * item.width_words + sw] |= mask;
+            } else {
+                item.bits[py * item.width_words + sw] |= ~((uint64_t(1) << sb) - 1);
+                for (int w = sw + 1; w < ew; w++)
+                    item.bits[py * item.width_words + w] = ~uint64_t(0);
+                item.bits[py * item.width_words + ew] |= (uint64_t(2) << eb) - 1;
+            }
+        }
+    }
+
+    return item;
+}
+
+BitmapArranger::BitmapItem BitmapArranger::rasterize_triangles(
+    const Points &tri_verts, coord_t inflation, coord_t res)
+{
+    BitmapItem item;
+    if (tri_verts.size() < 3) return item;
+
+    // Bounding box of all triangle vertices, expanded by inflation
+    BoundingBox bb(tri_verts);
+    bb.min -= Vec2crd(inflation, inflation);
+    bb.max += Vec2crd(inflation, inflation);
+
+    item.offset_x = bb.min.x();
+    item.offset_y = bb.min.y();
+    item.width_px  = (int)std::ceil((double)(bb.max.x() - bb.min.x()) / res) + 1;
+    item.height_px = (int)std::ceil((double)(bb.max.y() - bb.min.y()) / res) + 1;
+
+    if (item.width_px <= 0 || item.height_px <= 0) {
+        item.width_px = item.height_px = item.width_words = 0;
+        return item;
+    }
+
+    item.width_words = (item.width_px + 63) / 64;
+    item.bits.assign(item.width_words * item.height_px, 0);
+
+    auto set_pixel = [&](int px, int py) {
+        if (px < 0 || px >= item.width_px || py < 0 || py >= item.height_px) return;
+        item.bits[(size_t)py * item.width_words + px / 64] |= (uint64_t(1) << (px % 64));
+    };
+
+    double inv_res = 1.0 / res;
+
+    // Scanline-fill each triangle directly into the bitmap.
+    // Same algorithm GPUs use — for each scanline row that intersects the triangle,
+    // find the left and right edges and fill between them.
+    for (size_t ti = 0; ti + 2 < tri_verts.size(); ti += 3) {
+        // Convert triangle vertices to pixel coordinates
+        double x0 = (tri_verts[ti].x()     - bb.min.x()) * inv_res;
+        double y0 = (tri_verts[ti].y()     - bb.min.y()) * inv_res;
+        double x1 = (tri_verts[ti + 1].x() - bb.min.x()) * inv_res;
+        double y1 = (tri_verts[ti + 1].y() - bb.min.y()) * inv_res;
+        double x2 = (tri_verts[ti + 2].x() - bb.min.x()) * inv_res;
+        double y2 = (tri_verts[ti + 2].y() - bb.min.y()) * inv_res;
+
+        // Sort vertices by Y
+        if (y0 > y1) { std::swap(x0, x1); std::swap(y0, y1); }
+        if (y0 > y2) { std::swap(x0, x2); std::swap(y0, y2); }
+        if (y1 > y2) { std::swap(x1, x2); std::swap(y1, y2); }
+
+        int py_min = std::max(0, (int)y0);
+        int py_max = std::min(item.height_px - 1, (int)y2);
+
+        for (int py = py_min; py <= py_max; py++) {
+            double row = py + 0.5;
+            double left = 1e18, right = -1e18;
+
+            // Intersect scanline with each of the 3 edges
+            auto edge_intersect = [&](double ax, double ay, double bx, double by) {
+                if ((ay <= row && by > row) || (by <= row && ay > row)) {
+                    double t = (row - ay) / (by - ay);
+                    double ix = ax + t * (bx - ax);
+                    left = std::min(left, ix);
+                    right = std::max(right, ix);
+                }
+            };
+
+            edge_intersect(x0, y0, x1, y1);
+            edge_intersect(x1, y1, x2, y2);
+            edge_intersect(x0, y0, x2, y2);
+
+            if (left > right) continue;
+
+            int px_left  = std::max(0, (int)left);
+            int px_right = std::min(item.width_px - 1, (int)right);
+
+            // Fill the span using word-level operations for speed
+            if (px_left <= px_right) {
+                int sw = px_left / 64, ew = px_right / 64;
+                int sb = px_left % 64, eb = px_right % 64;
+                if (sw == ew) {
+                    uint64_t mask = ((uint64_t(2) << eb) - 1) & ~((uint64_t(1) << sb) - 1);
+                    item.bits[(size_t)py * item.width_words + sw] |= mask;
+                } else {
+                    item.bits[(size_t)py * item.width_words + sw] |= ~((uint64_t(1) << sb) - 1);
+                    for (int w = sw + 1; w < ew; w++)
+                        item.bits[(size_t)py * item.width_words + w] = ~uint64_t(0);
+                    item.bits[(size_t)py * item.width_words + ew] |= (uint64_t(2) << eb) - 1;
+                }
+            }
+        }
+    }
+
+    // If inflation > 0, dilate the bitmap by inflate_px pixels.
+    // Simple dilation: for each set bit, set its neighbors.
+    if (inflation > 0) {
+        int inflate_px = std::max(1, (int)(inflation * inv_res));
+        std::vector<uint64_t> dilated = item.bits; // copy
+        for (int py = 0; py < item.height_px; py++) {
+            for (int wx = 0; wx < item.width_words; wx++) {
+                uint64_t word = item.bits[(size_t)py * item.width_words + wx];
+                if (word == 0) continue;
+                // Expand each set bit in all directions
+                while (word) {
+                    int bit = ctz64(word);
+                    int px = wx * 64 + bit;
+                    for (int dy = -inflate_px; dy <= inflate_px; dy++) {
+                        int ny = py + dy;
+                        if (ny < 0 || ny >= item.height_px) continue;
+                        for (int dx = -inflate_px; dx <= inflate_px; dx++) {
+                            int nx = px + dx;
+                            if (nx < 0 || nx >= item.width_px) continue;
+                            dilated[(size_t)ny * item.width_words + nx / 64] |= (uint64_t(1) << (nx % 64));
+                        }
+                    }
+                    word &= word - 1;
+                }
+            }
+        }
+        item.bits = std::move(dilated);
+    }
+
+    return item;
+}
+
+void BitmapArranger::stamp(
+    std::vector<uint64_t> &bed_bits, int bed_w, int bed_w_px, int bed_h,
+    const BitmapItem &item, int ox, int oy)
+{
+    for (int py = 0; py < item.height_px; py++) {
+        int by = oy + py;
+        if (by < 0 || by >= bed_h) continue;
+        for (int wx = 0; wx < item.width_words; wx++) {
+            uint64_t iword = item.bits[py * item.width_words + wx];
+            if (iword == 0) continue;
+            int base_px = ox + wx * 64;
+            if (base_px + 63 < 0) continue;
+            if (base_px >= bed_w_px) break;
+
+            if (base_px < 0) {
+                // Bit-by-bit for left-edge partial overlap
+                while (iword) {
+                    int bit = ctz64(iword);
+                    int bx = base_px + bit;
+                    if (bx >= 0 && bx < bed_w_px) {
+                        bed_bits[(size_t)by * bed_w + bx / 64] |= (uint64_t(1) << (bx % 64));
+                    }
+                    iword &= iword - 1;
+                }
+                continue;
+            }
+
+            int bed_word_idx = base_px / 64;
+            int shift = base_px % 64;
+            if (shift == 0) {
+                if (bed_word_idx < bed_w)
+                    bed_bits[(size_t)by * bed_w + bed_word_idx] |= iword;
+            } else {
+                // Item pixels span two bed words when not 64-bit aligned.
+                // lo = bits landing in bed_word[idx], hi = overflow into bed_word[idx+1].
+                uint64_t lo = iword << shift;
+                uint64_t hi = (shift < 64) ? (iword >> (64 - shift)) : 0;
+                if (bed_word_idx < bed_w)
+                    bed_bits[(size_t)by * bed_w + bed_word_idx] |= lo;
+                if (bed_word_idx + 1 < bed_w)
+                    bed_bits[(size_t)by * bed_w + bed_word_idx + 1] |= hi;
+            }
+        }
+    }
+}
+
+bool BitmapArranger::collides(
+    const std::vector<uint64_t> &bed_bits, int bed_w, int bed_w_px, int bed_h,
+    const BitmapItem &item, int ox, int oy)
+{
+    for (int py = 0; py < item.height_px; py++) {
+        int by = oy + py;
+        if (by < 0 || by >= bed_h) return true;
+
+        for (int wx = 0; wx < item.width_words; wx++) {
+            uint64_t iword = item.bits[py * item.width_words + wx];
+            if (iword == 0) continue;
+
+            int base_px = ox + wx * 64;
+
+            if (base_px + 63 < 0) continue;
+            if (base_px >= bed_w_px) return true;
+
+            // Negative base_px: bit-by-bit fallback (shift by negative is UB)
+            if (base_px < 0) {
+                for (int b = 0; b < 64; b++) {
+                    if (!(iword & (uint64_t(1) << b))) continue;
+                    int bx = base_px + b;
+                    if (bx < 0) continue;
+                    if (bx >= bed_w_px) return true;
+                    int bword = bx / 64;
+                    int bbit  = bx % 64;
+                    if (bed_bits[(size_t)by * bed_w + bword] & (uint64_t(1) << bbit))
+                        return true;
+                }
+                continue;
+            }
+
+            int bed_word_idx = base_px / 64;
+            int shift = base_px % 64;
+
+            if (shift == 0) {
+                if (bed_word_idx < bed_w) {
+                    if (bed_bits[(size_t)by * bed_w + bed_word_idx] & iword)
+                        return true;
+                }
+            } else {
+                // Item pixels span two bed words when not 64-bit aligned.
+                // lo = bits landing in bed_word[idx], hi = overflow into bed_word[idx+1].
+                uint64_t lo = iword << shift;
+                uint64_t hi = (shift < 64) ? (iword >> (64 - shift)) : 0;
+
+                if (bed_word_idx < bed_w) {
+                    if (bed_bits[(size_t)by * bed_w + bed_word_idx] & lo)
+                        return true;
+                }
+                if (bed_word_idx + 1 < bed_w) {
+                    if (hi && (bed_bits[(size_t)by * bed_w + bed_word_idx + 1] & hi))
+                        return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+std::optional<std::pair<int,int>> BitmapArranger::find_placement(
+    const std::vector<uint64_t> &bed_bits, int bed_w, int bed_w_px, int bed_h,
+    const BitmapItem &item, int step)
+{
+    // Coarse scan with refinement
+    for (int y = 0; y <= bed_h - item.height_px; y += step) {
+        for (int x = 0; x <= bed_w_px - item.width_px; x += step) {
+            if (!collides(bed_bits, bed_w, bed_w_px, bed_h, item, x, y)) {
+                // Refine: find tightest bottom-left placement within one step
+                int best_x = x, best_y = y;
+                for (int ry = std::max(0, y - step + 1); ry <= y; ry++) {
+                    for (int rx = std::max(0, x - step + 1); rx <= x; rx++) {
+                        if (!collides(bed_bits, bed_w, bed_w_px, bed_h, item, rx, ry)) {
+                            best_x = rx;
+                            best_y = ry;
+                            goto found;
+                        }
+                    }
+                }
+                found:
+                return std::make_pair(best_x, best_y);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+void BitmapArranger::arrange(
+    ArrangePolygons &arrangables,
+    const ArrangePolygons &excludes,
+    const BoundingBox &bed,
+    const ArrangeParams &params)
+{
+    coord_t res = scaled<coord_t>(std::clamp(params.bitmap_resolution_mm, 0.1f, 2.0f));
+    coord_t inflation = params.min_obj_distance / 2;
+
+    // Apply purge pad: shrink the effective bed along one edge
+    BoundingBox effective_bed = bed;
+    if (params.avoid_purge_pad && params.purge_pad_mm > 0.f) {
+        coord_t pad = scaled(params.purge_pad_mm);
+        switch (params.purge_pad_edge) {
+        case 0: effective_bed.min.y() += pad; break;  // front (Y min)
+        case 1: effective_bed.max.y() -= pad; break;  // back (Y max)
+        case 2: effective_bed.min.x() += pad; break;  // left (X min)
+        case 3: effective_bed.max.x() -= pad; break;  // right (X max)
+        default: break;
+        }
+    }
+
+    // Bed dimensions in pixels. +1 prevents edge pixels from clipping:
+    // a polygon whose extent equals the bed size must still fit entirely.
+    int bed_w_px = (int)std::ceil((double)(effective_bed.max.x() - effective_bed.min.x()) / res) + 1;
+    int bed_h_px = (int)std::ceil((double)(effective_bed.max.y() - effective_bed.min.y()) / res) + 1;
+    int bed_w_words = (bed_w_px + 63) / 64;
+
+    // Cap bitmap size to prevent unbounded allocation from pathological beds
+    if ((size_t)bed_w_words * bed_h_px > MAX_BITMAP_WORDS) {
+        BOOST_LOG_TRIVIAL(error) << "BitmapArranger: bed too large for bitmap arrangement. Use convex hull mode.";
+        for (auto &ap : arrangables)
+            ap.bed_idx = UNARRANGED;
+        return;
+    }
+
+    BOOST_LOG_TRIVIAL(info) << "BitmapArranger: bed " << bed_w_px << "x" << bed_h_px
+                            << " px, resolution " << params.bitmap_resolution_mm << " mm/px"
+                            << ", " << arrangables.size() << " items"
+                            << (params.consolidate_plates ? " (consolidate)" : "");
+
+    // Consolidate plates: forget existing plate assignments so every item
+    // gets re-packed from scratch into the minimum number of plates.
+    if (params.consolidate_plates) {
+        for (auto &ap : arrangables)
+            ap.bed_idx = UNARRANGED;
+    }
+
+    struct ItemEntry {
+        size_t orig_idx;
+        ExPolygon poly;            // convex hull (for fallback / display)
+        Points concave_triangles;     // raw projected points (for bitmap rasterization)
+        double rotation;
+        coord_t inflation;
+        int filament_temp_type = -1;
+    };
+
+    std::vector<ItemEntry> entries;
+    entries.reserve(arrangables.size());
+    for (size_t i = 0; i < arrangables.size(); i++) {
+        ItemEntry e;
+        e.orig_idx = i;
+        e.poly = arrangables[i].poly;
+        e.concave_triangles = std::move(arrangables[i].concave_triangles);
+        e.rotation = arrangables[i].rotation;
+        e.inflation = std::max(inflation, arrangables[i].inflation);
+        e.filament_temp_type = arrangables[i].filament_temp_type;
+        entries.push_back(std::move(e));
+    }
+
+    // Sort largest-first by area: standard BLF companion heuristic.
+    // Large items are hardest to place, so they go first while the bed is empty.
+    std::sort(entries.begin(), entries.end(), [](const ItemEntry &a, const ItemEntry &b) {
+        return std::abs(a.poly.area()) > std::abs(b.poly.area());
+    });
+
+    // Build rotation candidates
+    std::vector<double> rotations = {0.};
+    if (params.allow_rotations) {
+        double rot_step = std::max(params.rotation_step_rad, PI / 36.); // min 5 degrees
+        rotations.clear();
+        int n_rot = std::max(1, (int)std::round(2.0 * PI / rot_step));
+        for (int i = 0; i < n_rot; i++)
+            rotations.push_back(i * rot_step);
+    }
+
+    // Stamp fixed items and excluded regions (purge line, calibration area) onto bed
+    auto stamp_excludes = [&](std::vector<uint64_t> &bits) {
+        auto stamp_polys = [&](const ArrangePolygons &polys) {
+            for (const auto &excl : polys) {
+                ExPolygon ep = excl.poly;
+                ep.rotate(excl.rotation);
+                ep.translate(excl.translation.x() - effective_bed.min.x(),
+                             excl.translation.y() - effective_bed.min.y());
+                auto bmp = rasterize(ep, 0, res);
+                int ox = (int)std::floor((double)bmp.offset_x / res);
+                int oy = (int)std::floor((double)bmp.offset_y / res);
+                stamp(bits, bed_w_words, bed_w_px, bed_h_px, bmp, ox, oy);
+            }
+        };
+        stamp_polys(excludes);
+        stamp_polys(params.excluded_regions);
+    };
+
+    // Plate bitmap vector — one entry per plate, enabling first-fit across
+    // all plates instead of forward-only assignment.
+    struct PlateState {
+        std::vector<uint64_t> bits;
+        int material_group = -1; // filament_temp_type of first item placed; -1 = unassigned
+        int free_px = 0;         // approximate free pixel count for quick skip
+    };
+    int total_bed_px = bed_w_px * bed_h_px;
+
+    auto count_free_px = [&](const std::vector<uint64_t> &bits) -> int {
+        int used = 0;
+        for (auto w : bits) {
+            // popcount: count set bits
+            #ifdef _MSC_VER
+            used += (int)__popcnt64(w);
+            #else
+            used += __builtin_popcountll(w);
+            #endif
+        }
+        return total_bed_px - used;
+    };
+
+    std::vector<PlateState> plates;
+    plates.push_back({std::vector<uint64_t>(bed_w_words * bed_h_px, 0), -1, 0});
+    stamp_excludes(plates[0].bits);
+    plates[0].free_px = count_free_px(plates[0].bits);
+
+    // Coarse step (~1mm): scan the bed in large strides, then refine within
+    // one step of the first collision-free spot. Balances speed vs. packing quality.
+    int scan_step = std::max(1, (int)(scaled<coord_t>(1.0) / res));
+
+    // Check whether an item's filament_temp_type is compatible with a plate's
+    // assigned material_group. HighTemp (0) and LowTemp (1) cannot coexist.
+    // HighLowCompatible (2) and unassigned (-1) are compatible with anything.
+    auto is_material_compatible = [&](int plate_group, int item_type) -> bool {
+        if (params.allow_multi_materials_on_same_plate)
+            return true;
+        if (plate_group < 0 || item_type < 0)
+            return true; // unassigned is compatible with everything
+        // HighLowCompatible (2) and Undefine (3) are compatible with any group
+        if (plate_group >= 2 || item_type >= 2)
+            return true;
+        // Both HighTemp (0) or both LowTemp (1): compatible
+        // One HighTemp and one LowTemp: incompatible
+        return plate_group == item_type;
+    };
+
+    // Try placing an item on a single plate.
+    // Uses direct point rasterization for concave mode (no Clipper),
+    // or ExPolygon rasterization for convex mode.
+    auto try_place_on_plate = [&](const ItemEntry &entry, int plate_idx) -> bool {
+        auto &bits = plates[plate_idx].bits;
+        for (double rot : rotations) {
+            BitmapItem bmp;
+            if (!entry.concave_triangles.empty()) {
+                // Concave mode: rotate the raw points, rasterize directly into bitmap.
+                Points rotated_pts = entry.concave_triangles;
+                BOOST_LOG_TRIVIAL(warning) << "BitmapArranger: item " << entry.orig_idx
+                    << " concave_triangles=" << rotated_pts.size()
+                    << " rot=" << rot << " inflation=" << entry.inflation;
+                if (std::abs(rot) > 1e-6) {
+                    double cos_r = std::cos(rot), sin_r = std::sin(rot);
+                    for (Point &p : rotated_pts) {
+                        coord_t x = (coord_t)(p.x() * cos_r - p.y() * sin_r);
+                        coord_t y = (coord_t)(p.x() * sin_r + p.y() * cos_r);
+                        p = {x, y};
+                    }
+                }
+                bmp = rasterize_triangles(rotated_pts, entry.inflation, res);
+            } else {
+                // Convex mode: rotate the ExPolygon, rasterize via scanline.
+                ExPolygon rotated = entry.poly;
+                rotated.rotate(rot);
+                bmp = rasterize(rotated, entry.inflation, res);
+            }
+            if (bmp.width_px <= 0 || bmp.height_px <= 0) continue;
+
+            // Count set bits to verify bitmap is populated
+            int set_bits = 0;
+            for (auto w : bmp.bits) {
+                #ifdef _MSC_VER
+                set_bits += (int)__popcnt64(w);
+                #else
+                set_bits += __builtin_popcountll(w);
+                #endif
+            }
+            BOOST_LOG_TRIVIAL(warning) << "BitmapArranger: bmp " << bmp.width_px << "x" << bmp.height_px
+                << " set_bits=" << set_bits << "/" << (bmp.width_px * bmp.height_px)
+                << " offset=(" << unscaled(bmp.offset_x) << "," << unscaled(bmp.offset_y) << ")mm";
+
+            auto result = find_placement(bits, bed_w_words, bed_w_px, bed_h_px, bmp, scan_step);
+            if (result) {
+                auto [px, py] = *result;
+                arrangables[entry.orig_idx].translation = {
+                    effective_bed.min.x() + (coord_t)(px * res) - bmp.offset_x,
+                    effective_bed.min.y() + (coord_t)(py * res) - bmp.offset_y
+                };
+                arrangables[entry.orig_idx].rotation = rot;
+                arrangables[entry.orig_idx].bed_idx = plate_idx;
+                stamp(bits, bed_w_words, bed_w_px, bed_h_px, bmp, px, py);
+
+                // Update free pixel estimate
+                int item_px = 0;
+                for (auto w : bmp.bits) {
+                    #ifdef _MSC_VER
+                    item_px += (int)__popcnt64(w);
+                    #else
+                    item_px += __builtin_popcountll(w);
+                    #endif
+                }
+                plates[plate_idx].free_px -= item_px;
+
+                if (plates[plate_idx].material_group < 0)
+                    plates[plate_idx].material_group = entry.filament_temp_type;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    constexpr int MAX_PLATES = 100;
+
+    int placed_count = 0;
+    int failed_count = 0;
+    for (auto &entry : entries) {
+        bool placed = false;
+
+        // Estimate item pixel count from bounding box for quick plate skip
+        BoundingBox item_bb = get_extents(entry.poly);
+        int item_est_px = (int)((double)(item_bb.max.x() - item_bb.min.x()) / res + 1) *
+                          (int)((double)(item_bb.max.y() - item_bb.min.y()) / res + 1);
+
+        for (int pi = 0; pi < (int)plates.size(); pi++) {
+            if (!is_material_compatible(plates[pi].material_group, entry.filament_temp_type))
+                continue;
+            // Skip plates that clearly don't have enough free space
+            if (plates[pi].free_px < item_est_px)
+                continue;
+            if (try_place_on_plate(entry, pi)) { placed = true; break; }
+        }
+
+        if (!placed && params.allow_multi_plate && (int)plates.size() < MAX_PLATES) {
+            int new_idx = (int)plates.size();
+            plates.push_back({std::vector<uint64_t>(bed_w_words * bed_h_px, 0), -1, 0});
+            stamp_excludes(plates[new_idx].bits);
+            plates[new_idx].free_px = count_free_px(plates[new_idx].bits);
+            placed = try_place_on_plate(entry, new_idx);
+            if (!placed) plates.pop_back();
+        }
+
+        if (!placed) {
+            arrangables[entry.orig_idx].bed_idx = -1;
+            failed_count++;
+        } else {
+            placed_count++;
+        }
+
+        if (params.progressind) {
+            // Arg is treated as progress numerator by ArrangeJob's callback
+            params.progressind(placed_count + failed_count, "");
+        }
+        if (params.stopcondition && params.stopcondition())
+            break;
+    }
+
+    BOOST_LOG_TRIVIAL(info) << "BitmapArranger: placed " << placed_count
+                            << "/" << arrangables.size() << " on "
+                            << plates.size() << " plate(s)";
+}
+
+}} // namespace Slic3r::arrangement

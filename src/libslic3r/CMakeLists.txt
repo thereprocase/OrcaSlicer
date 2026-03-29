@@ -73,6 +73,8 @@ set(lisbslic3r_sources
     ArcFitter.hpp
     Arrange.cpp
     Arrange.hpp
+    Arrange/BitmapArranger.cpp
+    Arrange/BitmapArranger.hpp
     BlacklistedLibraryCheck.cpp
     BlacklistedLibraryCheck.hpp
     BoundingBox.cpp

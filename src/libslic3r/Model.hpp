@@ -484,6 +484,7 @@ public:
     // This method is cheap in that it does not make any unnecessary copy of the volume meshes.
     // This method is used by the auto arrange function.
     Polygon       convex_hull_2d(const Transform3d &trafo_instance) const;
+    ExPolygons    concave_hull_2d(const Transform3d &trafo_instance) const;
 
     void center_around_origin(bool include_modifiers = true);
     void ensure_on_bed(bool allow_negative_z = false);
@@ -1344,7 +1345,7 @@ public:
 
     // Getting the input polygon for arrange
     // We use void* as input type to avoid including Arrange.hpp in Model.hpp.
-    void get_arrange_polygon(void *arrange_polygon, const Slic3r::DynamicPrintConfig &config = Slic3r::DynamicPrintConfig()) const;
+    void get_arrange_polygon(void *arrange_polygon, const Slic3r::DynamicPrintConfig &config = Slic3r::DynamicPrintConfig(), bool use_concave = false) const;
 
     // Apply the arrange result on the ModelInstance
     void apply_arrange_result(const Vec2d& offs, double rotation)
