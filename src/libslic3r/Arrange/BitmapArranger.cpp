@@ -1016,8 +1016,16 @@ void BitmapArranger::arrange(
     coord_t res = scaled<coord_t>(std::clamp(params.bitmap_resolution_mm, 0.1f, 2.0f));
     coord_t inflation = params.min_obj_distance / 2;
 
-    // Apply purge pad: shrink the effective bed along one edge
+    // Safety margin: shrink effective bed by 1 pixel on each side to prevent
+    // rounding errors from placing items at positions where the actual geometry
+    // extends past the bed boundary. OrcaSlicer checks boundaries in scaled
+    // coords, but we place in pixel coords — the 0.5-pixel rounding can push
+    // a part's edge past the bed by up to 0.5 * resolution.
     BoundingBox effective_bed = bed;
+    effective_bed.min += Vec2crd(res, res);
+    effective_bed.max -= Vec2crd(res, res);
+
+    // Apply purge pad: shrink the effective bed along one edge
     if (params.avoid_purge_pad && params.purge_pad_mm > 0.f) {
         coord_t pad = scaled(params.purge_pad_mm);
         switch (params.purge_pad_edge) {
@@ -1652,72 +1660,70 @@ void BitmapArranger::arrange(
     item_minmax.resize(n);
 
     for (int i = 0; i < n; i++) {
-        if (rot_bmps_all[i].size() < 2) continue; // no benefit with 0-1 rotations
+        if (rot_bmps_all[i].size() < 2) continue;
 
-        // All rotated bitmaps may have different sizes. Use the maximum dimensions
-        // and align all bitmaps to a common frame for word-level AND/OR.
-        // For simplicity: use the first bitmap's dimensions as reference.
-        // Rotated bitmaps may be larger, but the core (AND) will be smaller anyway.
-        // Use word-level ops on matching-size bitmaps only.
-        int ref_w = 0, ref_h = 0, ref_ww = 0;
+        // Find the envelope dimensions (max across all rotations)
+        int env_w = 0, env_h = 0;
         for (const auto &[bmp, rot] : rot_bmps_all[i]) {
-            ref_w = std::max(ref_w, bmp.width_px);
-            ref_h = std::max(ref_h, bmp.height_px);
+            env_w = std::max(env_w, bmp.width_px);
+            env_h = std::max(env_h, bmp.height_px);
         }
-        if (ref_w <= 0 || ref_h <= 0) continue;
-        ref_ww = (ref_w + 63) / 64;
+        if (env_w <= 0 || env_h <= 0) continue;
+        int env_ww = (env_w + 63) / 64;
 
-        // Build max (OR) and min (AND) across all rotations in the envelope frame
-        std::vector<uint64_t> max_bits(ref_ww * ref_h, 0);
-        std::vector<uint64_t> min_bits(ref_ww * ref_h, ~uint64_t(0));
+        std::vector<uint64_t> max_bits((size_t)env_ww * env_h, 0);
+        std::vector<uint64_t> min_bits((size_t)env_ww * env_h, ~uint64_t(0));
 
-        // Use the first rotation's offset as the reference origin
-        coord_t ref_ox = rot_bmps_all[i][0].first.offset_x;
-        coord_t ref_oy = rot_bmps_all[i][0].first.offset_y;
-
-        // For speed: only OR/AND bitmaps that share the reference dimensions.
-        // Rotated bitmaps change size, so we OR/AND at the pixel level using
-        // the largest frame. Bitmaps smaller than the frame contribute zeros
-        // to the OR (no effect) and ones to the AND (masked out).
-        bool size_mismatch = false;
+        // Center each rotation bitmap in the envelope frame, then OR/AND.
+        // Each bitmap is centered: offset = (env_w - bmp_w) / 2.
         for (const auto &[bmp, rot] : rot_bmps_all[i]) {
-            if (bmp.width_px != rot_bmps_all[i][0].first.width_px ||
-                bmp.height_px != rot_bmps_all[i][0].first.height_px) {
-                size_mismatch = true;
-                break;
-            }
-        }
+            int dx = (env_w - bmp.width_px) / 2;
+            int dy = (env_h - bmp.height_px) / 2;
 
-        if (!size_mismatch) {
-            // All rotations same size — fast word-level AND/OR
-            size_t total_words = (size_t)ref_ww * ref_h;
-            for (const auto &[bmp, rot] : rot_bmps_all[i]) {
-                for (size_t w = 0; w < total_words && w < bmp.bits.size(); w++) {
-                    max_bits[w] |= bmp.bits[w];
-                    min_bits[w] &= bmp.bits[w];
+            // Temporary: stamp this rotation into an envelope-sized bitmap
+            std::vector<uint64_t> centered((size_t)env_ww * env_h, 0);
+            for (int py = 0; py < bmp.height_px; py++) {
+                int ey = py + dy;
+                if (ey < 0 || ey >= env_h) continue;
+                for (int px = 0; px < bmp.width_px; px++) {
+                    int ex = px + dx;
+                    if (ex < 0 || ex >= env_w) continue;
+                    if (bmp.bits[(size_t)py * bmp.width_words + px / 64] & (uint64_t(1) << (px % 64))) {
+                        centered[(size_t)ey * env_ww + ex / 64] |= (uint64_t(1) << (ex % 64));
+                    }
                 }
             }
-        } else {
-            // Different sizes — skip min (too complex to align), just build max
-            // by ORing each bitmap at its center offset. Min stays all-ones (unused).
-            // For the envelope (max), just use the largest rotation bitmap directly.
-            int biggest_idx = 0;
-            size_t biggest_px = 0;
-            for (size_t ri = 0; ri < rot_bmps_all[i].size(); ri++) {
-                size_t px = rot_bmps_all[i][ri].first.bits.size();
-                if (px > biggest_px) { biggest_px = px; biggest_idx = (int)ri; }
+
+            for (size_t w = 0; w < centered.size(); w++) {
+                max_bits[w] |= centered[w];
+                min_bits[w] &= centered[w];
             }
-            item_minmax[i].max_bmp = rot_bmps_all[i][biggest_idx].first;
-            item_minmax[i].max_profile = compute_profile(item_minmax[i].max_bmp, bed_h_px);
-            // No valid min — disable min pre-filter for this item
-            item_minmax[i].valid = true;
-            continue;
         }
 
-        item_minmax[i].max_bmp = rot_bmps_all[i][0].first; // copy structure
-        item_minmax[i].max_bmp.bits = std::move(max_bits);
-        item_minmax[i].min_bmp = rot_bmps_all[i][0].first;
-        item_minmax[i].min_bmp.bits = std::move(min_bits);
+        // Build the BitmapItems. Use the first rotation's center as the offset reference,
+        // adjusted for the envelope expansion.
+        auto &ref_bmp = rot_bmps_all[i][0].first;
+        coord_t center_x = ref_bmp.offset_x + (coord_t)(ref_bmp.width_px * res / 2);
+        coord_t center_y = ref_bmp.offset_y + (coord_t)(ref_bmp.height_px * res / 2);
+
+        BitmapItem max_bmp;
+        max_bmp.width_px = env_w;
+        max_bmp.height_px = env_h;
+        max_bmp.width_words = env_ww;
+        max_bmp.bits = std::move(max_bits);
+        max_bmp.offset_x = center_x - (coord_t)(env_w * res / 2);
+        max_bmp.offset_y = center_y - (coord_t)(env_h * res / 2);
+
+        BitmapItem min_bmp;
+        min_bmp.width_px = env_w;
+        min_bmp.height_px = env_h;
+        min_bmp.width_words = env_ww;
+        min_bmp.bits = std::move(min_bits);
+        min_bmp.offset_x = max_bmp.offset_x;
+        min_bmp.offset_y = max_bmp.offset_y;
+
+        item_minmax[i].max_bmp = std::move(max_bmp);
+        item_minmax[i].min_bmp = std::move(min_bmp);
         item_minmax[i].max_profile = compute_profile(item_minmax[i].max_bmp, bed_h_px);
         item_minmax[i].min_profile = compute_profile(item_minmax[i].min_bmp, bed_h_px);
         item_minmax[i].valid = true;
