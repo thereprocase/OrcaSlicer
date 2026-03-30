@@ -1199,6 +1199,10 @@ void GLCanvas3D::load_arrange_settings()
     if (!placement_bias_str.empty())
         m_arrange_settings_fff.placement_bias = safe_stoi(placement_bias_str, 0);
 
+    std::string arrange_mode_str = wxGetApp().app_config->get("arrange", "arrange_mode");
+    if (!arrange_mode_str.empty())
+        m_arrange_settings_fff.arrange_mode = safe_stoi(arrange_mode_str, 0);
+
     //BBS: add specific arrange settings
     m_arrange_settings_fff_seq_print.is_seq_print = true;
 }
@@ -5918,26 +5922,40 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     // ====== PLATES ======
     {
         std::string multi_plate_key = "allow_multi_plate";
-        if (!settings_out.use_concave_hulls) imgui->disabled_begin(true);
+        std::string consolidate_key = "consolidate_plates";
+
+        // Gray out checkboxes that conflict with the current arrange mode.
+        // arrange_mode: 0=Arrange All, 1=Keep Plates, 2=This Plate, 3=Stragglers
+        bool mode_disables_checkboxes = (arrange_mode >= 1); // Keep Plates, This Plate, Stragglers
+        if (!settings_out.use_concave_hulls || mode_disables_checkboxes)
+            imgui->disabled_begin(true);
 
         if (imgui->bbl_checkbox(_L("Fill multiple plates"), settings.allow_multi_plate)) {
             settings_out.allow_multi_plate = settings.allow_multi_plate;
             appcfg->set("arrange", multi_plate_key.c_str(), settings_out.allow_multi_plate ? "1" : "0");
             settings_changed = true;
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", _u8L("Overflow onto additional plates when one is full.").c_str());
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (mode_disables_checkboxes)
+                ImGui::SetTooltip("%s", _u8L("Controlled automatically by the arrangement mode.").c_str());
+            else
+                ImGui::SetTooltip("%s", _u8L("Overflow onto additional plates when one is full.").c_str());
+        }
 
-        std::string consolidate_key = "consolidate_plates";
         if (imgui->bbl_checkbox(_L("Consolidate plates"), settings.consolidate_plates)) {
             settings_out.consolidate_plates = settings.consolidate_plates;
             appcfg->set("arrange", consolidate_key.c_str(), settings_out.consolidate_plates ? "1" : "0");
             settings_changed = true;
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", _u8L("Re-pack all plates into the fewest possible.").c_str());
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (mode_disables_checkboxes)
+                ImGui::SetTooltip("%s", _u8L("Controlled automatically by the arrangement mode.").c_str());
+            else
+                ImGui::SetTooltip("%s", _u8L("Re-pack all plates into the fewest possible.").c_str());
+        }
 
-        if (!settings_out.use_concave_hulls) imgui->disabled_end();
+        if (!settings_out.use_concave_hulls || mode_disables_checkboxes)
+            imgui->disabled_end();
     }
 
     ImGui::Separator();
@@ -6155,16 +6173,21 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
 
     ImGui::Separator();
 
-    // Arrangement mode dropdown
-    static int arrange_mode = 0;
+    // Arrangement mode dropdown — persisted in settings
     const char* arrange_mode_labels[] = {
         "Arrange All",
         "Arrange All (Keep Plates)",
         "Arrange This Plate",
         "Place Stragglers"
     };
+    int arrange_mode = settings.arrange_mode;
     ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x);
-    ImGui::Combo("##arrange_mode", &arrange_mode, arrange_mode_labels, IM_ARRAYSIZE(arrange_mode_labels));
+    if (ImGui::Combo("##arrange_mode", &arrange_mode, arrange_mode_labels, IM_ARRAYSIZE(arrange_mode_labels))) {
+        settings.arrange_mode = arrange_mode;
+        settings_out.arrange_mode = arrange_mode;
+        appcfg->set("arrange", "arrange_mode", std::to_string(arrange_mode));
+        settings_changed = true;
+    }
     ImGui::PopItemWidth();
 
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(15.0f, 10.0f));
@@ -6176,6 +6199,27 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         case 2: prepare_state = Job::PREPARE_STATE_MENU; break;
         case 3: prepare_state = Job::PREPARE_STATE_STRAGGLERS; break;
         }
+
+        // Notify user if checkbox settings are being overridden by the mode
+        if (arrange_mode >= 1) {
+            std::string overrides;
+            if (arrange_mode == 1) { // Keep Plates
+                if (settings.consolidate_plates) overrides += "Consolidate disabled. ";
+                if (settings.allow_multi_plate) overrides += "Fill Multiple Plates disabled. ";
+            } else if (arrange_mode == 2) { // This Plate
+                if (settings.consolidate_plates) overrides += "Consolidate disabled. ";
+            } else if (arrange_mode == 3) { // Stragglers
+                if (settings.consolidate_plates) overrides += "Consolidate disabled. ";
+                if (!settings.allow_multi_plate) overrides += "Fill Multiple Plates enabled. ";
+            }
+            if (!overrides.empty()) {
+                std::string msg = std::string(arrange_mode_labels[arrange_mode]) + " mode: " + overrides;
+                wxGetApp().plater()->get_notification_manager()->push_notification(
+                    NotificationType::CustomNotification,
+                    NotificationManager::NotificationLevel::RegularNotificationLevel, msg);
+            }
+        }
+
         wxGetApp().plater()->set_prepare_state(prepare_state);
         wxGetApp().plater()->arrange();
     }

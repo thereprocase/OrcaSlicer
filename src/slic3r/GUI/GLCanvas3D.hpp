@@ -510,6 +510,7 @@ public:
         bool  nesting_3d           = false;
         float slice_height_mm      = 10.0f;
         float z_clearance_mm       = 2.0f;
+        int   arrange_mode         = 0;     // 0=All, 1=Keep Plates, 2=This Plate, 3=Stragglers
     };
 
     struct OrientSettings
