@@ -1,6 +1,7 @@
 #include "ArrangeJob.hpp"
 
 #include "libslic3r/BuildVolume.hpp"
+#include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/SVG.hpp"
 #include "libslic3r/MTUtils.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -551,6 +552,7 @@ void ArrangeJob::prepare()
     m_plater->get_notification_manager()->push_notification(NotificationType::ArrangeOngoing,
         NotificationManager::NotificationLevel::RegularNotificationLevel, _u8L("Arranging..."));
     m_plater->get_notification_manager()->bbl_close_plateinfo_notification();
+    m_plater->get_notification_manager()->close_notification_of_type(NotificationType::ArrangeResult);
 
     params = init_arrange_params(m_plater);
 
@@ -911,9 +913,38 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(":arrange m_unprintable: name: %4%, bed_id %1%, trans {%2%,%3%}") % ap.bed_idx % unscale<double>(ap.translation(X)) % unscale<double>(ap.translation(Y)) % ap.name;
     }
 
+    // Post-postprocess overlap sanity check. Rasterizes all placed items at their
+    // final physical positions and checks for pairwise overlap via Clipper intersection.
+    // Catches mapping bugs that put items on the wrong plate after postprocess.
+    {
+        std::map<int, std::vector<ExPolygon>> plate_polys;
+        for (const ArrangePolygon& ap : m_selected) {
+            if (ap.bed_idx >= 0)
+                plate_polys[ap.bed_idx].push_back(ap.transformed_poly());
+        }
+        int overlap_count = 0;
+        for (auto& [pi, polys] : plate_polys) {
+            for (size_t a = 0; a < polys.size(); a++) {
+                for (size_t b = a + 1; b < polys.size(); b++) {
+                    ExPolygons overlap = intersection_ex(polys[a], polys[b]);
+                    double area = 0;
+                    for (const auto& ep : overlap) area += std::abs(ep.area());
+                    if (area > scaled(1.0) * scaled(1.0)) // >1mm² overlap
+                        overlap_count++;
+                }
+            }
+        }
+        if (overlap_count > 0) {
+            auto level = m_keep_plates_mode
+                ? NotificationManager::NotificationLevel::WarningNotificationLevel
+                : NotificationManager::NotificationLevel::ErrorNotificationLevel;
+            m_plater->get_notification_manager()->push_notification(
+                NotificationType::ArrangeResult, level,
+                std::to_string(overlap_count) + " item overlap(s) detected after arrangement.");
+        }
+    }
+
     m_plater->update();
-    // BBS
-    //wxGetApp().obj_manipul()->set_dirty();
 
     if (!m_unarranged.empty()) {
         std::set<std::string> names;

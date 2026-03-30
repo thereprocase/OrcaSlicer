@@ -1057,10 +1057,11 @@ void BitmapArranger::arrange(
         return std::abs(a.poly.area()) > std::abs(b.poly.area());
     });
 
-    // Minimum 5 degrees to prevent absurd rotation counts
-    std::vector<double> rotations = {0.};
+    // When rotations are enabled, build candidate angles from step size.
+    // When disabled, each item keeps its own rotation (set per-item in Phase 2).
+    std::vector<double> rotations;
+    bool preserve_rotation = !params.allow_rotations;
     if (params.allow_rotations) {
-        rotations.clear();
         double rot_step = std::max(params.rotation_step_rad, PI / 36.); // minimum 5°
         int n_rot = std::max(1, (int)std::round(2.0 * PI / rot_step));
         for (int i = 0; i < n_rot; i++)
@@ -1538,25 +1539,44 @@ void BitmapArranger::arrange(
             for (int i = range.begin(); i < range.end(); i++) {
                 if (rot_cancelled.load(std::memory_order_relaxed)) break;
 
+                // When preserve_rotation is true, use the item's own rotation
+                // as the sole candidate (user chose this orientation, keep it).
+                std::vector<double> item_rotations = rotations;
+                if (preserve_rotation)
+                    item_rotations = { entries[i].rotation };
+
                 if (!base_stacks[i].slices.empty()) {
-                    rot_stacks_all[i].push_back({base_stacks[i], 0.});
-                    for (size_t ri = 1; ri < rotations.size(); ri++) {
-                        auto rstack = rotate_stack(base_stacks[i], rotations[ri], res);
-                        rot_stacks_all[i].push_back({std::move(rstack), rotations[ri]});
+                    // Base is at rotation 0. Rotate to each candidate angle.
+                    for (size_t ri = 0; ri < item_rotations.size(); ri++) {
+                        if (std::abs(item_rotations[ri]) < 1e-6) {
+                            rot_stacks_all[i].push_back({base_stacks[i], 0.});
+                        } else {
+                            auto rstack = rotate_stack(base_stacks[i], item_rotations[ri], res);
+                            rot_stacks_all[i].push_back({std::move(rstack), item_rotations[ri]});
+                        }
                     }
+                    // Also keep a 2D bitmap for area estimation
                     auto &base = base_bitmaps[i];
                     if (base.width_px > 0 && base.height_px > 0) {
-                        rot_bmps_all[i].push_back({base, 0.});
+                        if (std::abs(item_rotations[0]) < 1e-6)
+                            rot_bmps_all[i].push_back({base, 0.});
+                        else {
+                            auto rbmp = rotate_bitmap(base, item_rotations[0], res);
+                            rot_bmps_all[i].push_back({std::move(rbmp), item_rotations[0]});
+                        }
                     }
                 } else {
                     auto &base = base_bitmaps[i];
                     if (base.width_px <= 0 || base.height_px <= 0) continue;
 
-                    rot_bmps_all[i].push_back({base, 0.});
-                    for (size_t ri = 1; ri < rotations.size(); ri++) {
-                        auto rbmp = rotate_bitmap(base, rotations[ri], res);
-                        if (rbmp.width_px > 0 && rbmp.height_px > 0)
-                            rot_bmps_all[i].push_back({std::move(rbmp), rotations[ri]});
+                    for (size_t ri = 0; ri < item_rotations.size(); ri++) {
+                        if (std::abs(item_rotations[ri]) < 1e-6) {
+                            rot_bmps_all[i].push_back({base, 0.});
+                        } else {
+                            auto rbmp = rotate_bitmap(base, item_rotations[ri], res);
+                            if (rbmp.width_px > 0 && rbmp.height_px > 0)
+                                rot_bmps_all[i].push_back({std::move(rbmp), item_rotations[ri]});
+                        }
                     }
                 }
 

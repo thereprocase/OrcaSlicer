@@ -134,6 +134,8 @@ enum class NotificationType
     URLDownload,
 	// BBS: Short meesage to fill space between start and finish of arranging
 	ArrangeOngoing,
+	// Post-arrange results (errors, warnings, info). Cleared on next arrange.
+	ArrangeResult,
 	// BBL: Plate Info ,Design For @YangLeDuo
 	BBLPlateInfo,
 	// BBL: 3MF warnings

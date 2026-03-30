@@ -6195,9 +6195,9 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         if (!settings.use_concave_hulls && (arrange_mode == 1 || arrange_mode == 3)) {
             arrange_mode = 0;
             wxGetApp().plater()->get_notification_manager()->push_notification(
-                NotificationType::CustomNotification,
+                NotificationType::ArrangeResult,
                 NotificationManager::NotificationLevel::RegularNotificationLevel,
-                "Keep Plates and Place Stragglers require 'Use actual part shape' to be enabled.");
+                into_u8(_L("Keep Plates and Place Stragglers require 'Use actual part shape' to be enabled.")));
         }
         settings.arrange_mode = arrange_mode;
         settings_out.arrange_mode = arrange_mode;
@@ -6231,7 +6231,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
             if (!overrides.empty()) {
                 std::string msg = std::string(arrange_mode_labels[arrange_mode]) + " mode: " + overrides;
                 wxGetApp().plater()->get_notification_manager()->push_notification(
-                    NotificationType::CustomNotification,
+                    NotificationType::ArrangeResult,
                     NotificationManager::NotificationLevel::RegularNotificationLevel, msg);
             }
         }
