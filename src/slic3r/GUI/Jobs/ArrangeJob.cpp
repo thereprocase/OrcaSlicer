@@ -753,7 +753,11 @@ void ArrangeJob::process(Ctl &ctl)
 
     // Stragglers: offset bed_idx so new items land AFTER existing plates
     if (m_stragglers_mode) {
+        BOOST_LOG_TRIVIAL(warning) << "Stragglers: m_selected=" << m_selected.size()
+                                    << " m_existing_plate_count=" << m_existing_plate_count;
         for (auto& ap : m_selected) {
+            BOOST_LOG_TRIVIAL(warning) << "  straggler " << ap.name << " bed_idx=" << ap.bed_idx
+                                        << " -> " << (ap.bed_idx >= 0 ? ap.bed_idx + m_existing_plate_count : ap.bed_idx);
             if (ap.bed_idx >= 0)
                 ap.bed_idx += m_existing_plate_count;
         }
@@ -845,7 +849,11 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
         } else if (m_stragglers_mode) {
             // Stragglers: bed_idx is offset past existing plates.
             // Use normal postprocess to create plates and compute positions.
+            BOOST_LOG_TRIVIAL(warning) << "Straggler finalize: " << ap.name
+                                        << " bed_idx=" << ap.bed_idx << " before postprocess";
             plate_list.postprocess_bed_index_for_selected(ap);
+            BOOST_LOG_TRIVIAL(warning) << "Straggler finalize: " << ap.name
+                                        << " bed_idx=" << ap.bed_idx << " after postprocess";
         } else if (only_on_partplate) {
             plate_list.postprocess_bed_index_for_current_plate(ap);
         } else {
