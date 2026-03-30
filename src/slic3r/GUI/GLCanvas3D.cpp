@@ -1105,14 +1105,23 @@ void GLCanvas3D::load_arrange_settings()
 
 
 
+    // Guard against malformed config values (e.g. "true"/"false" where a
+    // number is expected). Keeps the struct default on parse failure.
+    auto safe_stof = [](const std::string& s, float fallback) -> float {
+        try { return std::stof(s); } catch (...) { return fallback; }
+    };
+    auto safe_stoi = [](const std::string& s, int fallback) -> int {
+        try { return std::stoi(s); } catch (...) { return fallback; }
+    };
+
     if (!dist_fff_str.empty())
-        m_arrange_settings_fff.distance = std::stof(dist_fff_str);
+        m_arrange_settings_fff.distance = safe_stof(dist_fff_str, 0.f);
 
     if (!dist_fff_seq_print_str.empty())
-        m_arrange_settings_fff_seq_print.distance = std::stof(dist_fff_seq_print_str);
+        m_arrange_settings_fff_seq_print.distance = safe_stof(dist_fff_seq_print_str, 0.f);
 
     if (!dist_sla_str.empty())
-        m_arrange_settings_sla.distance = std::stof(dist_sla_str);
+        m_arrange_settings_sla.distance = safe_stof(dist_sla_str, 0.f);
 
     if (!en_rot_fff_str.empty())
         m_arrange_settings_fff.enable_rotation = (en_rot_fff_str == "1" || en_rot_fff_str == "true");
@@ -1144,15 +1153,6 @@ void GLCanvas3D::load_arrange_settings()
         wxGetApp().app_config->get("arrange", "consolidate_plates");
     if (!en_consolidate_str.empty())
         m_arrange_settings_fff.consolidate_plates = (en_consolidate_str == "1" || en_consolidate_str == "true");
-
-    // Guard against malformed config values (e.g. "true"/"false" where a
-    // number is expected). Keeps the struct default on parse failure.
-    auto safe_stof = [](const std::string& s, float fallback) -> float {
-        try { return std::stof(s); } catch (...) { return fallback; }
-    };
-    auto safe_stoi = [](const std::string& s, int fallback) -> int {
-        try { return std::stoi(s); } catch (...) { return fallback; }
-    };
 
     std::string rot_step_str =
         wxGetApp().app_config->get("arrange", "rotation_step_deg_fff");
