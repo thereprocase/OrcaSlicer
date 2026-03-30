@@ -589,10 +589,12 @@ void ArrangeJob::prepare()
     }
     else if (state == Job::JobPrepareState::PREPARE_STATE_KEEP_PLATES) {
         only_on_partplate = false;
+        skip_plate_clear = true;
         prepare_keep_plates();
     }
     else if (state == Job::JobPrepareState::PREPARE_STATE_STRAGGLERS) {
         only_on_partplate = false;
+        skip_plate_clear = true;
         prepare_stragglers();
     }
 
@@ -765,7 +767,12 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
     //BBS: partplate
     PartPlateList& plate_list = m_plater->get_partplate_list();
     //clear all the relations before apply the arrangement results
-    if (only_on_partplate) {
+    if (skip_plate_clear) {
+        // keep-plates and stragglers: don't clear existing plate associations.
+        // Only the items in m_selected will be repositioned; everything else
+        // (m_unselected, m_locked) stays exactly where it was.
+    }
+    else if (only_on_partplate) {
         plate_list.clear(false, false, true, current_plate_index);
     }
     else
@@ -790,8 +797,8 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
         if (ap.is_virt_object)
             continue;
 
-        //BBS: partplate postprocess
-        if (!only_on_partplate)
+        //BBS: partplate postprocess — skip for keep-plates/stragglers to preserve positions
+        if (!only_on_partplate && !skip_plate_clear)
             plate_list.postprocess_bed_index_for_unselected(ap);
 
         beds = std::max(ap.bed_idx, beds);
@@ -814,16 +821,20 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
         ap.apply();
     }
 
-    // Apply the arrange result to unselected objects(due to the sukodu-style column changes, the position of unselected may also be modified)
-    for (ArrangePolygon& ap : m_unselected)
-    {
-        if (ap.is_virt_object)
-            continue;
+    // Apply the arrange result to unselected objects (due to the sukodu-style column changes,
+    // the position of unselected may also be modified). Skip for keep-plates/stragglers
+    // where unselected items must remain exactly where they were.
+    if (!skip_plate_clear) {
+        for (ArrangePolygon& ap : m_unselected)
+        {
+            if (ap.is_virt_object)
+                continue;
 
-        //BBS: partplate postprocess
-        plate_list.postprocess_arrange_polygon(ap, false);
+            //BBS: partplate postprocess
+            plate_list.postprocess_arrange_polygon(ap, false);
 
-        ap.apply();
+            ap.apply();
+        }
     }
 
     // Move the unprintable items to the last virtual bed.
