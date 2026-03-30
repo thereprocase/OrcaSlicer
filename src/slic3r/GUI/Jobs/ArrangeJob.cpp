@@ -836,7 +836,10 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
         // postprocess_bed_index_for_selected assumes LOGICAL indices (skipping locked plates)
         // and would corrupt the mapping. Skip it for these modes.
         if (skip_plate_clear) {
-            // bed_idx is already the real plate index — just ensure plates exist
+            // bed_idx is already the real plate index. Create plates if needed
+            // (stragglers can have bed_idx beyond existing plate count).
+            while (ap.bed_idx >= 0 && ap.bed_idx >= (int)plate_list.get_plate_count())
+                plate_list.create_plate(false);
         } else if (only_on_partplate) {
             plate_list.postprocess_bed_index_for_current_plate(ap);
         } else {
