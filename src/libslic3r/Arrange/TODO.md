@@ -28,14 +28,6 @@ helps placement but compaction still does per-rotation collision with
 collides_3d. Parallel plate search (TBB) helps but doesn't eliminate the
 per-slice cost.
 
-## Correctness
-
-### Gravity compaction not implemented
-Phase 5 placeholder exists. UI option "gravity compact" does nothing.
-Needs un-stamp + re-stamp to move items without leaving ghost pixels
-in the bed bitmap. Not blocking — compaction (Phase 4) handles plate
-reduction, gravity would only tighten within-plate layout.
-
 ## Features
 
 ### Fill bed with copies

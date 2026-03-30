@@ -794,7 +794,6 @@ arrangement::ArrangeParams init_arrange_params(Plater *p)
     params.compaction_mode                     = settings.compaction_mode;
     params.best_fit_compact                    = settings.best_fit_compact;
     params.placement_bias                      = settings.placement_bias;
-    params.gravity_compact                     = false; // not exposed in UI yet — needs un-stamp implementation
 
     int state = p->get_prepare_state();
     if (state == Job::JobPrepareState::PREPARE_STATE_MENU) {
