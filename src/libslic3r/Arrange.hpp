@@ -205,6 +205,12 @@ struct ArrangeParams {
         ret += "\"purge_pad_edge\":" + std::to_string(purge_pad_edge) + ",";
         ret += "\"purge_pad_mm\":" + std::to_string(purge_pad_mm) + ",";
         ret += "\"bitmap_resolution_mm\":" + std::to_string(bitmap_resolution_mm) + ",";
+        ret += "\"nesting_3d\":" + std::to_string(nesting_3d) + ",";
+        ret += "\"slice_height_mm\":" + std::to_string(slice_height_mm) + ",";
+        ret += "\"z_clearance_mm\":" + std::to_string(z_clearance_mm) + ",";
+        ret += "\"compaction_mode\":" + std::to_string(compaction_mode) + ",";
+        ret += "\"gravity_compact\":" + std::to_string(gravity_compact) + ",";
+        ret += "\"best_fit_compact\":" + std::to_string(best_fit_compact) + ",";
         ret += "\"placement_bias\":" + std::to_string(placement_bias) + ",";
         ret.pop_back();
         ret += "}";
