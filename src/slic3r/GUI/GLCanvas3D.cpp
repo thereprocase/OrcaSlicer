@@ -5925,8 +5925,8 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         std::string consolidate_key = "consolidate_plates";
 
         // Gray out checkboxes that conflict with the current arrange mode.
-        // arrange_mode: 0=Arrange All, 1=Keep Plates, 2=This Plate, 3=Stragglers
-        bool mode_disables_checkboxes = (arrange_mode >= 1); // Keep Plates, This Plate, Stragglers
+        // 0=Arrange All, 1=Keep Plates, 2=This Plate, 3=Stragglers
+        bool mode_disables_checkboxes = (settings.arrange_mode >= 1);
         if (!settings_out.use_concave_hulls || mode_disables_checkboxes)
             imgui->disabled_begin(true);
 
