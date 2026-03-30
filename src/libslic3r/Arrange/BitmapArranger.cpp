@@ -1859,6 +1859,9 @@ void BitmapArranger::arrange(
 
                 int n_plates_try = use_3d ? (int)plates_3d.size() : (int)plates.size();
                 for (int pi = 0; pi < n_plates_try && !placed; pi++) {
+                    // keep-plates: only try the preferred plate
+                    if (entry.preferred_plate >= 0 && pi != entry.preferred_plate)
+                        continue;
                     if (use_3d && !rot_stacks_all[idx].empty()) {
                         if (!is_material_compatible(
                                 plates_3d[pi].material_group,
