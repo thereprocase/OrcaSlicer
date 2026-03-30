@@ -847,13 +847,13 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
             while (ap.bed_idx >= 0 && ap.bed_idx >= (int)plate_list.get_plate_count())
                 plate_list.create_plate(false);
         } else if (m_stragglers_mode) {
-            // Stragglers: bed_idx is offset past existing plates.
-            // Use normal postprocess to create plates and compute positions.
-            BOOST_LOG_TRIVIAL(warning) << "Straggler finalize: " << ap.name
-                                        << " bed_idx=" << ap.bed_idx << " before postprocess";
-            plate_list.postprocess_bed_index_for_selected(ap);
-            BOOST_LOG_TRIVIAL(warning) << "Straggler finalize: " << ap.name
-                                        << " bed_idx=" << ap.bed_idx << " after postprocess";
+            // Stragglers: bed_idx is already physical (offset past existing plates).
+            // Don't use postprocess_bed_index_for_selected — it assumes logical indices.
+            // Use create_plate(true) so that when the plate grid layout changes
+            // (e.g. 4→5 plates changes cols from 2→3), existing objects get
+            // repositioned to the new grid along with their plates.
+            while (ap.bed_idx >= 0 && ap.bed_idx >= (int)plate_list.get_plate_count())
+                plate_list.create_plate(true);
         } else if (only_on_partplate) {
             plate_list.postprocess_bed_index_for_current_plate(ap);
         } else {
