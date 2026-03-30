@@ -710,12 +710,8 @@ void ArrangeJob::process(Ctl &ctl)
         m_selected.clear();
 
         auto keep_params = params;
-        keep_params.allow_multi_plate = true;  // overflow to extra beds if plate can't fit all items
+        keep_params.allow_multi_plate = false;  // single plate — overflow items keep original position
         keep_params.consolidate_plates = false;
-
-        // Overflow plates start after all existing plates; running counter
-        // prevents collisions when multiple source plates overflow.
-        int overflow_base = n_plates;
 
         // Plate stride for coordinate transforms (global ↔ plate-local)
         int cols = pl.get_plate_cols();
@@ -735,13 +731,18 @@ void ArrangeJob::process(Ctl &ctl)
             int row = plate_idx / cols;
             int col = plate_idx % cols;
 
+            // Save original positions — if re-arrange can't fit an item,
+            // restore its original position instead of creating overflow plates.
+            // The greedy packer may not reproduce the original result exactly.
+            struct SavedPos { Vec2crd translation; double rotation; };
+            std::vector<SavedPos> saved(group.size());
+
             // Convert items from GLOBAL to plate-LOCAL coordinates.
-            // prepare_arrange_polygon() returns global positions (including plate stride).
-            // arrange() expects plate-0-local positions (within bed bounds).
-            // postprocess_arrange_polygon() in finalize will add the stride back.
-            for (auto& ap : group) {
+            for (size_t gi = 0; gi < group.size(); gi++) {
+                auto& ap = group[gi];
                 ap.translation(X) -= scaled<double>(stride_x * col);
                 ap.translation(Y) += scaled<double>(stride_y * row);
+                saved[gi] = {ap.translation, ap.rotation};
                 ap.bed_idx = 0;
             }
 
@@ -767,33 +768,81 @@ void ArrangeJob::process(Ctl &ctl)
             arrangement::arrange(group, plate_unselected, bedpts, keep_params);
             items_done += (int)group.size();
 
-            // Map results: bed_idx 0 = placed on this plate, >0 = overflow, <0 = unarranged
-            int overflow_count = 0;
-            for (auto& ap : group) {
-                if (ap.bed_idx == 0) {
-                    ap.bed_idx = plate_idx;
-                } else if (ap.bed_idx > 0) {
-                    // Overflow — map to unique new plates using running counter
-                    ap.bed_idx = overflow_base + ap.bed_idx - 1;
-                    overflow_count++;
-                } else {
-                    // Unarranged (bed_idx = -1) — arranger couldn't place it.
-                    // Put at plate origin so user can see and fix it.
-                    ap.bed_idx = plate_idx;
-                    ap.translation = {0, 0};
-                    BOOST_LOG_TRIVIAL(warning) << "keep-plates: item on plate " << plate_idx
-                                               << " could not be placed, sent to origin";
-                }
-                m_selected.push_back(std::move(ap));
+            // Decision logic:
+            // 1. If re-arrange placed everything → use new positions
+            // 2. If re-arrange couldn't fit all AND originals were valid → keep originals
+            // 3. If re-arrange couldn't fit all AND originals overlap → use re-arrange,
+            //    items that didn't fit go to plate origin
+            bool all_placed = true;
+            for (const auto& ap : group) {
+                if (ap.bed_idx != 0) { all_placed = false; break; }
             }
-            // Advance overflow base so next plate's overflows don't collide
-            if (overflow_count > 0) {
-                int max_overflow_bed = 0;
-                for (const auto& ap : m_selected)
-                    max_overflow_bed = std::max(max_overflow_bed, ap.bed_idx);
-                overflow_base = max_overflow_bed + 1;
+
+            if (all_placed) {
+                // Re-arrange succeeded — use new positions
+                for (auto& ap : group) {
+                    ap.bed_idx = plate_idx;
+                    m_selected.push_back(std::move(ap));
+                }
                 BOOST_LOG_TRIVIAL(info) << "keep-plates: plate " << plate_idx
-                                        << " overflow: " << overflow_count << " items";
+                                        << " re-packed " << group.size() << " items successfully";
+            } else {
+                // Re-arrange couldn't fit everything. Check if originals were valid.
+                // Use bitmap collision (same as arranger) for reliable overlap detection.
+                bool originals_valid = true;
+                {
+                    // Quick pairwise check using polygon intersection
+                    // (faster than full bitmap rasterize for small item counts per plate)
+                    for (size_t a = 0; a < saved.size() && originals_valid; a++) {
+                        ExPolygon pa = group[a].poly;
+                        pa.rotate(saved[a].rotation);
+                        pa.translate(saved[a].translation.x(), saved[a].translation.y());
+                        for (size_t b = a + 1; b < saved.size(); b++) {
+                            ExPolygon pb = group[b].poly;
+                            pb.rotate(saved[b].rotation);
+                            pb.translate(saved[b].translation.x(), saved[b].translation.y());
+                            ExPolygons overlap = intersection_ex(pa, pb);
+                            double area = 0;
+                            for (const auto& o : overlap) area += std::abs(o.area());
+                            if (area > scaled(0.5) * scaled(0.5)) {
+                                originals_valid = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (originals_valid) {
+                    // Originals were valid — don't make it worse, keep them
+                    for (size_t gi = 0; gi < group.size(); gi++) {
+                        auto& ap = group[gi];
+                        ap.bed_idx = plate_idx;
+                        ap.translation = saved[gi].translation;
+                        ap.rotation = saved[gi].rotation;
+                        m_selected.push_back(std::move(ap));
+                    }
+                    BOOST_LOG_TRIVIAL(warning) << "keep-plates: plate " << plate_idx
+                                               << " re-pack worse than valid original, keeping "
+                                               << group.size() << " items unchanged";
+                } else {
+                    // Originals were invalid (overlapping) — use re-arrange,
+                    // items that didn't fit go to plate origin
+                    int failed = 0;
+                    for (auto& ap : group) {
+                        if (ap.bed_idx == 0) {
+                            ap.bed_idx = plate_idx;
+                        } else {
+                            ap.bed_idx = plate_idx;
+                            ap.translation = {0, 0};
+                            ap.rotation = 0;
+                            failed++;
+                        }
+                        m_selected.push_back(std::move(ap));
+                    }
+                    BOOST_LOG_TRIVIAL(warning) << "keep-plates: plate " << plate_idx
+                                               << " had overlapping originals, re-packed with "
+                                               << failed << " items at origin";
+                }
             }
         }
     } else {
