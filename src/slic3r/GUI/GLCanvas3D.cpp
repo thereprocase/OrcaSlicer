@@ -6181,8 +6181,22 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         "Place Stragglers"
     };
     int arrange_mode = settings.arrange_mode;
+
+    // Keep Plates (1) and Stragglers (3) require concave mode — BitmapArranger
+    // respects pre-assigned bed_idx, libnest2d does not. Fall back if needed.
+    if (!settings.use_concave_hulls && (arrange_mode == 1 || arrange_mode == 3))
+        arrange_mode = 0;
+
     ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x);
     if (ImGui::Combo("##arrange_mode", &arrange_mode, arrange_mode_labels, IM_ARRAYSIZE(arrange_mode_labels))) {
+        // Reject modes that require concave
+        if (!settings.use_concave_hulls && (arrange_mode == 1 || arrange_mode == 3)) {
+            arrange_mode = 0;
+            wxGetApp().plater()->get_notification_manager()->push_notification(
+                NotificationType::CustomNotification,
+                NotificationManager::NotificationLevel::RegularNotificationLevel,
+                "Keep Plates and Place Stragglers require 'Use actual part shape' to be enabled.");
+        }
         settings.arrange_mode = arrange_mode;
         settings_out.arrange_mode = arrange_mode;
         appcfg->set("arrange", "arrange_mode", std::to_string(arrange_mode));
