@@ -835,11 +835,15 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
         // Keep-plates and stragglers set bed_idx to PHYSICAL plate indices.
         // postprocess_bed_index_for_selected assumes LOGICAL indices (skipping locked plates)
         // and would corrupt the mapping. Skip it for these modes.
-        if (skip_plate_clear) {
-            // bed_idx is already the real plate index. Create plates if needed
-            // (stragglers can have bed_idx beyond existing plate count).
+        if (m_keep_plates_mode) {
+            // Keep-plates: bed_idx is already the real physical plate index.
+            // Create plates if somehow needed but don't remap.
             while (ap.bed_idx >= 0 && ap.bed_idx >= (int)plate_list.get_plate_count())
                 plate_list.create_plate(false);
+        } else if (m_stragglers_mode) {
+            // Stragglers: bed_idx is offset past existing plates.
+            // Use normal postprocess to create plates and compute positions.
+            plate_list.postprocess_bed_index_for_selected(ap);
         } else if (only_on_partplate) {
             plate_list.postprocess_bed_index_for_current_plate(ap);
         } else {
