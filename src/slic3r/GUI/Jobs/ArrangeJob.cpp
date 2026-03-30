@@ -710,7 +710,7 @@ void ArrangeJob::process(Ctl &ctl)
         m_selected.clear();
 
         auto keep_params = params;
-        keep_params.allow_multi_plate = false;
+        keep_params.allow_multi_plate = true;  // overflow to extra beds if plate can't fit all items
         keep_params.consolidate_plates = false;
 
         // Plate stride for coordinate transforms (global ↔ plate-local)
@@ -762,11 +762,22 @@ void ArrangeJob::process(Ctl &ctl)
             arrangement::arrange(group, plate_unselected, bedpts, keep_params);
             items_done += (int)group.size();
 
-            // Restore plate assignment — postprocess_arrange_polygon adds stride back
+            // Map results: bed_idx 0 = stays on this plate, bed_idx > 0 = overflow
+            // Track highest overflow bed to create new physical plates later
+            int overflow_count = 0;
             for (auto& ap : group) {
-                ap.bed_idx = plate_idx;
+                if (ap.bed_idx <= 0) {
+                    ap.bed_idx = plate_idx;  // stays on original plate
+                } else {
+                    // Overflow — map to new plates after all existing ones
+                    ap.bed_idx = n_plates + ap.bed_idx - 1;
+                    overflow_count++;
+                }
                 m_selected.push_back(std::move(ap));
             }
+            if (overflow_count > 0)
+                BOOST_LOG_TRIVIAL(info) << "keep-plates: plate " << plate_idx
+                                        << " overflow: " << overflow_count << " items to new plates";
         }
     } else {
         arrangement::arrange(m_selected, m_unselected, bedpts, params);
