@@ -780,9 +780,19 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
     }
     else
         plate_list.clear(false, false, true, -1);
+    // For stragglers: offset bed_idx so new items go to plates AFTER existing ones.
+    // The arranger assigns bed_idx starting from 0, but plates 0..N-1 are already occupied.
+    int straggler_plate_offset = 0;
+    if (skip_plate_clear && !only_on_partplate) {
+        straggler_plate_offset = (int)plate_list.get_plate_count();
+        for (ArrangePolygon& ap : m_selected) {
+            if (ap.bed_idx >= 0)
+                ap.bed_idx += straggler_plate_offset;
+        }
+    }
+
     //BBS: adjust the bed_index, create new plates, get the max bed_index
     for (ArrangePolygon& ap : m_selected) {
-        //if (ap.bed_idx < 0) continue;  // bed_idx<0 means unarrangable
         //BBS: partplate postprocess
         if (only_on_partplate)
             plate_list.postprocess_bed_index_for_current_plate(ap);
