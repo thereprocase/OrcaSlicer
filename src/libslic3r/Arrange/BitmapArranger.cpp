@@ -2660,15 +2660,16 @@ void BitmapArranger::arrange(
     }
 
     // ============================================================
-    // POST-PLACEMENT: Corner bias shift
+    // POST-PLACEMENT: Cluster repositioning
     // ============================================================
-    // Pack bottom-left for max density, then shift each plate's cluster
-    // to the back-right corner. Items stay in the same relative positions
-    // so no collisions are introduced. Moves items away from front-left
-    // purge/exclusion zones.
-    if (params.placement_bias == 1) {
+    // After packing bottom-left for max density, shift each plate's
+    // cluster to match the placement preference. Items keep relative
+    // positions so no collisions are introduced.
+    {
         int n_plates_shift = use_3d ? (int)plates_3d.size() : (int)plates.size();
         for (int pi = 0; pi < n_plates_shift; pi++) {
+            coord_t min_left = effective_bed.max.x();
+            coord_t min_bottom = effective_bed.max.y();
             coord_t max_right = effective_bed.min.x();
             coord_t max_top = effective_bed.min.y();
             bool has_items = false;
@@ -2679,13 +2680,36 @@ void BitmapArranger::arrange(
                 ExPolygon rotated = arrangables[i].poly;
                 rotated.rotate(arrangables[i].rotation);
                 BoundingBox bb = get_extents(rotated);
-                max_right = std::max(max_right, arrangables[i].translation.x() + bb.max.x());
-                max_top   = std::max(max_top,   arrangables[i].translation.y() + bb.max.y());
+                coord_t left   = arrangables[i].translation.x() + bb.min.x();
+                coord_t bottom = arrangables[i].translation.y() + bb.min.y();
+                coord_t right  = arrangables[i].translation.x() + bb.max.x();
+                coord_t top    = arrangables[i].translation.y() + bb.max.y();
+                min_left   = std::min(min_left,   left);
+                min_bottom = std::min(min_bottom, bottom);
+                max_right  = std::max(max_right,  right);
+                max_top    = std::max(max_top,    top);
             }
             if (!has_items) continue;
 
-            coord_t shift_x = effective_bed.max.x() - max_right;
-            coord_t shift_y = effective_bed.max.y() - max_top;
+            coord_t shift_x = 0, shift_y = 0;
+            if (params.placement_bias == 1) {
+                // Corner: shift cluster to back-right
+                shift_x = effective_bed.max.x() - max_right;
+                shift_y = effective_bed.max.y() - max_top;
+            } else {
+                // Center: shift cluster to bed center
+                coord_t cluster_cx = (min_left + max_right) / 2;
+                coord_t cluster_cy = (min_bottom + max_top) / 2;
+                coord_t bed_cx = (effective_bed.min.x() + effective_bed.max.x()) / 2;
+                coord_t bed_cy = (effective_bed.min.y() + effective_bed.max.y()) / 2;
+                shift_x = bed_cx - cluster_cx;
+                shift_y = bed_cy - cluster_cy;
+                // Clamp so nothing goes out of bounds
+                shift_x = std::max(shift_x, effective_bed.min.x() - min_left);
+                shift_x = std::min(shift_x, effective_bed.max.x() - max_right);
+                shift_y = std::max(shift_y, effective_bed.min.y() - min_bottom);
+                shift_y = std::min(shift_y, effective_bed.max.y() - max_top);
+            }
 
             for (auto &arr : arrangables) {
                 if (arr.bed_idx == pi) {
@@ -2694,7 +2718,8 @@ void BitmapArranger::arrange(
                 }
             }
         }
-        ARRANGE_LOG("Corner bias: shifted " << n_plates_shift << " plate(s) to back-right");
+        ARRANGE_LOG("Placement shift: " << n_plates_shift << " plate(s), bias="
+                    << params.placement_bias);
     }
 
     int total_plates = params.nesting_3d ? (int)plates_3d.size() : (int)plates.size();
