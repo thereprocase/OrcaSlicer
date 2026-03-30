@@ -8,43 +8,10 @@
 #include <mutex>
 #include <set>
 #include <chrono>
-#include <fstream>
 #include <sstream>
 
-// Debug log for arrange. Writes to arrange_debug.log in the working directory.
-// File is opened opportunistically — touch arrange_debug.log to enable it.
-namespace {
-    class ArrangeLog {
-    public:
-        static ArrangeLog &instance() {
-            static ArrangeLog s;
-            return s;
-        }
-        void log(const std::string &msg) {
-            std::lock_guard<std::mutex> lock(mtx_);
-            if (!file_.is_open()) return;
-            auto now = std::chrono::high_resolution_clock::now();
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now.time_since_epoch()).count();
-            file_ << "[" << ms << "] " << msg << "\n";
-            file_.flush();
-        }
-        void begin_session(const std::string &header) {
-            std::lock_guard<std::mutex> lock(mtx_);
-            file_.open("arrange_debug.log", std::ios::app);
-            if (file_.is_open()) {
-                file_ << "\n=== " << header << " ===\n";
-                file_.flush();
-            }
-        }
-    private:
-        std::ofstream file_;
-        std::mutex mtx_;
-    };
-}
 #define ARRANGE_LOG(msg) do { \
     std::ostringstream _oss; _oss << msg; \
-    ArrangeLog::instance().log(_oss.str()); \
     BOOST_LOG_TRIVIAL(info) << _oss.str(); \
 } while(0)
 
@@ -1129,9 +1096,6 @@ void BitmapArranger::arrange(
         return;
     }
 
-    ArrangeLog::instance().begin_session("BitmapArranger");
-
-    ARRANGE_LOG("version " << BITMAP_ARRANGE_VERSION);
     ARRANGE_LOG("bed " << bed_w_px << "x" << bed_h_px
                 << " px, res " << params.bitmap_resolution_mm << " mm/px"
                 << ", " << arrangables.size() << " items"
