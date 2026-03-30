@@ -25,8 +25,6 @@
 // 64M × 8 bytes = 512 MB max per plate. Larger beds must use convex-hull mode.
 constexpr size_t MAX_BITMAP_WORDS = 64'000'000u;
 
-static const char* BITMAP_ARRANGE_VERSION = "dev-cbef94e14d";
-
 #ifdef _MSC_VER
 #include <intrin.h>
 // Count trailing zeros. Precondition: x != 0 (callers must guard).
