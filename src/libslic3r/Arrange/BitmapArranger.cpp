@@ -98,7 +98,6 @@ BitmapArranger::BitmapItem BitmapArranger::rasterize(
     item.width_px  = (int)std::ceil((double)(bb.max.x() - bb.min.x()) / res) + 1;
     item.height_px = (int)std::ceil((double)(bb.max.y() - bb.min.y()) / res) + 1;
 
-    // Inflation can collapse a thin polygon to nothing
     if (item.width_px <= 0 || item.height_px <= 0) {
         item.width_px = item.height_px = item.width_words = 0;
         return item;
@@ -112,7 +111,6 @@ BitmapArranger::BitmapItem BitmapArranger::rasterize(
     for (int py = 0; py < item.height_px; py++) {
         coord_t y = bb.min.y() + (coord_t)(py * res + res / 2);
 
-        // Collect x-intersections for contour and all holes (even-odd fill)
         x_intersections.clear();
 
         auto scan_ring = [&](const Polygon &ring) {
@@ -151,7 +149,6 @@ BitmapArranger::BitmapItem BitmapArranger::rasterize_triangles(
     BitmapItem item;
     if (tri_verts.size() < 3) return item;
 
-    // Bounding box of all triangle vertices, expanded by inflation
     BoundingBox bb(tri_verts);
     bb.min -= Vec2crd(inflation, inflation);
     bb.max += Vec2crd(inflation, inflation);
@@ -177,7 +174,6 @@ BitmapArranger::BitmapItem BitmapArranger::rasterize_triangles(
     double inv_res = 1.0 / res;
 
     for (size_t ti = 0; ti + 2 < tri_verts.size(); ti += 3) {
-        // Convert triangle vertices to pixel coordinates
         double x0 = (tri_verts[ti].x()     - bb.min.x()) * inv_res;
         double y0 = (tri_verts[ti].y()     - bb.min.y()) * inv_res;
         double x1 = (tri_verts[ti + 1].x() - bb.min.x()) * inv_res;
@@ -235,8 +231,6 @@ BitmapArranger::BitmapItem BitmapArranger::rotate_bitmap(
 
     double cos_a = std::cos(angle_rad), sin_a = std::sin(angle_rad);
 
-    // Compute the bounding box of the rotated source bitmap.
-    // The four corners of the source, rotated, give the new extents.
     double hw = src.width_px * 0.5, hh = src.height_px * 0.5;
     double corners_x[4] = { -hw, hw, hw, -hw };
     double corners_y[4] = { -hh, -hh, hh, hh };
@@ -254,15 +248,12 @@ BitmapArranger::BitmapItem BitmapArranger::rotate_bitmap(
     dst.width_words = (dst.width_px + 63) / 64;
     dst.bits.assign(dst.width_words * dst.height_px, 0);
 
-    // New offset: rotate the source center and compute the new BB min in scaled coords.
+    // Rotation is around the object's own center, so the center stays the same
     double src_cx = src.offset_x + hw * res;
     double src_cy = src.offset_y + hh * res;
-    // The center stays the same after rotation (we rotate around the object's own center)
     dst.offset_x = (coord_t)(src_cx - (dst.width_px * 0.5) * res);
     dst.offset_y = (coord_t)(src_cy - (dst.height_px * 0.5) * res);
 
-    // Reverse mapping: for each destination pixel, find the source pixel.
-    // Rotate the destination coordinate backwards by -angle to find the source.
     double dst_cx = dst.width_px * 0.5;
     double dst_cy = dst.height_px * 0.5;
 
@@ -270,7 +261,6 @@ BitmapArranger::BitmapItem BitmapArranger::rotate_bitmap(
         double fy = dy - dst_cy;
         for (int dx = 0; dx < dst.width_px; dx++) {
             double fx = dx - dst_cx;
-            // Inverse rotation
             int sx = (int)(fx * cos_a + fy * sin_a + hw);
             int sy = (int)(-fx * sin_a + fy * cos_a + hh);
             if (sx >= 0 && sx < src.width_px && sy >= 0 && sy < src.height_px) {
@@ -294,12 +284,10 @@ BitmapArranger::SliceStack BitmapArranger::rasterize_slices(
     SliceStack stack;
     if (tri_verts.size() < 3 || tri_z.size() != tri_verts.size()) return stack;
 
-    // Find max Z to determine number of slices
     float max_z = 0;
     for (float z : tri_z) max_z = std::max(max_z, z);
     stack.n_slices = std::max(1, (int)std::ceil(max_z / slice_height_mm));
 
-    // Compute GLOBAL bounding box from ALL triangles, expanded by inflation.
     // All slices must share this same coordinate frame so that collides_3d
     // can pass the same (ox, oy) to collides() for every slice. Without this,
     // each slice has a different offset/size and the collision check is misaligned.
@@ -309,11 +297,11 @@ BitmapArranger::SliceStack BitmapArranger::rasterize_slices(
 
     int global_w = (int)std::ceil((double)(global_bb.max.x() - global_bb.min.x()) / res) + 1;
     int global_h = (int)std::ceil((double)(global_bb.max.y() - global_bb.min.y()) / res) + 1;
-    int global_ww = (global_w + 63) / 64;
+    int global_width_words = (global_w + 63) / 64;
 
     if (global_w <= 0 || global_h <= 0) return stack;
 
-    // Bin each triangle into every Z slice its range intersects, expanded by z_clearance.
+    // Bin triangles into Z slices, expanded by z_clearance
     std::vector<Points> slice_tris(stack.n_slices);
     for (size_t ti = 0; ti + 2 < tri_verts.size(); ti += 3) {
         float z_min = std::min({tri_z[ti], tri_z[ti + 1], tri_z[ti + 2]});
@@ -327,9 +315,6 @@ BitmapArranger::SliceStack BitmapArranger::rasterize_slices(
         }
     }
 
-    // Rasterize each slice directly into the global bounding box.
-    // rasterize_triangles() computes its own BB per call — using it would give each
-    // slice a different frame, breaking collides_3d's assumption of shared (ox, oy).
     double inv_res = 1.0 / res;
 
     auto rasterize_into_global = [&](const Points &tris) -> BitmapItem {
@@ -338,10 +323,11 @@ BitmapArranger::SliceStack BitmapArranger::rasterize_slices(
         item.offset_y = global_bb.min.y();
         item.width_px = global_w;
         item.height_px = global_h;
-        item.width_words = global_ww;
-        item.bits.assign((size_t)global_ww * global_h, 0);
+        item.width_words = global_width_words;
+        item.bits.assign((size_t)global_width_words * global_h, 0);
 
-        // Scanline-fill each triangle (same as rasterize_triangles but with fixed BB)
+        // Why not call rasterize_triangles()? It computes its own bounding box per call,
+        // giving each slice a different coordinate frame. collides_3d needs all slices in the same frame.
         for (size_t ti = 0; ti + 2 < tris.size(); ti += 3) {
             double x0 = (tris[ti].x()     - global_bb.min.x()) * inv_res;
             double y0 = (tris[ti].y()     - global_bb.min.y()) * inv_res;
@@ -380,13 +366,13 @@ BitmapArranger::SliceStack BitmapArranger::rasterize_slices(
                 int px_right = std::min(global_w - 1, (int)right);
 
                 if (px_left <= px_right)
-                    fill_span(item.bits, global_ww, py, px_left, px_right);
+                    fill_span(item.bits, global_width_words, py, px_left, px_right);
             }
         }
 
         if (inflation > 0) {
             int inflate_px = std::max(1, (int)(inflation * inv_res));
-            dilate_bitmap(item.bits, global_ww, global_w, global_h, inflate_px);
+            dilate_bitmap(item.bits, global_width_words, global_w, global_h, inflate_px);
         }
 
         return item;
@@ -405,7 +391,7 @@ BitmapArranger::SliceStack BitmapArranger::rasterize_slices(
                         stack.slices[s].offset_y = global_bb.min.y();
                         stack.slices[s].width_px = global_w;
                         stack.slices[s].height_px = global_h;
-                        stack.slices[s].width_words = global_ww;
+                        stack.slices[s].width_words = global_width_words;
                     }
                 }
             }
@@ -419,15 +405,13 @@ BitmapArranger::SliceStack BitmapArranger::rasterize_slices(
                 stack.slices[s].offset_y = global_bb.min.y();
                 stack.slices[s].width_px = global_w;
                 stack.slices[s].height_px = global_h;
-                stack.slices[s].width_words = global_ww;
+                stack.slices[s].width_words = global_width_words;
             }
         }
     }
 
-    // Optimization: if all slices produce identical bitmaps (no overhangs),
-    // collapse to a single slice. Avoids N×rotations for simple prismatic parts.
-    // Compare actual rasterized bits, not triangle counts — triangle counts differ
-    // even for cylinders because top/bottom face triangles land in different slices.
+    // Collapse identical slices to 1 — prismatic parts (cubes, cylinders) don't need
+    // per-slice collision. Compare bits, not triangle counts (top/bottom faces differ).
     if (stack.n_slices > 1 && !stack.slices[0].bits.empty()) {
         bool all_same = true;
         const auto &ref_bits = stack.slices[0].bits;
@@ -509,6 +493,7 @@ void BitmapArranger::stamp_3d(
         bed_stack.slices.push_back(std::move(new_slice));
         bed_stack.n_slices++;
     }
+
     bool item_collapsed = (int)item_stack.slices.size() < item_stack.n_slices;
     for (int z = 0; z < item_stack.n_slices; z++) {
         int item_z = item_collapsed ? 0 : z;
@@ -530,14 +515,8 @@ std::optional<std::pair<int,int>> BitmapArranger::find_placement_3d(
     const SliceStack &bed_stack, int bed_w, int bed_w_px, int bed_h,
     const SliceStack &item_stack, int step)
 {
-    // Two-stage 3D placement:
-    //   1. Skyline on bottom slice (O(bed_width)) — fast, finds most placements
-    //   2. Center-out scan with 2D pre-filter on slice 0 — catches cases
-    //      where skyline fails but gaps exist below the skyline
-    //
-    // The key optimization: only call expensive collides_3d() at positions
-    // that already pass the cheap 2D collision check on slice 0.
-
+    // Only call expensive collides_3d() at positions that already pass
+    // the cheap 2D collision check on slice 0.
     if (item_stack.slices.empty() || bed_stack.slices.empty())
         return std::nullopt;
 
@@ -553,9 +532,6 @@ std::optional<std::pair<int,int>> BitmapArranger::find_placement_3d(
     const auto &bed_s0 = bed_stack.slices[0];
     const auto &item_s0 = item_stack.slices[0];
 
-    // Skyline search is handled by the caller, which caches it across rotations.
-    // This function is the fallback — skip straight to center-out scan with
-    // 2D pre-filter on slice 0:
     int cx = max_x / 2, cy = max_y / 2;
     int max_radius = std::max(max_x, max_y);
 
@@ -569,11 +545,10 @@ std::optional<std::pair<int,int>> BitmapArranger::find_placement_3d(
                     y > y_lo + step && y < y_hi - step)
                     continue;
 
-                // 2D pre-filter: skip if bottom slice collides (cheap)
+                // 2D pre-filter on slice 0 avoids expensive full-3D check
                 if (collides(bed_s0.bits, bed_w, bed_w_px, bed_h, item_s0, x, y))
                     continue;
 
-                // Bottom slice clear — check full 3D
                 if (!collides_3d(bed_stack, bed_w, bed_w_px, bed_h, item_stack, x, y)) {
                     int best_x = x, best_y = y;
                     int best_dist = (x - cx) * (x - cx) + (y - cy) * (y - cy);
@@ -740,8 +715,7 @@ BitmapArranger::ItemProfile BitmapArranger::compute_profile(
     prof.max_y = bed_h - item.height_px;
     if (prof.max_y < 0) return prof;
 
-    // Bottom profile: lowest set pixel per column. bed_h+1 = sentinel for empty columns.
-    prof.bottom.assign(prof.bw, bed_h + 1);
+    prof.bottom.assign(prof.bw, bed_h + 1); // bed_h+1 = sentinel for empty columns
     for (int x = 0; x < prof.bw; x++) {
         for (int y = 0; y < prof.bh; y++) {
             int word = x / 64;
@@ -753,7 +727,7 @@ BitmapArranger::ItemProfile BitmapArranger::compute_profile(
         }
     }
 
-    // Top profile: one past the highest set pixel per active column (exclusive, matches skyline convention)
+    // Exclusive top: one past the highest set pixel (matches skyline convention)
     for (int x = 0; x < prof.bw; x++) {
         if (prof.bottom[x] > bed_h) continue; // inactive column
         for (int y = prof.bh - 1; y >= 0; y--) {
@@ -782,7 +756,6 @@ std::optional<std::pair<int,int>> BitmapArranger::find_placement_skyline(
     constexpr int STRIDE = 8;
     constexpr int REFINE = 10;
 
-    // Helper: compute placement Y at a given X position
     auto eval_y = [&](int x) -> int {
         int y = 0;
         for (int c = 0; c < profile.bw; c++) {
@@ -793,7 +766,6 @@ std::optional<std::pair<int,int>> BitmapArranger::find_placement_skyline(
     };
 
     if (placement_bias == 1) {
-        // Corner mode: lowest Y, leftmost X (original behavior)
         int best_x = -1, best_y = INT_MAX;
 
         for (int x = 0; x < n_pos; x += STRIDE) {
@@ -808,7 +780,6 @@ std::optional<std::pair<int,int>> BitmapArranger::find_placement_skyline(
         if (best_x < 0 || best_y > profile.max_y)
             return std::nullopt;
 
-        // Refine around coarse winner
         if (best_y > 0) {
             int ref_lo = std::max(0, best_x - REFINE);
             int ref_hi = std::min(n_pos, best_x + REFINE + 1);
@@ -826,11 +797,8 @@ std::optional<std::pair<int,int>> BitmapArranger::find_placement_skyline(
         return std::make_pair(best_x, best_y);
     }
 
-    // Center mode: prefer positions with X closest to bed center,
-    // among all candidates at or near the lowest achievable Y.
-    int bed_cx = bed_w_px / 2;  // bed center in pixels
+    int bed_cx = bed_w_px / 2;
 
-    // Coarse pass: collect all valid positions with their Y values
     struct PosY { int x, y; };
     std::vector<PosY> coarse;
     coarse.reserve(n_pos / STRIDE + 1);
@@ -853,7 +821,6 @@ std::optional<std::pair<int,int>> BitmapArranger::find_placement_skyline(
     int y_tolerance = std::max(2, global_min_y / 10);
     int y_threshold = global_min_y + y_tolerance;
 
-    // Among candidates within Y threshold, pick closest to bed center X
     int best_x = -1, best_y = INT_MAX;
     int best_dist = INT_MAX;
 
@@ -871,7 +838,6 @@ std::optional<std::pair<int,int>> BitmapArranger::find_placement_skyline(
     if (best_x < 0)
         return std::nullopt;
 
-    // Refine around winner at pixel resolution
     {
         int ref_lo = std::max(0, best_x - REFINE);
         int ref_hi = std::min(n_pos, best_x + REFINE + 1);
@@ -897,7 +863,6 @@ std::optional<std::pair<int,int>> BitmapArranger::find_placement(
     const std::vector<uint64_t> &bed_bits, int bed_w, int bed_w_px, int bed_h,
     const BitmapItem &item, int step)
 {
-    // Multi-tier search: coarse (4× step) → medium (1× step) → pixel-level refinement, center-out at each tier.
     int max_x = bed_w_px - item.width_px;
     int max_y = bed_h - item.height_px;
     if (max_x < 0 || max_y < 0) return std::nullopt;
@@ -932,11 +897,9 @@ std::optional<std::pair<int,int>> BitmapArranger::find_placement(
             }
         }
     }
-    // Coarse scan found nothing — item doesn't fit
     return std::nullopt;
 
 tier2:
-    // Tier 2: Medium scan around the coarse hit (within coarse_step radius)
     {
         int search_r = coarse_step;
         int y_lo = std::max(0, hit_y - search_r);
@@ -957,7 +920,6 @@ tier2:
         }
     }
 
-    // Tier 3: Pixel-level refinement around the medium hit (within one step)
     {
         int best_x = hit_x, best_y = hit_y;
         best_dist = (hit_x - cx) * (hit_x - cx) + (hit_y - cy) * (hit_y - cy);
@@ -973,7 +935,6 @@ tier2:
     }
 }
 
-// Converts a polygon bed to a bounding box + exclusion mask for the area outside the polygon.
 void BitmapArranger::arrange(
     ArrangePolygons &arrangables,
     const ArrangePolygons &excludes,
@@ -1020,7 +981,6 @@ void BitmapArranger::arrange(
 
     BoundingBox effective_bed = bed;
 
-    // Purge pad: shrink the effective bed along one edge
     if (params.avoid_purge_pad && params.purge_pad_mm > 0.f) {
         coord_t pad = scaled(params.purge_pad_mm);
         switch (params.purge_pad_edge) {
@@ -1060,7 +1020,6 @@ void BitmapArranger::arrange(
     auto t_total_start = std::chrono::high_resolution_clock::now();
     auto t_phase_start = t_total_start;
 
-    // Consolidate: clear existing assignments so all items are repacked from scratch.
     if (params.consolidate_plates) {
         for (auto &ap : arrangables)
             ap.bed_idx = UNARRANGED;
@@ -1093,15 +1052,12 @@ void BitmapArranger::arrange(
         entries.push_back(std::move(e));
     }
 
-    // Sort largest-first by area: standard BLF companion heuristic.
-    // Large items are hardest to place, so they go first while the bed is empty.
+    // Largest-first: standard BLF heuristic — large items are hardest to place.
     std::sort(entries.begin(), entries.end(), [](const ItemEntry &a, const ItemEntry &b) {
         return std::abs(a.poly.area()) > std::abs(b.poly.area());
     });
 
-    // Build rotation candidates from user-selected step size.
-    // Uses params.rotation_step_rad (mapped from UI dropdown: 90°/45°/15°).
-    // Minimum 5° to prevent absurd rotation counts.
+    // Minimum 5 degrees to prevent absurd rotation counts
     std::vector<double> rotations = {0.};
     if (params.allow_rotations) {
         rotations.clear();
@@ -1111,7 +1067,6 @@ void BitmapArranger::arrange(
             rotations.push_back(i * rot_step);
     }
 
-    // Stamp all exclusion zones (purge line, calibration pad) onto the bed bitmap.
     auto stamp_excludes = [&](std::vector<uint64_t> &bits) {
         auto stamp_polys = [&](const ArrangePolygons &polys) {
             for (const auto &excl : polys) {
@@ -1129,7 +1084,6 @@ void BitmapArranger::arrange(
         stamp_polys(params.excluded_regions);
     };
 
-    // One entry per plate — enables first-fit search across all plates.
     struct PlateState {
         std::vector<uint64_t> bits;
         std::vector<int> skyline;  // 1D height per column for O(bed_w) placement
@@ -1162,7 +1116,6 @@ void BitmapArranger::arrange(
     plates.push_back({std::vector<uint64_t>(bed_w_words * bed_h_px, 0), std::vector<int>(bed_w_px, 0), -1, 0});
     stamp_excludes(plates[0].bits);
     plates[0].free_px = count_free_px(plates[0].bits);
-    // Initialize skyline from exclude-stamped bitmap so placement respects exclusion zones.
     for (int x = 0; x < bed_w_px; x++) {
         for (int y = bed_h_px - 1; y >= 0; y--) {
             int word = x / 64, bit = x % 64;
@@ -1184,7 +1137,6 @@ void BitmapArranger::arrange(
         s0.width_px = bed_w_px;
         s0.height_px = bed_h_px;
         stamp_excludes(s0.bits);
-        // Initialize skyline from exclude-stamped bottom slice
         p3d.skyline.assign(bed_w_px, 0);
         for (int x = 0; x < bed_w_px; x++) {
             for (int y = bed_h_px - 1; y >= 0; y--) {
@@ -1217,28 +1169,20 @@ void BitmapArranger::arrange(
         bed_stack.n_slices = std::max(bed_stack.n_slices, required_slices);
     };
 
-    // Coarse step (~1mm): scan the bed in large strides, then refine within
-    // one step of the first collision-free spot. Balances speed vs. packing quality.
-    // 2D scan step: 1mm (used for legacy bitmap scanning if needed)
     int scan_step = std::max(1, (int)(scaled<coord_t>(1.0) / res));
-    // 3D scan step: 2mm — fallback after skyline, needs decent resolution
-    // to find gaps in concave 3D arrangements
     int scan_step_3d = std::max(2, (int)(scaled<coord_t>(2.0) / res));
 
-    // Per-plate extruder set — enforces extruder separation in addition to temperature group checks.
     struct PlateExtruders {
         std::set<int> extruder_ids;
     };
     std::vector<PlateExtruders> plate_extruders(1); // one per plate, grows with plates
 
-    // When allow_multi_materials is false, enforces both temperature group
-    // (HighTemp/LowTemp) and extruder identity, matching the libnest2d path.
+    // Must match libnest2d's behavior: check both temperature group and extruder identity
     auto is_material_compatible = [&](int plate_group, int item_type,
                                       int plate_idx, const std::set<int> &item_extruders) -> bool {
         if (params.allow_multi_materials_on_same_plate)
             return true;
 
-        // Temperature compatibility
         if (plate_group >= 0 && item_type >= 0 &&
             plate_group < 2 && item_type < 2 &&
             plate_group != item_type)
@@ -1260,7 +1204,6 @@ void BitmapArranger::arrange(
         return true;
     };
 
-    // Min/max bitmaps per item (populated in Phase 2.5, captured by placement lambdas).
     struct MinMaxBmps {
         BitmapItem min_bmp, max_bmp;
         ItemProfile min_profile, max_profile;
@@ -1268,9 +1211,6 @@ void BitmapArranger::arrange(
     };
     std::vector<MinMaxBmps> item_minmax; // sized to n after Phase 2
 
-    // Top-K skyline candidates — returns multiple positions sorted by preference.
-    // Corner mode (1): sorted by Y ascending (lowest Y first, packs from bottom-left).
-    // Center mode (0): among positions near the lowest Y, prefer X closest to bed center.
     auto find_skyline_topk = [&](const std::vector<int> &skyline,
                                   const ItemProfile &profile, int k) {
         std::vector<std::pair<int,int>> candidates;
@@ -1293,7 +1233,7 @@ void BitmapArranger::arrange(
         }
 
         if (params.placement_bias == 0 && !valid.empty()) {
-            // Center mode: sort by Y (with tolerance), then by distance from bed center
+            // Near-minimum Y candidates first, then prefer closest to center
             int min_y = INT_MAX;
             for (const auto &p : valid)
                 if (p.y < min_y) min_y = p.y;
@@ -1304,7 +1244,6 @@ void BitmapArranger::arrange(
                 bool b_near = (b.y <= min_y + y_tol);
                 if (a_near != b_near) return a_near; // near-minimum candidates first
                 if (a_near && b_near) {
-                    // Both near minimum: prefer closer to center
                     int da = std::abs(a.x + profile.bw / 2 - bed_cx);
                     int db = std::abs(b.x + profile.bw / 2 - bed_cx);
                     if (da != db) return da < db;
@@ -1313,7 +1252,6 @@ void BitmapArranger::arrange(
                 return a.y < b.y; // both far from minimum: sort by Y
             });
         } else {
-            // Corner mode: sort by Y ascending (original behavior)
             std::sort(valid.begin(), valid.end(), [](const PosY &a, const PosY &b) {
                 return a.y < b.y;
             });
@@ -1346,26 +1284,19 @@ void BitmapArranger::arrange(
         plate_extruders[plate_idx].extruder_ids.insert(item_extruders.begin(), item_extruders.end());
     };
 
-    // Try placing an item on a single plate using optimized skyline placement.
-    // Uses min/max pre-filter: max_bmp to find candidates, min_bmp to skip
-    // rotation checks at positions with ample free space.
-    // Selects the rotation with lowest Y (base tight to cluster → overhang inboard).
-    // entry_idx: index into entries[] for min/max lookup.
+    // Selects lowest-Y rotation (base tight to cluster keeps overhang inboard)
     auto try_place_on_plate = [&](const ItemEntry &entry, int entry_idx,
                                   const std::vector<std::pair<BitmapItem, double>> &rot_bmps,
                                   int plate_idx) -> bool {
         auto &plate = plates[plate_idx];
         const auto &mm = item_minmax[entry_idx];
 
-        // Use max envelope to find top-K candidate positions
         if (mm.valid && mm.max_profile.max_y >= 0) {
             auto candidates = find_skyline_topk(plate.skyline, mm.max_profile, 5);
             for (auto [cx, cy] : candidates) {
-                // max_bmp collides → all rotations collide (envelope is the union). Skip.
                 if (collides(plate.bits, bed_w_words, bed_w_px, bed_h_px, mm.max_bmp, cx, cy))
                     continue;
 
-                // min_bmp clear → all rotations fit (core is the intersection). Pick lowest-Y rotation.
                 int best_y = INT_MAX, best_ri = -1;
                 bool min_clear = mm.min_bmp.width_px > 0 &&
                     !collides(plate.bits, bed_w_words, bed_w_px, bed_h_px, mm.min_bmp, cx, cy);
@@ -1417,7 +1348,6 @@ void BitmapArranger::arrange(
             }
         }
 
-        // Fallback: full per-rotation skyline search (no min/max or all top-K positions rejected).
         for (const auto &[bmp, rot] : rot_bmps) {
             if (bmp.width_px <= 0 || bmp.height_px <= 0) continue;
             auto profile = compute_profile(bmp, bed_h_px);
@@ -1450,30 +1380,21 @@ void BitmapArranger::arrange(
         return false;
     };
 
-    // 3D placement: try all rotated stacks on a 3D plate.
-    // Best-rotation selection: tries all rotations at top-K skyline candidates,
-    // picks the rotation with lowest Y (base closest to cluster → overhang inboard).
-    // No per-rotation center-out fallback — rejects go to batch Pass 2.
+    // Rejects go to batch Pass 2 rather than expensive per-rotation center-out fallback
     auto try_place_on_plate_3d = [&](const ItemEntry &entry,
                                       const std::vector<std::pair<SliceStack, double>> &rot_stacks,
                                       int plate_idx) -> bool {
         auto &bed_stack = plates_3d[plate_idx].stack;
         if (bed_stack.slices.empty()) return false;
 
-        // Ensure bed stack covers the tallest rotation
         int max_item_slices = 0;
         for (const auto &[stack, rot] : rot_stacks)
             max_item_slices = std::max(max_item_slices, stack.n_slices);
         if (max_item_slices > 0)
             ensure_bed_height(bed_stack, max_item_slices);
 
-        // Use cached skyline from PlateState3D (maintained incrementally)
         const auto &sky = plates_3d[plate_idx].skyline;
 
-        // Per-rotation skyline: each rotation gets its own skyline search with
-        // its own width constraint. Collect all valid placements, pick lowest Y
-        // (base tight to cluster, overhang inboard). If skyline fails for all
-        // rotations, try center-out fallback per rotation.
         int best_cx = -1, best_cy = INT_MAX, best_ri = -1;
 
         for (size_t ri = 0; ri < rot_stacks.size(); ri++) {
@@ -1508,7 +1429,7 @@ void BitmapArranger::arrange(
             arrangables[entry.orig_idx].rotation = rot;
             arrangables[entry.orig_idx].bed_idx = plate_idx;
             stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, best_cx, best_cy, stamp_excludes);
-            // Update cached skyline incrementally from placed item's bottom slice
+
             auto profile = compute_profile(item_s0, bed_h_px);
             for (const auto &[col, top] : profile.top_pairs) {
                 int c = best_cx + col;
@@ -1521,7 +1442,6 @@ void BitmapArranger::arrange(
             return true;
         }
 
-        // Skyline failed all rotations — center-out fallback per rotation
         for (const auto &[stack, rot] : rot_stacks) {
             if (stack.slices.empty()) continue;
             auto result = find_placement_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, scan_step_3d);
@@ -1535,7 +1455,7 @@ void BitmapArranger::arrange(
                 arrangables[entry.orig_idx].rotation = rot;
                 arrangables[entry.orig_idx].bed_idx = plate_idx;
                 stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
-                // Update cached skyline incrementally from placed item's bottom slice
+    
                 auto prof = compute_profile(item_s0, bed_h_px);
                 for (const auto &[col, top] : prof.top_pairs) {
                     int c = px + col;
@@ -1549,7 +1469,6 @@ void BitmapArranger::arrange(
             }
         }
 
-        // All failed — reject for batch Pass 2
         return false;
     };
 
@@ -1558,7 +1477,7 @@ void BitmapArranger::arrange(
     constexpr int MAX_PLATES = 36;
     int n = (int)entries.size();
 
-    // --- Phase 1: Compute shapes — rasterize each item's triangles at 0° ---
+    // --- Phase 1: Compute shapes --- convert triangle meshes to collision bitmaps
     std::vector<BitmapItem> base_bitmaps(n);
     std::vector<SliceStack> base_stacks(n);
     {
@@ -1591,7 +1510,7 @@ void BitmapArranger::arrange(
 
         if (rast_cancelled.load()) return;
 
-        // Report progress from main thread (wxWidgets is not thread-safe)
+        // wxWidgets is not thread-safe — report progress from main thread only
         if (params.progressind)
             params.progressind(n, " (computing shapes)");
     }
@@ -1607,10 +1526,8 @@ void BitmapArranger::arrange(
         t_phase_start = t_now;
     }
 
-    // --- Phase 2: Prepare rotations — rotate each 0° bitmap to all candidate angles ---
-    // rot_bmps_all[i] = vector of (BitmapItem, angle) for item i
+    // --- Phase 2: Prepare rotations --- pre-rotate bitmaps so placement only tests positions
     std::vector<std::vector<std::pair<BitmapItem, double>>> rot_bmps_all(n);
-    // rot_stacks_all[i] = vector of (SliceStack, angle) for 3D items
     std::vector<std::vector<std::pair<SliceStack, double>>> rot_stacks_all(n);
 
     std::atomic<int> rot_progress{0};
@@ -1622,13 +1539,11 @@ void BitmapArranger::arrange(
                 if (rot_cancelled.load(std::memory_order_relaxed)) break;
 
                 if (!base_stacks[i].slices.empty()) {
-                    // 3D items rotate the full SliceStack; 2D items rotate a single BitmapItem.
                     rot_stacks_all[i].push_back({base_stacks[i], 0.});
                     for (size_t ri = 1; ri < rotations.size(); ri++) {
                         auto rstack = rotate_stack(base_stacks[i], rotations[ri], res);
                         rot_stacks_all[i].push_back({std::move(rstack), rotations[ri]});
                     }
-                    // Also build the 2D bitmap for area estimation and min/max (Phase 2.5).
                     auto &base = base_bitmaps[i];
                     if (base.width_px > 0 && base.height_px > 0) {
                         rot_bmps_all[i].push_back({base, 0.});
@@ -1669,16 +1584,13 @@ void BitmapArranger::arrange(
         t_phase_start = t_now;
     }
 
-    // Release triangle geometry — rasterized bitmaps are the working representation now.
     for (auto &entry : entries) {
         entry.concave_triangles.clear();
         entry.concave_z.clear();
     }
 
-    // --- Phase 2.5: Precompute min/max bitmaps per item ---
-    // min_bmp = AND of all rotations (item core — if this collides, nothing works)
-    // max_bmp = OR of all rotations (item envelope — if this doesn't collide, anything works)
-    // These eliminate per-rotation collision checks for ~80% of candidate positions.
+    // --- Phase 2.5: Precompute min/max envelopes --- eliminates ~80% of per-rotation collision checks
+    // min_bmp = AND of all rotations (core), max_bmp = OR of all rotations (envelope)
     item_minmax.resize(n);
 
     for (int i = 0; i < n; i++) {
@@ -1695,13 +1607,10 @@ void BitmapArranger::arrange(
         std::vector<uint64_t> max_bits((size_t)env_ww * env_h, 0);
         std::vector<uint64_t> min_bits((size_t)env_ww * env_h, ~uint64_t(0));
 
-        // Center each rotation bitmap in the envelope frame, then OR/AND.
-        // Each bitmap is centered: offset = (env_w - bmp_w) / 2.
         for (const auto &[bmp, rot] : rot_bmps_all[i]) {
             int dx = (env_w - bmp.width_px) / 2;
             int dy = (env_h - bmp.height_px) / 2;
 
-            // Temporary: stamp this rotation into an envelope-sized bitmap
             std::vector<uint64_t> centered((size_t)env_ww * env_h, 0);
             for (int py = 0; py < bmp.height_px; py++) {
                 int ey = py + dy;
@@ -1721,7 +1630,6 @@ void BitmapArranger::arrange(
             }
         }
 
-        // Anchor the envelope's offset to the first rotation's center.
         auto &ref_bmp = rot_bmps_all[i][0].first;
         coord_t center_x = ref_bmp.offset_x + (coord_t)(ref_bmp.width_px * res / 2);
         coord_t center_y = ref_bmp.offset_y + (coord_t)(ref_bmp.height_px * res / 2);
@@ -1758,7 +1666,6 @@ void BitmapArranger::arrange(
         t_phase_start = t_now;
     }
 
-    // Pixel count of the 0° bitmap, used to skip plates with insufficient free area.
     std::vector<int> item_est_px(n, 0);
     for (int i = 0; i < n; i++) {
         if (rot_bmps_all[i].empty()) continue;
@@ -1771,10 +1678,7 @@ void BitmapArranger::arrange(
         }
     }
 
-    // --- Phase 3: Place parts — PLATE-CENTRIC filling ---
-    // Fill one plate completely (largest to smallest), then move on.
-    // Once the smallest remaining item can't fit, the plate is full.
-    // No backtracking, no re-scanning closed plates.
+    // --- Phase 3: Place parts --- fill one plate completely before moving to the next
     int placed_count = 0;
     int failed_count = 0;
 
@@ -1813,7 +1717,6 @@ void BitmapArranger::arrange(
         s0.width_px = bed_w_px;
         s0.height_px = bed_h_px;
         stamp_excludes(s0.bits);
-        // Initialize skyline from exclude-stamped bottom slice
         p3d.skyline.assign(bed_w_px, 0);
         for (int x = 0; x < bed_w_px; x++) {
             for (int y = bed_h_px - 1; y >= 0; y--) {
@@ -1902,10 +1805,7 @@ void BitmapArranger::arrange(
         t_phase_start = t_now;
     }
 
-    // --- Phase 3b: Batch reject placement ---
-    // Items that skyline couldn't place get one batch scan per plate.
-    // Uses the center-out bitmap/3D scan but runs once for ALL rejects
-    // instead of once per item. Amortizes the expensive bed scan.
+    // --- Phase 3b: Batch reject placement --- center-out fallback for skyline failures
     {
         std::vector<int> rejects;
         for (int i = 0; i < n; i++)
@@ -1914,7 +1814,6 @@ void BitmapArranger::arrange(
         if (!rejects.empty()) {
             ARRANGE_LOG("Phase 3b: " << rejects.size() << " rejects, batch placement");
 
-            // For each reject, try center-out fallback on all existing plates
             for (int idx : rejects) {
                 if (params.stopcondition && params.stopcondition()) break;
                 auto &entry = entries[idx];
@@ -1947,7 +1846,7 @@ void BitmapArranger::arrange(
                                 arrangables[entry.orig_idx].rotation = rot;
                                 arrangables[entry.orig_idx].bed_idx = pi;
                                 stamp_3d(bed_stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
-                                // Update cached skyline incrementally
+                
                                 auto prof = compute_profile(item_s0, bed_h_px);
                                 for (const auto &[col, top] : prof.top_pairs) {
                                     int c = px + col;
@@ -2001,7 +1900,6 @@ void BitmapArranger::arrange(
                     item_placed[idx] = true;
                     placed_count++;
                 } else if (params.allow_multi_plate) {
-                    // Create new plate for this reject (if under limit)
                     int n_cur = use_3d ? (int)plates_3d.size() : (int)plates.size();
                     if (n_cur >= MAX_PLATES) continue; // all plates full
                     int new_pi = use_3d ? new_3d_plate() : new_2d_plate();
@@ -2031,15 +1929,9 @@ void BitmapArranger::arrange(
         t_phase_start = t_now;
     }
 
-    // --- Phase 4: Compaction — parallel plate search ---
-    // For each item on the last plate, search all earlier plates in parallel
-    // (one TBB task per plate). Each task is read-only on plate state — it
-    // finds a valid position and reports it. The main thread picks the best
-    // result and commits (stamps) sequentially. This is safe because:
-    //   - Find phase: reads plate bits (immutable during search)
-    //   - Commit phase: writes plate bits (serial, one item at a time)
+    // --- Phase 4: Compaction --- relocate items from last plate to earlier plates to free it
+    // Thread safety: find phase is read-only (parallel), commit phase is serial.
 
-    // Read-only: safe to call from parallel TBB tasks during compaction search.
     auto find_compact_bitmap = [&](const BitmapItem &bmp, int plate_idx)
         -> std::optional<std::pair<int,int>>
     {
@@ -2079,7 +1971,6 @@ void BitmapArranger::arrange(
         return std::nullopt;
     };
 
-    // Read-only: safe to call from parallel TBB tasks during compaction search.
     auto find_compact_reverse_skyline = [&](const BitmapItem &bmp, int plate_idx)
         -> std::optional<std::pair<int,int>>
     {
@@ -2140,7 +2031,6 @@ void BitmapArranger::arrange(
         }
     };
 
-    // 3D compaction: relocate items from the last plate onto earlier plates to free it.
     if (use_3d && plates_3d.size() > 1 && params.compaction_mode > 0) {
         bool compacted = true;
         while (compacted && plates_3d.size() > 1) {
@@ -2162,7 +2052,6 @@ void BitmapArranger::arrange(
 
                 bool relocated = false;
 
-                // Determine max item height across rotations
                 int max_item_slices = 0;
                 for (const auto &[stack, rot] : rot_stacks_all[idx])
                     max_item_slices = std::max(max_item_slices, stack.n_slices);
@@ -2171,16 +2060,13 @@ void BitmapArranger::arrange(
                     if (!is_material_compatible(plates_3d[pi].material_group, entries[idx].filament_temp_type, pi, entries[idx].extrude_ids))
                         continue;
 
-                    // Ensure bed covers item height (excludes at all Z levels)
                     ensure_bed_height(plates_3d[pi].stack, max_item_slices);
 
-                    // Try each rotation on this plate
                     for (const auto &[stack, rot] : rot_stacks_all[idx]) {
                         if (stack.slices.empty()) continue;
                         const auto &item_s0 = stack.slices[0];
                         if (item_s0.width_px <= 0 || item_s0.height_px <= 0) continue;
 
-                        // Use cached skyline from PlateState3D
                         auto profile = compute_profile(item_s0, bed_h_px);
                         if (profile.max_y < 0) continue;
 
@@ -2195,7 +2081,7 @@ void BitmapArranger::arrange(
                                 arrangables[entries[idx].orig_idx].rotation = rot;
                                 arrangables[entries[idx].orig_idx].bed_idx = pi;
                                 stamp_3d(plates_3d[pi].stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
-                                // Update cached skyline incrementally
+                
                                 for (const auto &[col, top] : profile.top_pairs) {
                                     int c = px + col;
                                     int v = py + top;
@@ -2209,7 +2095,6 @@ void BitmapArranger::arrange(
                             }
                         }
 
-                        // Skyline failed — try center-out fallback
                         auto fallback = find_placement_3d(plates_3d[pi].stack, bed_w_words, bed_w_px, bed_h_px, stack, scan_step_3d);
                         if (fallback) {
                             auto [px, py] = *fallback;
@@ -2220,7 +2105,7 @@ void BitmapArranger::arrange(
                             arrangables[entries[idx].orig_idx].rotation = rot;
                             arrangables[entries[idx].orig_idx].bed_idx = pi;
                             stamp_3d(plates_3d[pi].stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py, stamp_excludes);
-                            // Update cached skyline incrementally
+            
                             for (const auto &[col, top] : profile.top_pairs) {
                                 int c = px + col;
                                 int v = py + top;
@@ -2267,7 +2152,6 @@ void BitmapArranger::arrange(
             for (int idx : last_plate_items) {
                 if (params.stopcondition && params.stopcondition()) break;
 
-                // Collect all (bmp, rot) candidates for this item
                 struct Candidate { const BitmapItem *bmp; double rot; size_t ri; };
                 std::vector<Candidate> candidates;
                 for (size_t ri = 0; ri < rot_bmps_all[idx].size(); ri++) {
@@ -2277,7 +2161,6 @@ void BitmapArranger::arrange(
                 }
                 if (candidates.empty()) continue;
 
-                // Build list of compatible plates
                 std::vector<int> compat_plates;
                 for (int pi = 0; pi < last_plate; pi++) {
                     if (is_material_compatible(plates[pi].material_group, entries[idx].filament_temp_type, pi, entries[idx].extrude_ids))
@@ -2285,7 +2168,6 @@ void BitmapArranger::arrange(
                 }
                 if (compat_plates.empty()) continue;
 
-                // Result structure for parallel search
                 struct SearchResult {
                     int plate_idx = -1;
                     int px = 0, py = 0;
@@ -2295,11 +2177,7 @@ void BitmapArranger::arrange(
 
                 bool relocated = false;
 
-                // Parallel search across plates — each plate searched independently.
-                // For first-fit: use atomic flag so threads stop early once any plate succeeds.
-                // For best-fit: collect all results, pick lowest Y.
                 if (params.best_fit_compact) {
-                    // Best-fit: search all plates in parallel, collect results
                     std::vector<SearchResult> results(compat_plates.size());
                     std::atomic<bool> any_found{false};
 
@@ -2324,7 +2202,6 @@ void BitmapArranger::arrange(
                     );
 
                     if (any_found.load()) {
-                        // Pick lowest Y among all results
                         int best_idx = -1, best_y = INT_MAX;
                         for (size_t i = 0; i < results.size(); i++) {
                             if (results[i].plate_idx >= 0 && results[i].py < best_y) {
@@ -2334,7 +2211,7 @@ void BitmapArranger::arrange(
                         }
                         if (best_idx >= 0) {
                             auto &r = results[best_idx];
-                            // Re-verify (plate may have changed if another item was committed)
+    
                             for (const auto &cand : candidates) {
                                 if (cand.ri == r.ri) {
                                     if (!collides(plates[r.plate_idx].bits, bed_w_words, bed_w_px, bed_h_px,
@@ -2349,7 +2226,6 @@ void BitmapArranger::arrange(
                         }
                     }
                 } else {
-                    // First-fit: stop as soon as any plate succeeds
                     std::atomic<bool> found_flag{false};
                     SearchResult winner;
                     std::mutex winner_mutex;
@@ -2382,7 +2258,7 @@ void BitmapArranger::arrange(
                     if (found_flag.load()) {
                         for (const auto &cand : candidates) {
                             if (cand.ri == winner.ri) {
-                                // Re-verify after parallel search
+
                                 if (!collides(plates[winner.plate_idx].bits, bed_w_words, bed_w_px, bed_h_px,
                                               *cand.bmp, winner.px, winner.py)) {
                                     commit_compact(idx, *cand.bmp, winner.rot, winner.plate_idx, winner.px, winner.py);
@@ -2422,14 +2298,13 @@ void BitmapArranger::arrange(
     // Requires un-stamp + re-stamp to move items without leaving ghost pixels.
     // Placeholder: the UI option exists but does nothing until this is built.
 
-    // --- Phase 6: Overlap safety check — paranoid failsafe ---
+    // --- Phase 6: Overlap safety check --- re-verify all placements to catch compaction bugs
     // Re-rasterize all placed items per plate and verify no pixel overlaps.
     // If any overlap is found, mark the item as unarranged (Phase 7 rescues it).
     {
         int n_plates_check = use_3d ? (int)plates_3d.size() : (int)plates.size();
         for (int pi = 0; pi < n_plates_check; pi++) {
             if (use_3d) {
-                // 3D overlap check: rebuild a verification SliceStack
                 SliceStack verify_stack;
                 verify_stack.n_slices = 1;
                 BitmapItem vs0;
@@ -2446,7 +2321,6 @@ void BitmapArranger::arrange(
                     if (item_plate != pi) continue;
                     if (rot_stacks_all[i].empty()) continue;
 
-                    // Match stored rotation back to a SliceStack (rotation angle is the only key post-placement)
                     double cur_rot = arrangables[entries[i].orig_idx].rotation;
                     const SliceStack *cur_stack = nullptr;
                     for (const auto &[stack, rot] : rot_stacks_all[i]) {
@@ -2470,7 +2344,6 @@ void BitmapArranger::arrange(
                     }
                 }
             } else {
-                // 2D overlap check
                 std::vector<uint64_t> verify_bits(bed_w_words * bed_h_px, 0);
                 stamp_excludes(verify_bits);
 
@@ -2504,7 +2377,7 @@ void BitmapArranger::arrange(
         }
     }
 
-    // --- Phase 7: Nothing left behind ---
+    // --- Phase 7: Nothing left behind --- rescue orphaned items onto overflow plates
     // If multi-plate is enabled, every item MUST end up on a plate.
     // Any item with bed_idx = -1 gets placed on a new overflow plate
     // via the standard placement path.
@@ -2517,7 +2390,6 @@ void BitmapArranger::arrange(
         if (!orphans.empty()) {
             BOOST_LOG_TRIVIAL(warning) << "BitmapArranger: " << orphans.size()
                                        << " orphaned items — placing on overflow plates";
-            // Find matching entry index for each orphan
             for (int orig_idx : orphans) {
                 int entry_idx = -1;
                 for (int j = 0; j < n; j++) {
@@ -2526,7 +2398,6 @@ void BitmapArranger::arrange(
                 if (entry_idx < 0) continue;
 
                 bool placed = false;
-                // Try all existing plates first
                 int n_existing = use_3d ? (int)plates_3d.size() : (int)plates.size();
                 for (int pi = 0; pi < n_existing && !placed; pi++) {
                     if (use_3d && !rot_stacks_all[entry_idx].empty()) {
@@ -2536,7 +2407,6 @@ void BitmapArranger::arrange(
                     }
                 }
 
-                // No existing plate fit — create an overflow plate for this orphan.
                 if (!placed) {
                     int n_cur = use_3d ? (int)plates_3d.size() : (int)plates.size();
                     if (n_cur < MAX_PLATES) {
@@ -2558,10 +2428,7 @@ void BitmapArranger::arrange(
         }
     }
 
-    // --- Post-placement: Cluster repositioning ---
-    // After packing bottom-left for max density, shift each plate's
-    // cluster to match the placement preference. Items keep relative
-    // positions so no collisions are introduced.
+    // --- Post-placement: Cluster repositioning --- shift packed cluster to match user preference (center/corner)
     {
         int n_plates_shift = use_3d ? (int)plates_3d.size() : (int)plates.size();
         for (int pi = 0; pi < n_plates_shift; pi++) {
@@ -2590,18 +2457,15 @@ void BitmapArranger::arrange(
 
             coord_t shift_x = 0, shift_y = 0;
             if (params.placement_bias == 1) {
-                // Corner: shift cluster to back-right
                 shift_x = effective_bed.max.x() - max_right;
                 shift_y = effective_bed.max.y() - max_top;
             } else {
-                // Center: shift cluster to bed center
                 coord_t cluster_cx = (min_left + max_right) / 2;
                 coord_t cluster_cy = (min_bottom + max_top) / 2;
                 coord_t bed_cx = (effective_bed.min.x() + effective_bed.max.x()) / 2;
                 coord_t bed_cy = (effective_bed.min.y() + effective_bed.max.y()) / 2;
                 shift_x = bed_cx - cluster_cx;
                 shift_y = bed_cy - cluster_cy;
-                // Clamp so nothing goes out of bounds
                 shift_x = std::max(shift_x, effective_bed.min.x() - min_left);
                 shift_x = std::min(shift_x, effective_bed.max.x() - max_right);
                 shift_y = std::max(shift_y, effective_bed.min.y() - min_bottom);
