@@ -2072,7 +2072,13 @@ void BitmapArranger::arrange(
         }
     };
 
-    if (use_3d && plates_3d.size() > 1 && params.compaction_mode > 0) {
+    // Skip compaction when keep-plates is active — compaction moves items between
+    // plates to reduce plate count, which contradicts keep-plates' preservation goal.
+    bool has_preferred_plates = false;
+    for (int i = 0; i < n; i++)
+        if (entries[i].preferred_plate >= 0) { has_preferred_plates = true; break; }
+
+    if (use_3d && plates_3d.size() > 1 && params.compaction_mode > 0 && !has_preferred_plates) {
         bool compacted = true;
         while (compacted && plates_3d.size() > 1) {
             compacted = false;
@@ -2175,7 +2181,7 @@ void BitmapArranger::arrange(
         }
     }
 
-    if (!use_3d && plates.size() > 1 && params.compaction_mode > 0) {
+    if (!use_3d && plates.size() > 1 && params.compaction_mode > 0 && !has_preferred_plates) {
         bool compacted = true;
         while (compacted && plates.size() > 1) {
             compacted = false;
