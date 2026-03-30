@@ -6243,35 +6243,46 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     ImGui::SameLine();
 
     if (imgui->button(_L("Defaults"))) {
+        settings.use_concave_hulls = true;
         settings.bitmap_resolution_mm = 1.0f;
-        settings.compaction_mode = 3;
-        settings.best_fit_compact = true;
-        settings.rotation_step_deg = 45;
-        settings.enable_rotation = true;
+        settings.allow_multi_plate = true;
+        settings.consolidate_plates = false;
+        settings.avoid_purge_pad = false;
+        settings.purge_pad_mm = 5.0f;
+        settings.purge_pad_edge = 0;
         settings.nesting_3d = false;
         settings.slice_height_mm = 10.0f;
         settings.z_clearance_mm = 2.0f;
-        settings.avoid_purge_pad = true;
-        settings.purge_pad_mm = 5.0f;
-        settings.purge_pad_edge = 0;
-        settings.placement_bias = 1;
+        settings.compaction_mode = 3;
+        settings.best_fit_compact = true;
+        settings.placement_bias = 0; // center
+        settings.enable_rotation = false;
+        settings.rotation_step_deg = 45;
         settings.allow_multi_materials_on_same_plate = true;
+        settings.align_to_y_axis = false;
+        settings.arrange_mode = 0; // Arrange All
+        settings.distance = 0; // auto spacing
 
         settings_out = settings;
         // Save all to config
+        appcfg->set("arrange", concave_key.c_str(), settings_out.use_concave_hulls ? "1" : "0");
         appcfg->set("arrange", "bitmap_resolution_mm", float_to_string_decimal_point(settings_out.bitmap_resolution_mm));
-        appcfg->set("arrange", "compaction_mode", std::to_string(settings_out.compaction_mode));
-        appcfg->set("arrange", "best_fit_compact", settings_out.best_fit_compact ? "1" : "0");
-        appcfg->set("arrange", rot_key.c_str(), settings_out.enable_rotation ? "1" : "0");
-        appcfg->set("arrange", "rotation_step_deg_fff", std::to_string(settings_out.rotation_step_deg));
-        appcfg->set("arrange", "nesting_3d", settings_out.nesting_3d ? "1" : "0");
-        appcfg->set("arrange", "slice_height_mm", float_to_string_decimal_point(settings_out.slice_height_mm));
-        appcfg->set("arrange", "z_clearance_mm", float_to_string_decimal_point(settings_out.z_clearance_mm));
+        appcfg->set("arrange", "allow_multi_plate", settings_out.allow_multi_plate ? "1" : "0");
+        appcfg->set("arrange", "consolidate_plates", settings_out.consolidate_plates ? "1" : "0");
         appcfg->set("arrange", "avoid_purge_pad", settings_out.avoid_purge_pad ? "1" : "0");
         appcfg->set("arrange", "purge_pad_mm", float_to_string_decimal_point(settings_out.purge_pad_mm));
         appcfg->set("arrange", "purge_pad_edge", std::to_string(settings_out.purge_pad_edge));
+        appcfg->set("arrange", "nesting_3d", settings_out.nesting_3d ? "1" : "0");
+        appcfg->set("arrange", "slice_height_mm", float_to_string_decimal_point(settings_out.slice_height_mm));
+        appcfg->set("arrange", "z_clearance_mm", float_to_string_decimal_point(settings_out.z_clearance_mm));
+        appcfg->set("arrange", "compaction_mode", std::to_string(settings_out.compaction_mode));
+        appcfg->set("arrange", "best_fit_compact", settings_out.best_fit_compact ? "1" : "0");
         appcfg->set("arrange", "placement_bias", std::to_string(settings_out.placement_bias));
+        appcfg->set("arrange", rot_key.c_str(), settings_out.enable_rotation ? "1" : "0");
+        appcfg->set("arrange", "rotation_step_deg_fff", std::to_string(settings_out.rotation_step_deg));
         appcfg->set("arrange", multi_material_key.c_str(), settings_out.allow_multi_materials_on_same_plate ? "1" : "0");
+        appcfg->set("arrange", align_to_y_axis_key, settings_out.align_to_y_axis ? "1" : "0");
+        appcfg->set("arrange", "arrange_mode", std::to_string(settings_out.arrange_mode));
         settings_changed = true;
     }
     ImGui::SameLine();
