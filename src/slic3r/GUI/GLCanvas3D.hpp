@@ -505,7 +505,6 @@ public:
         float purge_pad_mm         = 5.f;    // mm to exclude (0-20 range)
         float bitmap_resolution_mm = 1.0f;  // mm per pixel (0.1-2.0)
         int   compaction_mode      = 3;    // 0=none, 1=coarse bitmap, 2=reverse skyline, 3=both
-        bool  gravity_compact      = false;
         bool  best_fit_compact     = true;
         int   placement_bias      = 0;      // 0=center, 1=corner
         bool  nesting_3d           = false;
