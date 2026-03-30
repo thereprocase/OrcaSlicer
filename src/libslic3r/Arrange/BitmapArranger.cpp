@@ -1737,6 +1737,19 @@ void BitmapArranger::arrange(
 
     bool use_3d = params.nesting_3d;
 
+    // Pre-create plates for keep-plates mode so preferred_plate indices are valid.
+    // Without this, an item with preferred_plate=2 would skip plate 0 (the only
+    // plate that exists initially) and never get placed.
+    {
+        int max_preferred = 0;
+        for (int i = 0; i < n; i++)
+            max_preferred = std::max(max_preferred, entries[i].preferred_plate);
+        while ((use_3d ? (int)plates_3d.size() : (int)plates.size()) <= max_preferred) {
+            if (use_3d) new_3d_plate();
+            else new_2d_plate();
+        }
+    }
+
     int current_plate = 0;
 
     for (;;) {
@@ -1783,8 +1796,17 @@ void BitmapArranger::arrange(
         if (remaining == 0) break;
 
         if (!any_placed_this_plate) {
-            if (!params.allow_multi_plate ||
-                (use_3d ? (int)plates_3d.size() : (int)plates.size()) >= MAX_PLATES) {
+            int total_plates = use_3d ? (int)plates_3d.size() : (int)plates.size();
+            // Try advancing to the next existing plate (keep-plates pre-creates them)
+            if (current_plate + 1 < total_plates) {
+                current_plate++;
+                continue;
+            }
+            // No more existing plates — create one if allowed
+            if (params.allow_multi_plate && total_plates < MAX_PLATES) {
+                current_plate = use_3d ? new_3d_plate() : new_2d_plate();
+            } else {
+                // Can't create new plates — give up on remaining items
                 for (int i = 0; i < n; i++) {
                     if (!item_placed[i]) {
                         arrangables[entries[i].orig_idx].bed_idx = -1;
@@ -1794,7 +1816,6 @@ void BitmapArranger::arrange(
                 }
                 break;
             }
-            current_plate = use_3d ? new_3d_plate() : new_2d_plate();
         }
     }
     done:
