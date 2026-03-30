@@ -436,7 +436,6 @@ void ArrangeJob::prepare_keep_plates() {
 
     PartPlateList& plate_list = m_plater->get_partplate_list();
     Model& model = m_plater->model();
-    int locked_plate_count = 0;
 
     // Items on plates get arranged on their current plate.
     // Items not on any plate are ignored.
@@ -466,7 +465,6 @@ void ArrangeJob::prepare_keep_plates() {
             if (plate->is_locked()) {
                 ap.itemid = m_locked.size();
                 m_locked.emplace_back(std::move(ap));
-                locked_plate_count++;
                 continue;
             }
 
@@ -707,7 +705,13 @@ void ArrangeJob::process(Ctl &ctl)
         keep_params.consolidate_plates = false;
 
         for (auto& [plate_idx, group] : plate_groups) {
-            arrangement::arrange(group, m_unselected, bedpts, keep_params);
+            // Filter excludes to only this plate's obstacles (wipe towers have per-plate bed_idx)
+            ArrangePolygons plate_excludes;
+            for (const auto& excl : m_unselected) {
+                if (excl.is_virt_object || excl.bed_idx == plate_idx || excl.bed_idx < 0)
+                    plate_excludes.push_back(excl);
+            }
+            arrangement::arrange(group, plate_excludes, bedpts, keep_params);
 
             for (auto& ap : group) {
                 if (ap.bed_idx >= 0) {
@@ -808,10 +812,16 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
     //BBS: adjust the bed_index, create new plates, get the max bed_index
     for (ArrangePolygon& ap : m_selected) {
         //BBS: partplate postprocess
-        if (only_on_partplate)
+        // Keep-plates and stragglers set bed_idx to PHYSICAL plate indices.
+        // postprocess_bed_index_for_selected assumes LOGICAL indices (skipping locked plates)
+        // and would corrupt the mapping. Skip it for these modes.
+        if (skip_plate_clear) {
+            // bed_idx is already the real plate index — just ensure plates exist
+        } else if (only_on_partplate) {
             plate_list.postprocess_bed_index_for_current_plate(ap);
-        else
+        } else {
             plate_list.postprocess_bed_index_for_selected(ap);
+        }
 
         beds = std::max(ap.bed_idx, beds);
 
