@@ -208,7 +208,6 @@ struct ArrangeParams {
         ret += "\"slice_height_mm\":" + std::to_string(slice_height_mm) + ",";
         ret += "\"z_clearance_mm\":" + std::to_string(z_clearance_mm) + ",";
         ret += "\"compaction_mode\":" + std::to_string(compaction_mode) + ",";
-        ret += "\"gravity_compact\":" + std::to_string(gravity_compact) + ",";
         ret += "\"best_fit_compact\":" + std::to_string(best_fit_compact) + ",";
         ret += "\"placement_bias\":" + std::to_string(placement_bias) + ",";
         ret.pop_back();
