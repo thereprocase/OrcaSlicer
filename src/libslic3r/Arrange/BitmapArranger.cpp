@@ -8,12 +8,7 @@
 #include <mutex>
 #include <set>
 #include <chrono>
-#include <sstream>
-
-#define ARRANGE_LOG(msg) do { \
-    std::ostringstream _oss; _oss << msg; \
-    BOOST_LOG_TRIVIAL(info) << _oss.str(); \
-} while(0)
+#define ARRANGE_LOG(msg) BOOST_LOG_TRIVIAL(info) << msg
 
 // Coordinate systems used in this module:
 //   Scaled coords (coord_t): Slic3r internal units. 1mm = scaled(1.0).
@@ -37,6 +32,46 @@ static inline int ctz64(uint64_t x) {
 // Count trailing zeros. Precondition: x != 0 (callers must guard).
 static inline int ctz64(uint64_t x) { return x ? __builtin_ctzll(x) : 0; }
 #endif
+
+// Fill bits [px_left..px_right] in row py of a bitmap with width_words.
+static inline void fill_span(std::vector<uint64_t> &bits, int width_words, int py, int px_left, int px_right) {
+    int sw = px_left / 64, ew = px_right / 64;
+    int sb = px_left % 64, eb = px_right % 64;
+    size_t row = (size_t)py * width_words;
+    if (sw == ew) {
+        bits[row + sw] |= ((uint64_t(2) << eb) - 1) & ~((uint64_t(1) << sb) - 1);
+    } else {
+        bits[row + sw] |= ~((uint64_t(1) << sb) - 1);
+        for (int w = sw + 1; w < ew; w++) bits[row + w] = ~uint64_t(0);
+        bits[row + ew] |= (uint64_t(2) << eb) - 1;
+    }
+}
+
+// Dilate all set pixels by inflate_px in all directions.
+static void dilate_bitmap(std::vector<uint64_t> &bits, int width_words, int width_px, int height_px, int inflate_px) {
+    std::vector<uint64_t> dilated = bits;
+    for (int py = 0; py < height_px; py++) {
+        for (int wx = 0; wx < width_words; wx++) {
+            uint64_t word = bits[(size_t)py * width_words + wx];
+            if (word == 0) continue;
+            while (word) {
+                int bit = ctz64(word);
+                int px = wx * 64 + bit;
+                for (int dy = -inflate_px; dy <= inflate_px; dy++) {
+                    int ny = py + dy;
+                    if (ny < 0 || ny >= height_px) continue;
+                    for (int dx = -inflate_px; dx <= inflate_px; dx++) {
+                        int nx = px + dx;
+                        if (nx < 0 || nx >= width_px) continue;
+                        dilated[(size_t)ny * width_words + nx / 64] |= (uint64_t(1) << (nx % 64));
+                    }
+                }
+                word &= word - 1;
+            }
+        }
+    }
+    bits = std::move(dilated);
+}
 
 namespace Slic3r { namespace arrangement {
 
@@ -103,17 +138,7 @@ BitmapArranger::BitmapItem BitmapArranger::rasterize(
             int px_start = std::max(0, (int)((x_intersections[i] - bb.min.x()) / res));
             int px_end   = std::min(item.width_px - 1,
                                     (int)((x_intersections[i + 1] - bb.min.x()) / res));
-            int sw = px_start / 64, ew = px_end / 64;
-            int sb = px_start % 64, eb = px_end % 64;
-            if (sw == ew) {
-                uint64_t mask = ((uint64_t(2) << eb) - 1) & ~((uint64_t(1) << sb) - 1);
-                item.bits[py * item.width_words + sw] |= mask;
-            } else {
-                item.bits[py * item.width_words + sw] |= ~((uint64_t(1) << sb) - 1);
-                for (int w = sw + 1; w < ew; w++)
-                    item.bits[py * item.width_words + w] = ~uint64_t(0);
-                item.bits[py * item.width_words + ew] |= (uint64_t(2) << eb) - 1;
-            }
+            fill_span(item.bits, item.width_words, py, px_start, px_end);
         }
     }
 
@@ -189,49 +214,14 @@ BitmapArranger::BitmapItem BitmapArranger::rasterize_triangles(
             int px_left  = std::max(0, (int)left);
             int px_right = std::min(item.width_px - 1, (int)right);
 
-            // Word-level span fill: avoids per-pixel branching
-            if (px_left <= px_right) {
-                int sw = px_left / 64, ew = px_right / 64;
-                int sb = px_left % 64, eb = px_right % 64;
-                if (sw == ew) {
-                    uint64_t mask = ((uint64_t(2) << eb) - 1) & ~((uint64_t(1) << sb) - 1);
-                    item.bits[(size_t)py * item.width_words + sw] |= mask;
-                } else {
-                    item.bits[(size_t)py * item.width_words + sw] |= ~((uint64_t(1) << sb) - 1);
-                    for (int w = sw + 1; w < ew; w++)
-                        item.bits[(size_t)py * item.width_words + w] = ~uint64_t(0);
-                    item.bits[(size_t)py * item.width_words + ew] |= (uint64_t(2) << eb) - 1;
-                }
-            }
+            if (px_left <= px_right)
+                fill_span(item.bits, item.width_words, py, px_left, px_right);
         }
     }
 
-    // Dilate by inflate_px pixels: expands each set pixel outward to add spacing.
     if (inflation > 0) {
         int inflate_px = std::max(1, (int)(inflation * inv_res));
-        std::vector<uint64_t> dilated = item.bits; // copy
-        for (int py = 0; py < item.height_px; py++) {
-            for (int wx = 0; wx < item.width_words; wx++) {
-                uint64_t word = item.bits[(size_t)py * item.width_words + wx];
-                if (word == 0) continue;
-                // Expand each set bit in all directions
-                while (word) {
-                    int bit = ctz64(word);
-                    int px = wx * 64 + bit;
-                    for (int dy = -inflate_px; dy <= inflate_px; dy++) {
-                        int ny = py + dy;
-                        if (ny < 0 || ny >= item.height_px) continue;
-                        for (int dx = -inflate_px; dx <= inflate_px; dx++) {
-                            int nx = px + dx;
-                            if (nx < 0 || nx >= item.width_px) continue;
-                            dilated[(size_t)ny * item.width_words + nx / 64] |= (uint64_t(1) << (nx % 64));
-                        }
-                    }
-                    word &= word - 1;
-                }
-            }
-        }
-        item.bits = std::move(dilated);
+        dilate_bitmap(item.bits, item.width_words, item.width_px, item.height_px, inflate_px);
     }
 
     return item;
@@ -294,9 +284,7 @@ BitmapArranger::BitmapItem BitmapArranger::rotate_bitmap(
     return dst;
 }
 
-// ============================================================
-// 3D-aware nesting: Z-slice collision
-// ============================================================
+// --- 3D-aware nesting: Z-slice collision ---
 
 BitmapArranger::SliceStack BitmapArranger::rasterize_slices(
     const Points &tri_verts, const std::vector<float> &tri_z,
@@ -391,46 +379,14 @@ BitmapArranger::SliceStack BitmapArranger::rasterize_slices(
                 int px_left  = std::max(0, (int)left);
                 int px_right = std::min(global_w - 1, (int)right);
 
-                if (px_left <= px_right) {
-                    int sw = px_left / 64, ew = px_right / 64;
-                    int sb = px_left % 64, eb = px_right % 64;
-                    if (sw == ew) {
-                        uint64_t mask = ((uint64_t(2) << eb) - 1) & ~((uint64_t(1) << sb) - 1);
-                        item.bits[(size_t)py * global_ww + sw] |= mask;
-                    } else {
-                        item.bits[(size_t)py * global_ww + sw] |= ~((uint64_t(1) << sb) - 1);
-                        for (int w = sw + 1; w < ew; w++)
-                            item.bits[(size_t)py * global_ww + w] = ~uint64_t(0);
-                        item.bits[(size_t)py * global_ww + ew] |= (uint64_t(2) << eb) - 1;
-                    }
-                }
+                if (px_left <= px_right)
+                    fill_span(item.bits, global_ww, py, px_left, px_right);
             }
         }
 
         if (inflation > 0) {
             int inflate_px = std::max(1, (int)(inflation * inv_res));
-            std::vector<uint64_t> dilated = item.bits;
-            for (int py = 0; py < global_h; py++) {
-                for (int wx = 0; wx < global_ww; wx++) {
-                    uint64_t word = item.bits[(size_t)py * global_ww + wx];
-                    if (word == 0) continue;
-                    while (word) {
-                        int bit = ctz64(word);
-                        int px = wx * 64 + bit;
-                        for (int dy = -inflate_px; dy <= inflate_px; dy++) {
-                            int ny = py + dy;
-                            if (ny < 0 || ny >= global_h) continue;
-                            for (int dx = -inflate_px; dx <= inflate_px; dx++) {
-                                int nx = px + dx;
-                                if (nx < 0 || nx >= global_w) continue;
-                                dilated[(size_t)ny * global_ww + nx / 64] |= (uint64_t(1) << (nx % 64));
-                            }
-                        }
-                        word &= word - 1;
-                    }
-                }
-            }
-            item.bits = std::move(dilated);
+            dilate_bitmap(item.bits, global_ww, global_w, global_h, inflate_px);
         }
 
         return item;
@@ -773,9 +729,7 @@ bool BitmapArranger::collides(
     return false;
 }
 
-// ============================================================
-// Skyline placement — O(bed_width) per item
-// ============================================================
+// --- Skyline placement — O(bed_width) per item ---
 
 BitmapArranger::ItemProfile BitmapArranger::compute_profile(
     const BitmapItem &item, int bed_h)
@@ -1604,9 +1558,7 @@ void BitmapArranger::arrange(
     constexpr int MAX_PLATES = 36;
     int n = (int)entries.size();
 
-    // ============================================================
-    // PHASE 1: Compute shapes — rasterize each item's triangles at 0°
-    // ============================================================
+    // --- Phase 1: Compute shapes — rasterize each item's triangles at 0° ---
     std::vector<BitmapItem> base_bitmaps(n);
     std::vector<SliceStack> base_stacks(n);
     {
@@ -1655,9 +1607,7 @@ void BitmapArranger::arrange(
         t_phase_start = t_now;
     }
 
-    // ============================================================
-    // PHASE 2: Prepare rotations — rotate each 0° bitmap to all candidate angles
-    // ============================================================
+    // --- Phase 2: Prepare rotations — rotate each 0° bitmap to all candidate angles ---
     // rot_bmps_all[i] = vector of (BitmapItem, angle) for item i
     std::vector<std::vector<std::pair<BitmapItem, double>>> rot_bmps_all(n);
     // rot_stacks_all[i] = vector of (SliceStack, angle) for 3D items
@@ -1725,9 +1675,7 @@ void BitmapArranger::arrange(
         entry.concave_z.clear();
     }
 
-    // ============================================================
-    // PHASE 2.5: Precompute min/max bitmaps per item
-    // ============================================================
+    // --- Phase 2.5: Precompute min/max bitmaps per item ---
     // min_bmp = AND of all rotations (item core — if this collides, nothing works)
     // max_bmp = OR of all rotations (item envelope — if this doesn't collide, anything works)
     // These eliminate per-rotation collision checks for ~80% of candidate positions.
@@ -1823,12 +1771,10 @@ void BitmapArranger::arrange(
         }
     }
 
-    // ============================================================
-    // PHASE 3: Place parts — PLATE-CENTRIC filling
+    // --- Phase 3: Place parts — PLATE-CENTRIC filling ---
     // Fill one plate completely (largest to smallest), then move on.
     // Once the smallest remaining item can't fit, the plate is full.
     // No backtracking, no re-scanning closed plates.
-    // ============================================================
     int placed_count = 0;
     int failed_count = 0;
 
@@ -1956,9 +1902,7 @@ void BitmapArranger::arrange(
         t_phase_start = t_now;
     }
 
-    // ============================================================
-    // PHASE 3b: Batch reject placement
-    // ============================================================
+    // --- Phase 3b: Batch reject placement ---
     // Items that skyline couldn't place get one batch scan per plate.
     // Uses the center-out bitmap/3D scan but runs once for ALL rejects
     // instead of once per item. Amortizes the expensive bed scan.
@@ -2087,9 +2031,7 @@ void BitmapArranger::arrange(
         t_phase_start = t_now;
     }
 
-    // ============================================================
-    // PHASE 4: Compaction — parallel plate search
-    // ============================================================
+    // --- Phase 4: Compaction — parallel plate search ---
     // For each item on the last plate, search all earlier plates in parallel
     // (one TBB task per plate). Each task is read-only on plate state — it
     // finds a valid position and reports it. The main thread picks the best
@@ -2480,9 +2422,7 @@ void BitmapArranger::arrange(
     // Requires un-stamp + re-stamp to move items without leaving ghost pixels.
     // Placeholder: the UI option exists but does nothing until this is built.
 
-    // ============================================================
-    // PHASE 6: Overlap safety check — paranoid failsafe
-    // ============================================================
+    // --- Phase 6: Overlap safety check — paranoid failsafe ---
     // Re-rasterize all placed items per plate and verify no pixel overlaps.
     // If any overlap is found, mark the item as unarranged (Phase 7 rescues it).
     {
@@ -2564,13 +2504,10 @@ void BitmapArranger::arrange(
         }
     }
 
-    // ============================================================
-    // PHASE 7: Nothing left behind — if multi-plate is enabled,
-    // every item MUST end up on a plate. Any item with bed_idx = -1
-    // gets placed on a new overflow plate via the standard placement
-    // path. This catches items that failed earlier due to collision
-    // bugs, overlap failsafe ejection, or edge cases.
-    // ============================================================
+    // --- Phase 7: Nothing left behind ---
+    // If multi-plate is enabled, every item MUST end up on a plate.
+    // Any item with bed_idx = -1 gets placed on a new overflow plate
+    // via the standard placement path.
     if (params.allow_multi_plate) {
         std::vector<int> orphans;
         for (size_t i = 0; i < arrangables.size(); i++) {
@@ -2621,9 +2558,7 @@ void BitmapArranger::arrange(
         }
     }
 
-    // ============================================================
-    // POST-PLACEMENT: Cluster repositioning
-    // ============================================================
+    // --- Post-placement: Cluster repositioning ---
     // After packing bottom-left for max density, shift each plate's
     // cluster to match the placement preference. Items keep relative
     // positions so no collisions are introduced.
