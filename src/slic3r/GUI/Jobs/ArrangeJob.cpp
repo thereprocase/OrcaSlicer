@@ -713,32 +713,39 @@ void ArrangeJob::process(Ctl &ctl)
         keep_params.allow_multi_plate = false;
         keep_params.consolidate_plates = false;
 
+        // Plate stride for coordinate transforms (global ↔ plate-local)
+        int cols = pl.get_plate_cols();
+        double stride_x = pl.plate_stride_x();
+        double stride_y = pl.plate_stride_y();
+
         for (auto& [plate_idx, group] : plate_groups) {
             if (plate_idx < 0 || plate_idx >= n_plates) continue;
             PartPlate* plate = pl.get_plate(plate_idx);
             if (!plate || plate->is_locked()) {
-                // Locked plates: keep items where they are
                 for (auto& ap : group) m_selected.push_back(std::move(ap));
+                BOOST_LOG_TRIVIAL(info) << "keep-plates: skipping plate " << plate_idx << " (locked)";
                 continue;
             }
 
-            // Build unselected list: items on OTHER plates as locked obstacles
-            ArrangePolygons plate_unselected;
-            for (auto& [other_idx, other_group] : plate_groups) {
-                if (other_idx == plate_idx) continue;
-                for (const auto& ap : other_group) {
-                    ArrangePolygon locked_ap = ap;
-                    plate_unselected.push_back(std::move(locked_ap));
-                }
+            int row = plate_idx / cols;
+            int col = plate_idx % cols;
+
+            // Convert items from GLOBAL to plate-LOCAL coordinates.
+            // prepare_arrange_polygon() returns global positions (including plate stride).
+            // arrange() expects plate-0-local positions (within bed bounds).
+            // postprocess_arrange_polygon() in finalize will add the stride back.
+            for (auto& ap : group) {
+                ap.translation(X) -= scaled<double>(stride_x * col);
+                ap.translation(Y) += scaled<double>(stride_y * row);
+                ap.bed_idx = 0;
             }
 
-            // Add wipe tower for this plate
+            // Exclude areas for this plate only
+            ArrangePolygons plate_unselected;
             if (auto wti = get_wipe_tower(*m_plater, plate_idx)) {
                 ArrangePolygon&& wt_ap = get_wipetower_arrange_poly(&wti);
                 plate_unselected.emplace_back(std::move(wt_ap));
             }
-
-            // Add exclude areas
             const DynamicPrintConfig& current_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
             bool enable_wrapping = current_config.option<ConfigOptionBool>("enable_wrapping_detection")->value;
             pl.preprocess_exclude_areas(plate_unselected, enable_wrapping, plate_idx + 1);
@@ -749,11 +756,13 @@ void ArrangeJob::process(Ctl &ctl)
                 ctl.update_status(std::min(pct, 99), _u8L("Arranging") + str);
             };
 
-            // Arrange this plate's items
+            BOOST_LOG_TRIVIAL(info) << "keep-plates: arranging plate " << plate_idx
+                                    << " (" << group.size() << " items)";
+
             arrangement::arrange(group, plate_unselected, bedpts, keep_params);
             items_done += (int)group.size();
 
-            // All items stay on this plate
+            // Restore plate assignment — postprocess_arrange_polygon adds stride back
             for (auto& ap : group) {
                 ap.bed_idx = plate_idx;
                 m_selected.push_back(std::move(ap));
