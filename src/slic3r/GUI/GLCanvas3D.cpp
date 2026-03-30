@@ -5927,6 +5927,8 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         // Gray out checkboxes that conflict with the current arrange mode.
         // 0=Arrange All, 1=Keep Plates, 2=This Plate, 3=Stragglers
         bool mode_disables_checkboxes = (settings.arrange_mode >= 1);
+        // Debug: show current mode value
+        imgui->text_colored(ImVec4(1.f, 1.f, 0.f, 0.7f), std::string("mode=" + std::to_string(settings.arrange_mode)).c_str());
         if (!settings_out.use_concave_hulls || mode_disables_checkboxes)
             imgui->disabled_begin(true);
 
