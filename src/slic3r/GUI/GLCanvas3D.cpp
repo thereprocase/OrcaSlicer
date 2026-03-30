@@ -1203,6 +1203,10 @@ void GLCanvas3D::load_arrange_settings()
     if (!arrange_mode_str.empty())
         m_arrange_settings_fff.arrange_mode = std::clamp(safe_stoi(arrange_mode_str, 0), 0, 3);
 
+    std::string align_y_str = wxGetApp().app_config->get("arrange", "align_to_y_axis");
+    if (!align_y_str.empty())
+        m_arrange_settings_fff.align_to_y_axis = (align_y_str == "1" || align_y_str == "true");
+
     //BBS: add specific arrange settings
     m_arrange_settings_fff_seq_print.is_seq_print = true;
 }
@@ -5950,14 +5954,15 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
             ImGui::SetTooltip("%s", _u8L("Center: cluster parts toward the middle of the bed.\n"
                                          "Corner: pack toward back-right, away from purge zone.").c_str());
 
-        if (imgui->bbl_checkbox(_L("Separate materials"), settings.allow_multi_materials_on_same_plate)) {
+        if (imgui->bbl_checkbox(_L("Mix materials on plate"), settings.allow_multi_materials_on_same_plate)) {
             settings_out.allow_multi_materials_on_same_plate = settings.allow_multi_materials_on_same_plate;
             appcfg->set("arrange", multi_material_key.c_str(), settings_out.allow_multi_materials_on_same_plate ? "1" : "0");
             settings_changed = true;
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", _u8L("When checked, parts using different filaments\n"
-                                         "can share the same plate.").c_str());
+                                         "can share the same plate.\n"
+                                         "Uncheck to separate by material.").c_str());
     }
     pop_section_style();
 

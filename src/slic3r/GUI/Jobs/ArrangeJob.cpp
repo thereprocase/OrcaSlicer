@@ -713,12 +713,17 @@ void ArrangeJob::process(Ctl &ctl)
         keep_params.allow_multi_plate = true;  // overflow to extra beds if plate can't fit all items
         keep_params.consolidate_plates = false;
 
+        // Overflow plates start after all existing plates; running counter
+        // prevents collisions when multiple source plates overflow.
+        int overflow_base = n_plates;
+
         // Plate stride for coordinate transforms (global ↔ plate-local)
         int cols = pl.get_plate_cols();
         double stride_x = pl.plate_stride_x();
         double stride_y = pl.plate_stride_y();
 
         for (auto& [plate_idx, group] : plate_groups) {
+            if (params.stopcondition && params.stopcondition()) break;
             if (plate_idx < 0 || plate_idx >= n_plates) continue;
             PartPlate* plate = pl.get_plate(plate_idx);
             if (!plate || plate->is_locked()) {
@@ -762,22 +767,34 @@ void ArrangeJob::process(Ctl &ctl)
             arrangement::arrange(group, plate_unselected, bedpts, keep_params);
             items_done += (int)group.size();
 
-            // Map results: bed_idx 0 = stays on this plate, bed_idx > 0 = overflow
-            // Track highest overflow bed to create new physical plates later
+            // Map results: bed_idx 0 = placed on this plate, >0 = overflow, <0 = unarranged
             int overflow_count = 0;
             for (auto& ap : group) {
-                if (ap.bed_idx <= 0) {
-                    ap.bed_idx = plate_idx;  // stays on original plate
-                } else {
-                    // Overflow — map to new plates after all existing ones
-                    ap.bed_idx = n_plates + ap.bed_idx - 1;
+                if (ap.bed_idx == 0) {
+                    ap.bed_idx = plate_idx;
+                } else if (ap.bed_idx > 0) {
+                    // Overflow — map to unique new plates using running counter
+                    ap.bed_idx = overflow_base + ap.bed_idx - 1;
                     overflow_count++;
+                } else {
+                    // Unarranged (bed_idx = -1) — arranger couldn't place it.
+                    // Put at plate origin so user can see and fix it.
+                    ap.bed_idx = plate_idx;
+                    ap.translation = {0, 0};
+                    BOOST_LOG_TRIVIAL(warning) << "keep-plates: item on plate " << plate_idx
+                                               << " could not be placed, sent to origin";
                 }
                 m_selected.push_back(std::move(ap));
             }
-            if (overflow_count > 0)
+            // Advance overflow base so next plate's overflows don't collide
+            if (overflow_count > 0) {
+                int max_overflow_bed = 0;
+                for (const auto& ap : m_selected)
+                    max_overflow_bed = std::max(max_overflow_bed, ap.bed_idx);
+                overflow_base = max_overflow_bed + 1;
                 BOOST_LOG_TRIVIAL(info) << "keep-plates: plate " << plate_idx
-                                        << " overflow: " << overflow_count << " items to new plates";
+                                        << " overflow: " << overflow_count << " items";
+            }
         }
     } else {
         arrangement::arrange(m_selected, m_unselected, bedpts, params);
