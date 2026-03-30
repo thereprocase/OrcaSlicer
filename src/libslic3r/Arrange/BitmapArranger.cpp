@@ -2389,9 +2389,11 @@ void BitmapArranger::arrange(
                     int py = (int)((ty + s0.offset_y - effective_bed.min.y()) / res);
 
                     if (collides_3d(verify_stack, bed_w_words, bed_w_px, bed_h_px, *cur_stack, px, py)) {
-                        BOOST_LOG_TRIVIAL(error) << "BitmapArranger: 3D OVERLAP detected for item "
-                                                 << entries[i].orig_idx << " on plate " << pi;
-                        arrangables[entries[i].orig_idx].bed_idx = -1;
+                        if (entries[i].preferred_plate < 0) {
+                            BOOST_LOG_TRIVIAL(error) << "BitmapArranger: 3D OVERLAP detected for item "
+                                                     << entries[i].orig_idx << " on plate " << pi;
+                            arrangables[entries[i].orig_idx].bed_idx = -1;
+                        }
                     } else {
                         stamp_3d(verify_stack, bed_w_words, bed_w_px, bed_h_px, *cur_stack, px, py, stamp_excludes);
                     }
@@ -2419,9 +2421,13 @@ void BitmapArranger::arrange(
                     int py = (int)((ty + cur_bmp->offset_y - effective_bed.min.y()) / res);
 
                     if (collides(verify_bits, bed_w_words, bed_w_px, bed_h_px, *cur_bmp, px, py)) {
-                        BOOST_LOG_TRIVIAL(error) << "BitmapArranger: OVERLAP detected for item "
-                                                 << entries[i].orig_idx << " on plate " << pi;
-                        arrangables[entries[i].orig_idx].bed_idx = -1;
+                        // Overflow items (placed at corner because they didn't fit) will
+                        // naturally overlap. Don't un-place them — that's intentional.
+                        if (entries[i].preferred_plate < 0) {
+                            BOOST_LOG_TRIVIAL(error) << "BitmapArranger: OVERLAP detected for item "
+                                                     << entries[i].orig_idx << " on plate " << pi;
+                            arrangables[entries[i].orig_idx].bed_idx = -1;
+                        }
                     } else {
                         stamp(verify_bits, bed_w_words, bed_w_px, bed_h_px, *cur_bmp, px, py);
                     }
