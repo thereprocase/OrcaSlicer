@@ -18,8 +18,10 @@ class Job {
 public:
 
     enum JobPrepareState {
-        PREPARE_STATE_DEFAULT = 0,
-        PREPARE_STATE_MENU = 1,
+        PREPARE_STATE_DEFAULT = 0,        // Arrange All
+        PREPARE_STATE_MENU = 1,           // Arrange This Plate
+        PREPARE_STATE_KEEP_PLATES = 2,    // Arrange All (Keep Plates)
+        PREPARE_STATE_STRAGGLERS = 3,     // Place Stragglers
     };
 
     // A controller interface that informs the job about cancellation and

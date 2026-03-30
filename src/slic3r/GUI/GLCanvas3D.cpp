@@ -6154,10 +6154,29 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     }
 
     ImGui::Separator();
-    imgui->text_colored(ImVec4(0.5f, 0.5f, 0.5f, 0.7f), "bitmap arranger dev");
+
+    // Arrangement mode dropdown
+    static int arrange_mode = 0;
+    const char* arrange_mode_labels[] = {
+        "Arrange All",
+        "Arrange All (Keep Plates)",
+        "Arrange This Plate",
+        "Place Stragglers"
+    };
+    ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x);
+    ImGui::Combo("##arrange_mode", &arrange_mode, arrange_mode_labels, IM_ARRAYSIZE(arrange_mode_labels));
+    ImGui::PopItemWidth();
+
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(15.0f, 10.0f));
     if (imgui->button(_L("Arrange"))) {
-        wxGetApp().plater()->set_prepare_state(Job::PREPARE_STATE_DEFAULT);
+        int prepare_state = Job::PREPARE_STATE_DEFAULT;
+        switch (arrange_mode) {
+        case 0: prepare_state = Job::PREPARE_STATE_DEFAULT; break;
+        case 1: prepare_state = Job::PREPARE_STATE_KEEP_PLATES; break;
+        case 2: prepare_state = Job::PREPARE_STATE_MENU; break;
+        case 3: prepare_state = Job::PREPARE_STATE_STRAGGLERS; break;
+        }
+        wxGetApp().plater()->set_prepare_state(prepare_state);
         wxGetApp().plater()->arrange();
     }
 

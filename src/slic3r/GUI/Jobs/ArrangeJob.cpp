@@ -431,6 +431,135 @@ void ArrangeJob::prepare_partplate() {
     plate_list.preprocess_exclude_areas(m_unselected, enable_wrapping, current_plate_index + 1);
 }
 
+void ArrangeJob::prepare_keep_plates() {
+    clear_input();
+
+    PartPlateList& plate_list = m_plater->get_partplate_list();
+    Model& model = m_plater->model();
+    int locked_plate_count = 0;
+
+    // Items on plates get arranged on their current plate.
+    // Items not on any plate are ignored.
+    // Items on locked plates are skipped.
+    for (size_t oidx = 0; oidx < model.objects.size(); ++oidx) {
+        ModelObject* mo = model.objects[oidx];
+        for (size_t i = 0; i < mo->instances.size(); ++i) {
+            ArrangePolygon&& ap = prepare_arrange_polygon(mo->instances[i]);
+
+            // Check if instance is on any plate
+            int plate_idx = -1;
+            for (int pi = 0; pi < (int)plate_list.get_plate_count(); pi++) {
+                PartPlate* plate = plate_list.get_plate(pi);
+                if (plate->contain_instance(oidx, i) || plate->intersect_instance(oidx, i)) {
+                    plate_idx = pi;
+                    break;
+                }
+            }
+
+            if (plate_idx < 0) {
+                // Not on any plate — skip entirely
+                continue;
+            }
+
+            // On a locked plate — skip
+            PartPlate* plate = plate_list.get_plate(plate_idx);
+            if (plate->is_locked()) {
+                ap.itemid = m_locked.size();
+                m_locked.emplace_back(std::move(ap));
+                locked_plate_count++;
+                continue;
+            }
+
+            if (!mo->instances[i]->printable) {
+                ap.itemid = m_unprintable.size();
+                m_unprintable.emplace_back(std::move(ap));
+                continue;
+            }
+
+            // Preserve plate assignment so arranger keeps item on this plate
+            ap.bed_idx = plate_idx;
+            ap.itemid = m_selected.size();
+            m_selected.emplace_back(std::move(ap));
+        }
+    }
+
+    if (m_selected.empty()) {
+        m_plater->get_notification_manager()->push_notification(NotificationType::BBLPlateInfo,
+            NotificationManager::NotificationLevel::WarningNotificationLevel,
+            into_u8(_L("No items on unlocked plates to arrange.")));
+    }
+
+    // Don't allow creating new plates in keep-plates mode
+    params.allow_multi_plate = false;
+
+    prepare_wipe_tower();
+
+    const DynamicPrintConfig& current_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+    bool enable_wrapping = current_config.option<ConfigOptionBool>("enable_wrapping_detection")->value;
+    plate_list.preprocess_exclude_areas(m_unselected, enable_wrapping, MAX_NUM_PLATES);
+}
+
+void ArrangeJob::prepare_stragglers() {
+    clear_input();
+
+    PartPlateList& plate_list = m_plater->get_partplate_list();
+    Model& model = m_plater->model();
+
+    // Items on plates become fixed obstacles.
+    // Items not on any plate get arranged onto new/existing plates.
+    for (size_t oidx = 0; oidx < model.objects.size(); ++oidx) {
+        ModelObject* mo = model.objects[oidx];
+        for (size_t i = 0; i < mo->instances.size(); ++i) {
+            ArrangePolygon&& ap = prepare_arrange_polygon(mo->instances[i]);
+
+            // Check if instance is on any plate
+            bool on_plate = false;
+            for (int pi = 0; pi < (int)plate_list.get_plate_count(); pi++) {
+                PartPlate* plate = plate_list.get_plate(pi);
+                if (plate->contain_instance(oidx, i) || plate->intersect_instance(oidx, i)) {
+                    on_plate = true;
+                    // Fixed obstacle — preserve its position
+                    bool locked = plate_list.preprocess_arrange_polygon(oidx, i, ap, false);
+                    if (!locked && mo->instances[i]->printable) {
+                        ap.itemid = m_unselected.size();
+                        m_unselected.emplace_back(std::move(ap));
+                    } else {
+                        ap.itemid = m_locked.size();
+                        m_locked.emplace_back(std::move(ap));
+                    }
+                    break;
+                }
+            }
+
+            if (!on_plate) {
+                if (!mo->instances[i]->printable) {
+                    ap.itemid = m_unprintable.size();
+                    m_unprintable.emplace_back(std::move(ap));
+                    continue;
+                }
+                // Unassigned item — arrange it
+                ap.bed_idx = arrangement::UNARRANGED;
+                ap.itemid = m_selected.size();
+                m_selected.emplace_back(std::move(ap));
+            }
+        }
+    }
+
+    if (m_selected.empty()) {
+        m_plater->get_notification_manager()->push_notification(NotificationType::BBLPlateInfo,
+            NotificationManager::NotificationLevel::RegularNotificationLevel,
+            into_u8(_L("No unassigned items to place.")));
+    }
+
+    params.allow_multi_plate = true;
+
+    prepare_wipe_tower();
+
+    const DynamicPrintConfig& current_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+    bool enable_wrapping = current_config.option<ConfigOptionBool>("enable_wrapping_detection")->value;
+    plate_list.preprocess_exclude_areas(m_unselected, enable_wrapping, MAX_NUM_PLATES);
+}
+
 //BBS: add partplate logic
 void ArrangeJob::prepare()
 {
@@ -455,8 +584,16 @@ void ArrangeJob::prepare()
         prepare_all();
     }
     else if (state == Job::JobPrepareState::PREPARE_STATE_MENU) {
-        only_on_partplate = true;   // only arrange items on current plate
+        only_on_partplate = true;
         prepare_partplate();
+    }
+    else if (state == Job::JobPrepareState::PREPARE_STATE_KEEP_PLATES) {
+        only_on_partplate = false;
+        prepare_keep_plates();
+    }
+    else if (state == Job::JobPrepareState::PREPARE_STATE_STRAGGLERS) {
+        only_on_partplate = false;
+        prepare_stragglers();
     }
 
 

@@ -1034,6 +1034,7 @@ void BitmapArranger::arrange(
         coord_t inflation;
         int filament_temp_type = -1;
         std::set<int> extrude_ids; // extruder indices used by this object
+        int preferred_plate = -1; // keep-plates mode: only place on this plate
     };
 
     std::vector<ItemEntry> entries;
@@ -1049,6 +1050,7 @@ void BitmapArranger::arrange(
         e.filament_temp_type = arrangables[i].filament_temp_type;
         e.extrude_ids = std::set<int>(arrangables[i].extrude_ids.begin(),
                                        arrangables[i].extrude_ids.end());
+        e.preferred_plate = arrangables[i].bed_idx;
         entries.push_back(std::move(e));
     }
 
@@ -1747,6 +1749,10 @@ void BitmapArranger::arrange(
             auto &entry = entries[i];
             bool placed = false;
 
+            // keep-plates: skip plates that don't match the preferred plate
+            if (entry.preferred_plate >= 0 && current_plate != entry.preferred_plate)
+                continue;
+
             if (use_3d && !rot_stacks_all[i].empty()) {
                 if (is_material_compatible(
                         plates_3d[current_plate].material_group,
@@ -1792,6 +1798,17 @@ void BitmapArranger::arrange(
         }
     }
     done:
+
+    // Keep-plates overflow: items that had a preferred plate but couldn't be placed
+    for (int i = 0; i < n; i++) {
+        if (!item_placed[i] && entries[i].preferred_plate >= 0) {
+            auto &entry = entries[i];
+            arrangables[entry.orig_idx].bed_idx = entry.preferred_plate;
+            arrangables[entry.orig_idx].translation = {effective_bed.min.x(), effective_bed.min.y()};
+            item_placed[i] = true;
+            failed_count++;
+        }
+    }
 
     {
         auto t_now = std::chrono::high_resolution_clock::now();
