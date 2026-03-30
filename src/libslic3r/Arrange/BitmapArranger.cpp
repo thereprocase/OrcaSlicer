@@ -1806,10 +1806,16 @@ void BitmapArranger::arrange(
             if (params.allow_multi_plate && total_plates < MAX_PLATES) {
                 current_plate = use_3d ? new_3d_plate() : new_2d_plate();
             } else {
-                // Can't create new plates — give up on remaining items
+                // Can't create new plates — overflow items to plate origin (0,0)
+                // so the user sees them stacked at the corner with an exclusion warning,
+                // rather than scattered to random positions or silently disappearing.
                 for (int i = 0; i < n; i++) {
                     if (!item_placed[i]) {
-                        arrangables[entries[i].orig_idx].bed_idx = -1;
+                        int overflow_plate = entries[i].preferred_plate >= 0
+                            ? entries[i].preferred_plate : 0;
+                        arrangables[entries[i].orig_idx].bed_idx = overflow_plate;
+                        arrangables[entries[i].orig_idx].translation = {
+                            effective_bed.min.x(), effective_bed.min.y()};
                         item_placed[i] = true;
                         failed_count++;
                     }
