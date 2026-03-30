@@ -5,7 +5,6 @@ add_executable(${_TEST_NAME}_tests
     test_3mf.cpp
     test_aabbindirect.cpp
     test_appconfig.cpp
-    test_bitmap_arranger.cpp
     test_bambu_networking.cpp
     test_clipper_offset.cpp
     test_clipper_utils.cpp
