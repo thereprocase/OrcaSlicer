@@ -5926,7 +5926,9 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
 
         // Gray out checkboxes that conflict with the current arrange mode.
         // 0=Arrange All, 1=Keep Plates, 2=This Plate, 3=Stragglers
-        bool mode_disables_checkboxes = (settings.arrange_mode >= 1);
+        // Only Keep Plates (1) and Stragglers (3) override these checkboxes.
+        // "Arrange This Plate" (2) uses the existing prepare_partplate path which respects them.
+        bool mode_disables_checkboxes = (settings.arrange_mode == 1 || settings.arrange_mode == 3);
         if (!settings_out.use_concave_hulls || mode_disables_checkboxes)
             imgui->disabled_begin(true);
 
@@ -6257,12 +6259,15 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         settings.enable_rotation = false;
         settings.rotation_step_deg = 45;
         settings.allow_multi_materials_on_same_plate = true;
+        settings.avoid_extrusion_cali_region = true;
         settings.align_to_y_axis = false;
         settings.arrange_mode = 0; // Arrange All
         settings.distance = 0; // auto spacing
 
         settings_out = settings;
         // Save all to config
+        appcfg->set("arrange", dist_key.c_str(), float_to_string_decimal_point(settings_out.distance));
+        appcfg->set("arrange", avoid_extrusion_key.c_str(), settings_out.avoid_extrusion_cali_region ? "1" : "0");
         appcfg->set("arrange", concave_key.c_str(), settings_out.use_concave_hulls ? "1" : "0");
         appcfg->set("arrange", "bitmap_resolution_mm", float_to_string_decimal_point(settings_out.bitmap_resolution_mm));
         appcfg->set("arrange", "allow_multi_plate", settings_out.allow_multi_plate ? "1" : "0");

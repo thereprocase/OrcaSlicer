@@ -704,12 +704,11 @@ void ArrangeJob::process(Ctl &ctl)
         auto keep_params = params;
         keep_params.allow_multi_plate = false;
         keep_params.consolidate_plates = false;
-        // Fix progress reporting: m_selected is empty during the loop,
-        // so status_range() would return ~1. Override with total count.
-        int items_done = 0;
-        keep_params.progressind = [&ctl, total_items, &items_done](unsigned num_finished, std::string str) {
-            items_done += num_finished;
-            int pct = total_items > 0 ? (items_done * 100 / (total_items + 1)) : 0;
+        // Progress: num_finished from each arrange call is absolute (within that call).
+        // Track completed items from prior plates, add current plate's progress.
+        int prior_plates_done = 0;
+        keep_params.progressind = [&ctl, total_items, &prior_plates_done](unsigned num_finished, std::string str) {
+            int pct = total_items > 0 ? ((prior_plates_done + (int)num_finished) * 100 / (total_items + 1)) : 0;
             ctl.update_status(std::min(pct, 99), _u8L("Arranging") + str);
         };
 
@@ -732,6 +731,7 @@ void ArrangeJob::process(Ctl &ctl)
                     plate_excludes.push_back(excl);
             }
             arrangement::arrange(group, plate_excludes, bedpts, keep_params);
+            prior_plates_done += (int)group.size();
 
             for (auto& ap : group) {
                 if (ap.bed_idx >= 0) {
