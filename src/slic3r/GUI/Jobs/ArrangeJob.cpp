@@ -696,6 +696,7 @@ void ArrangeJob::process(Ctl &ctl)
         // independently on a single-plate bed. The arranger never sees other plates'
         // items — no guards needed. Overflow items get placed at the plate corner.
         std::map<int, ArrangePolygons> plate_groups;
+        int total_items = (int)m_selected.size();
         for (auto& ap : m_selected)
             plate_groups[ap.bed_idx].push_back(std::move(ap));
         m_selected.clear();
@@ -703,12 +704,31 @@ void ArrangeJob::process(Ctl &ctl)
         auto keep_params = params;
         keep_params.allow_multi_plate = false;
         keep_params.consolidate_plates = false;
+        // Fix progress reporting: m_selected is empty during the loop,
+        // so status_range() would return ~1. Override with total count.
+        int items_done = 0;
+        keep_params.progressind = [&ctl, total_items, &items_done](unsigned num_finished, std::string str) {
+            items_done += num_finished;
+            int pct = total_items > 0 ? (items_done * 100 / (total_items + 1)) : 0;
+            ctl.update_status(std::min(pct, 99), _u8L("Arranging") + str);
+        };
 
         for (auto& [plate_idx, group] : plate_groups) {
-            // Filter excludes to only this plate's obstacles (wipe towers have per-plate bed_idx)
+            // Filter excludes to only this plate's obstacles.
+            // Wipe towers use bedid_unlocked numbering (skips locked plates),
+            // but keep-plates uses physical indices. Convert: count unlocked plates
+            // before plate_idx to get the logical index for matching wipe towers.
+            int logical_idx = 0;
+            {
+                PartPlateList& pl = m_plater->get_partplate_list();
+                for (int pi = 0; pi < plate_idx && pi < (int)pl.get_plate_count(); pi++)
+                    if (!pl.get_plate(pi)->is_locked()) logical_idx++;
+            }
             ArrangePolygons plate_excludes;
             for (const auto& excl : m_unselected) {
-                if (excl.is_virt_object || excl.bed_idx == plate_idx || excl.bed_idx < 0)
+                if (excl.is_virt_object && (excl.bed_idx == logical_idx || excl.bed_idx < 0))
+                    plate_excludes.push_back(excl);
+                else if (!excl.is_virt_object && (excl.bed_idx == plate_idx || excl.bed_idx < 0))
                     plate_excludes.push_back(excl);
             }
             arrangement::arrange(group, plate_excludes, bedpts, keep_params);

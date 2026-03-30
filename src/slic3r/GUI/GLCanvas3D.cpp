@@ -1201,7 +1201,7 @@ void GLCanvas3D::load_arrange_settings()
 
     std::string arrange_mode_str = wxGetApp().app_config->get("arrange", "arrange_mode");
     if (!arrange_mode_str.empty())
-        m_arrange_settings_fff.arrange_mode = safe_stoi(arrange_mode_str, 0);
+        m_arrange_settings_fff.arrange_mode = std::clamp(safe_stoi(arrange_mode_str, 0), 0, 3);
 
     //BBS: add specific arrange settings
     m_arrange_settings_fff_seq_print.is_seq_print = true;
