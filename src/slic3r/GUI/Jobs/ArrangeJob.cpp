@@ -843,9 +843,10 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
         // and would corrupt the mapping. Skip it for these modes.
         if (m_keep_plates_mode) {
             // Keep-plates: bed_idx is already the real physical plate index.
-            // Create plates if somehow needed but don't remap.
+            // Create plates if somehow needed. Use create_plate(true) so grid
+            // column changes reposition existing objects (same sqrt bug as stragglers).
             while (ap.bed_idx >= 0 && ap.bed_idx >= (int)plate_list.get_plate_count())
-                plate_list.create_plate(false);
+                plate_list.create_plate(true);
         } else if (m_stragglers_mode) {
             // Stragglers: bed_idx is already physical (offset past existing plates).
             // Don't use postprocess_bed_index_for_selected — it assumes logical indices.
