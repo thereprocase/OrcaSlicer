@@ -102,7 +102,7 @@ private:
     // Coarse stride + refinement for speed.
     static std::optional<std::pair<int,int>> find_placement_skyline(
         const std::vector<int> &skyline, int bed_w_px, int bed_h,
-        const ItemProfile &profile);
+        const ItemProfile &profile, int placement_bias = 1);
 
     // Legacy bitmap-scanning placement (kept for 3D nesting where skyline doesn't apply).
     static std::optional<std::pair<int,int>> find_placement(

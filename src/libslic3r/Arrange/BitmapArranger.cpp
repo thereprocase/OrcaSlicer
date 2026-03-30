@@ -852,7 +852,7 @@ BitmapArranger::ItemProfile BitmapArranger::compute_profile(
 
 std::optional<std::pair<int,int>> BitmapArranger::find_placement_skyline(
     const std::vector<int> &skyline, int bed_w_px, int bed_h,
-    const ItemProfile &profile)
+    const ItemProfile &profile, int placement_bias)
 {
     if (profile.max_y < 0 || profile.bw > bed_w_px)
         return std::nullopt;
@@ -863,39 +863,106 @@ std::optional<std::pair<int,int>> BitmapArranger::find_placement_skyline(
     constexpr int STRIDE = 8;
     constexpr int REFINE = 10;
 
-    // Coarse pass: evaluate every STRIDE-th position
-    int best_x = -1, best_y = INT_MAX;
-
-    for (int x = 0; x < n_pos; x += STRIDE) {
-        // Compute placement Y: max(skyline[x+col] - bottom[col]) for all columns
+    // Helper: compute placement Y at a given X position
+    auto eval_y = [&](int x) -> int {
         int y = 0;
         for (int c = 0; c < profile.bw; c++) {
             int diff = skyline[x + c] - profile.bottom[c];
             if (diff > y) y = diff;
         }
-        if (y < 0) y = 0;
-        if (y < best_y) {
-            best_y = y;
-            best_x = x;
-            if (y == 0) break; // floor placement — can't do better
+        return std::max(y, 0);
+    };
+
+    if (placement_bias == 1) {
+        // Corner mode: lowest Y, leftmost X (original behavior)
+        int best_x = -1, best_y = INT_MAX;
+
+        for (int x = 0; x < n_pos; x += STRIDE) {
+            int y = eval_y(x);
+            if (y < best_y) {
+                best_y = y;
+                best_x = x;
+                if (y == 0) break; // floor placement, can't improve
+            }
+        }
+
+        if (best_x < 0 || best_y > profile.max_y)
+            return std::nullopt;
+
+        // Refine around coarse winner
+        if (best_y > 0) {
+            int ref_lo = std::max(0, best_x - REFINE);
+            int ref_hi = std::min(n_pos, best_x + REFINE + 1);
+            for (int x = ref_lo; x < ref_hi; x++) {
+                int y = eval_y(x);
+                if (y < best_y) {
+                    best_y = y;
+                    best_x = x;
+                }
+            }
+        }
+
+        if (best_y > profile.max_y)
+            return std::nullopt;
+        return std::make_pair(best_x, best_y);
+    }
+
+    // Center mode: prefer positions with X closest to bed center,
+    // among all candidates at or near the lowest achievable Y.
+    int bed_cx = bed_w_px / 2;  // bed center in pixels
+
+    // Coarse pass: collect all valid positions with their Y values
+    struct PosY { int x, y; };
+    std::vector<PosY> coarse;
+    coarse.reserve(n_pos / STRIDE + 1);
+    int global_min_y = INT_MAX;
+
+    for (int x = 0; x < n_pos; x += STRIDE) {
+        int y = eval_y(x);
+        if (y <= profile.max_y) {
+            coarse.push_back({x, y});
+            if (y < global_min_y) global_min_y = y;
         }
     }
 
-    if (best_x < 0 || best_y > profile.max_y)
+    if (coarse.empty())
         return std::nullopt;
 
-    // Refine around coarse winner
-    if (best_y > 0) {
+    // Allow candidates within a small Y tolerance of the minimum.
+    // This lets center-biased selection avoid a 1-pixel-better corner
+    // position when a near-equal center position exists.
+    int y_tolerance = std::max(2, global_min_y / 10);
+    int y_threshold = global_min_y + y_tolerance;
+
+    // Among candidates within Y threshold, pick closest to bed center X
+    int best_x = -1, best_y = INT_MAX;
+    int best_dist = INT_MAX;
+
+    for (const auto &p : coarse) {
+        if (p.y > y_threshold) continue;
+        int item_cx = p.x + profile.bw / 2; // item center X at this position
+        int dist = std::abs(item_cx - bed_cx);
+        if (dist < best_dist || (dist == best_dist && p.y < best_y)) {
+            best_dist = dist;
+            best_y = p.y;
+            best_x = p.x;
+        }
+    }
+
+    if (best_x < 0)
+        return std::nullopt;
+
+    // Refine around winner at pixel resolution
+    {
         int ref_lo = std::max(0, best_x - REFINE);
         int ref_hi = std::min(n_pos, best_x + REFINE + 1);
         for (int x = ref_lo; x < ref_hi; x++) {
-            int y = 0;
-            for (int c = 0; c < profile.bw; c++) {
-                int diff = skyline[x + c] - profile.bottom[c];
-                if (diff > y) y = diff;
-            }
-            if (y < 0) y = 0;
-            if (y < best_y) {
+            int y = eval_y(x);
+            if (y > profile.max_y) continue;
+            int item_cx = x + profile.bw / 2;
+            int dist = std::abs(item_cx - bed_cx);
+            if (dist < best_dist || (dist == best_dist && y < best_y)) {
+                best_dist = dist;
                 best_y = y;
                 best_x = x;
             }
@@ -904,7 +971,6 @@ std::optional<std::pair<int,int>> BitmapArranger::find_placement_skyline(
 
     if (best_y > profile.max_y)
         return std::nullopt;
-
     return std::make_pair(best_x, best_y);
 }
 
@@ -1286,7 +1352,9 @@ void BitmapArranger::arrange(
     };
     std::vector<MinMaxBmps> item_minmax; // sized to n after Phase 2
 
-    // Top-K skyline candidates — returns multiple positions sorted by Y (lowest first)
+    // Top-K skyline candidates — returns multiple positions sorted by preference.
+    // Corner mode (1): sorted by Y ascending (lowest Y first, packs from bottom-left).
+    // Center mode (0): among positions near the lowest Y, prefer X closest to bed center.
     auto find_skyline_topk = [&](const std::vector<int> &skyline,
                                   const ItemProfile &profile, int k) {
         std::vector<std::pair<int,int>> candidates;
@@ -1307,9 +1375,34 @@ void BitmapArranger::arrange(
             if (y <= profile.max_y)
                 valid.push_back({x, y});
         }
-        std::sort(valid.begin(), valid.end(), [](const PosY &a, const PosY &b) {
-            return a.y < b.y;
-        });
+
+        if (params.placement_bias == 0 && !valid.empty()) {
+            // Center mode: sort by Y (with tolerance), then by distance from bed center
+            int min_y = INT_MAX;
+            for (const auto &p : valid)
+                if (p.y < min_y) min_y = p.y;
+            int y_tol = std::max(2, min_y / 10);
+            int bed_cx = bed_w_px / 2;
+            std::sort(valid.begin(), valid.end(), [&](const PosY &a, const PosY &b) {
+                bool a_near = (a.y <= min_y + y_tol);
+                bool b_near = (b.y <= min_y + y_tol);
+                if (a_near != b_near) return a_near; // near-minimum candidates first
+                if (a_near && b_near) {
+                    // Both near minimum: prefer closer to center
+                    int da = std::abs(a.x + profile.bw / 2 - bed_cx);
+                    int db = std::abs(b.x + profile.bw / 2 - bed_cx);
+                    if (da != db) return da < db;
+                    return a.y < b.y; // tie-break by Y
+                }
+                return a.y < b.y; // both far from minimum: sort by Y
+            });
+        } else {
+            // Corner mode: sort by Y ascending (original behavior)
+            std::sort(valid.begin(), valid.end(), [](const PosY &a, const PosY &b) {
+                return a.y < b.y;
+            });
+        }
+
         int take = std::min(k, (int)valid.size());
         for (int i = 0; i < take; i++) {
             int best_x = valid[i].x, best_y = valid[i].y;
@@ -1414,7 +1507,7 @@ void BitmapArranger::arrange(
             auto profile = compute_profile(bmp, bed_h_px);
             if (profile.max_y < 0) continue;
 
-            auto result = find_placement_skyline(plate.skyline, bed_w_px, bed_h_px, profile);
+            auto result = find_placement_skyline(plate.skyline, bed_w_px, bed_h_px, profile, params.placement_bias);
             if (result) {
                 auto [px, py] = *result;
                 if (collides(plate.bits, bed_w_words, bed_w_px, bed_h_px, bmp, px, py))
@@ -1476,7 +1569,7 @@ void BitmapArranger::arrange(
             auto profile = compute_profile(item_s0, bed_h_px);
             if (profile.max_y < 0) continue;
 
-            auto result = find_placement_skyline(sky, bed_w_px, bed_h_px, profile);
+            auto result = find_placement_skyline(sky, bed_w_px, bed_h_px, profile, params.placement_bias);
             if (result) {
                 auto [px, py] = *result;
                 if (px + item_s0.width_px > bed_w_px) continue;
@@ -2187,7 +2280,7 @@ void BitmapArranger::arrange(
                         auto profile = compute_profile(item_s0, bed_h_px);
                         if (profile.max_y < 0) continue;
 
-                        auto result = find_placement_skyline(plates_3d[pi].skyline, bed_w_px, bed_h_px, profile);
+                        auto result = find_placement_skyline(plates_3d[pi].skyline, bed_w_px, bed_h_px, profile, params.placement_bias);
                         if (result) {
                             auto [px, py] = *result;
                             if (!collides_3d(plates_3d[pi].stack, bed_w_words, bed_w_px, bed_h_px, stack, px, py)) {

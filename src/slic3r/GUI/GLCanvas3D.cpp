@@ -1195,6 +1195,10 @@ void GLCanvas3D::load_arrange_settings()
     if (!best_fit_str.empty())
         m_arrange_settings_fff.best_fit_compact = (best_fit_str == "1" || best_fit_str == "true");
 
+    std::string placement_bias_str = wxGetApp().app_config->get("arrange", "placement_bias");
+    if (!placement_bias_str.empty())
+        m_arrange_settings_fff.placement_bias = safe_stoi(placement_bias_str, 0);
+
     //BBS: add specific arrange settings
     m_arrange_settings_fff_seq_print.is_seq_print = true;
 }
@@ -6059,6 +6063,21 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("%s", _u8L("Try all plates, pick the tightest fit.").c_str());
 
+    // ====== PLACEMENT BIAS ======
+    const char* placement_labels[] = { "Center", "Corner" };
+    ImGui::AlignTextToFramePadding();
+    imgui->text(_L("Placement"));
+    ImGui::PushItemWidth(window_width);
+    if (ImGui::Combo("##placement_bias", &settings.placement_bias, placement_labels, IM_ARRAYSIZE(placement_labels))) {
+        settings_out.placement_bias = settings.placement_bias;
+        appcfg->set("arrange", "placement_bias", std::to_string(settings_out.placement_bias));
+        settings_changed = true;
+    }
+    ImGui::PopItemWidth();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", _u8L("Center: cluster parts toward the middle of the bed.\n"
+                                     "Corner: pack from back-left corner outward.").c_str());
+
     ImGui::Separator();
 
     // ====== ROTATION ======
@@ -6156,6 +6175,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         settings.avoid_purge_pad = false;
         settings.purge_pad_mm = 5.0f;
         settings.purge_pad_edge = 0;
+        settings.placement_bias = 0;
 
         settings_out = settings;
         // Save all to config
@@ -6170,6 +6190,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         appcfg->set("arrange", "avoid_purge_pad", settings_out.avoid_purge_pad ? "1" : "0");
         appcfg->set("arrange", "purge_pad_mm", float_to_string_decimal_point(settings_out.purge_pad_mm));
         appcfg->set("arrange", "purge_pad_edge", std::to_string(settings_out.purge_pad_edge));
+        appcfg->set("arrange", "placement_bias", std::to_string(settings_out.placement_bias));
         settings_changed = true;
     }
     ImGui::SameLine();
@@ -6202,6 +6223,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         appcfg->set("arrange", "nesting_3d", settings_out.nesting_3d ? "1" : "0");
         appcfg->set("arrange", "slice_height_mm", float_to_string_decimal_point(settings_out.slice_height_mm));
         appcfg->set("arrange", "z_clearance_mm", float_to_string_decimal_point(settings_out.z_clearance_mm));
+        appcfg->set("arrange", "placement_bias", std::to_string(settings_out.placement_bias));
         settings_changed = true;
     }
     ImGui::PopStyleVar(1);

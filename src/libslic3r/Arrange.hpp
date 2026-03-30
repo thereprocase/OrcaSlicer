@@ -150,6 +150,7 @@ struct ArrangeParams {
     int   compaction_mode                     = 3;  // 0=none, 1=coarse bitmap, 2=reverse skyline, 3=both
     bool  gravity_compact                     = false; // slide parts toward Y=0 to tighten layout
     bool  best_fit_compact                    = true;  // try all plates, pick lowest Y (vs first-fit)
+    int   placement_bias                      = 0;    // 0=center, 1=corner
     float bed_shrink_x = 1;
     float bed_shrink_y = 1;
     float brim_skirt_distance = 0;
@@ -204,6 +205,7 @@ struct ArrangeParams {
         ret += "\"purge_pad_edge\":" + std::to_string(purge_pad_edge) + ",";
         ret += "\"purge_pad_mm\":" + std::to_string(purge_pad_mm) + ",";
         ret += "\"bitmap_resolution_mm\":" + std::to_string(bitmap_resolution_mm) + ",";
+        ret += "\"placement_bias\":" + std::to_string(placement_bias) + ",";
         ret.pop_back();
         ret += "}";
         return ret;

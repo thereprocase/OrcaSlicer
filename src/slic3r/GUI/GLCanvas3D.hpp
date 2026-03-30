@@ -507,6 +507,7 @@ public:
         int   compaction_mode      = 3;    // 0=none, 1=coarse bitmap, 2=reverse skyline, 3=both
         bool  gravity_compact      = false;
         bool  best_fit_compact     = true;
+        int   placement_bias      = 0;      // 0=center, 1=corner
         bool  nesting_3d           = false;
         float slice_height_mm      = 10.0f;
         float z_clearance_mm       = 2.0f;
