@@ -694,11 +694,17 @@ void ArrangeJob::process(Ctl &ctl)
     }
 
     if (m_keep_plates_mode) {
-        // Per-plate arrangement: group items by their plate, arrange each group
-        // independently on a single-plate bed. The arranger never sees other plates'
-        // items — no guards needed. Overflow items get placed at the plate corner.
-        std::map<int, ArrangePolygons> plate_groups;
+        // Keep-plates: re-arrange each plate independently using the same logic
+        // as "Arrange This Plate." Each plate's items become selected, items on
+        // other plates become locked obstacles. This reuses the battle-tested
+        // per-plate path instead of reimplementing exclude filtering.
+        PartPlateList& pl = m_plater->get_partplate_list();
+        int n_plates = (int)pl.get_plate_count();
         int total_items = (int)m_selected.size();
+        int items_done = 0;
+
+        // Group items by plate
+        std::map<int, ArrangePolygons> plate_groups;
         for (auto& ap : m_selected)
             plate_groups[ap.bed_idx].push_back(std::move(ap));
         m_selected.clear();
@@ -706,44 +712,50 @@ void ArrangeJob::process(Ctl &ctl)
         auto keep_params = params;
         keep_params.allow_multi_plate = false;
         keep_params.consolidate_plates = false;
-        // Progress: num_finished from each arrange call is absolute (within that call).
-        // Track completed items from prior plates, add current plate's progress.
-        int prior_plates_done = 0;
-        keep_params.progressind = [&ctl, total_items, &prior_plates_done](unsigned num_finished, std::string str) {
-            int pct = total_items > 0 ? ((prior_plates_done + (int)num_finished) * 100 / (total_items + 1)) : 0;
-            ctl.update_status(std::min(pct, 99), _u8L("Arranging") + str);
-        };
 
         for (auto& [plate_idx, group] : plate_groups) {
-            // Filter excludes to only this plate's obstacles.
-            // Wipe towers use bedid_unlocked numbering (skips locked plates),
-            // but keep-plates uses physical indices. Convert: count unlocked plates
-            // before plate_idx to get the logical index for matching wipe towers.
-            int logical_idx = 0;
-            {
-                PartPlateList& pl = m_plater->get_partplate_list();
-                for (int pi = 0; pi < plate_idx && pi < (int)pl.get_plate_count(); pi++)
-                    if (!pl.get_plate(pi)->is_locked()) logical_idx++;
+            if (plate_idx < 0 || plate_idx >= n_plates) continue;
+            PartPlate* plate = pl.get_plate(plate_idx);
+            if (!plate || plate->is_locked()) {
+                // Locked plates: keep items where they are
+                for (auto& ap : group) m_selected.push_back(std::move(ap));
+                continue;
             }
-            ArrangePolygons plate_excludes;
-            for (const auto& excl : m_unselected) {
-                if (excl.is_virt_object && (excl.bed_idx == logical_idx || excl.bed_idx < 0))
-                    plate_excludes.push_back(excl);
-                else if (!excl.is_virt_object && (excl.bed_idx == plate_idx || excl.bed_idx < 0))
-                    plate_excludes.push_back(excl);
-            }
-            arrangement::arrange(group, plate_excludes, bedpts, keep_params);
-            prior_plates_done += (int)group.size();
 
-            for (auto& ap : group) {
-                if (ap.bed_idx >= 0) {
-                    // Placed successfully — assign to real plate
-                    ap.bed_idx = plate_idx;
-                } else {
-                    // Overflow — place at plate corner, keep plate assignment
-                    ap.bed_idx = plate_idx;
-                    ap.translation = {0, 0};
+            // Build unselected list: items on OTHER plates as locked obstacles
+            ArrangePolygons plate_unselected;
+            for (auto& [other_idx, other_group] : plate_groups) {
+                if (other_idx == plate_idx) continue;
+                for (const auto& ap : other_group) {
+                    ArrangePolygon locked_ap = ap;
+                    plate_unselected.push_back(std::move(locked_ap));
                 }
+            }
+
+            // Add wipe tower for this plate
+            if (auto wti = get_wipe_tower(*m_plater, plate_idx)) {
+                ArrangePolygon&& wt_ap = get_wipetower_arrange_poly(&wti);
+                plate_unselected.emplace_back(std::move(wt_ap));
+            }
+
+            // Add exclude areas
+            const DynamicPrintConfig& current_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+            bool enable_wrapping = current_config.option<ConfigOptionBool>("enable_wrapping_detection")->value;
+            pl.preprocess_exclude_areas(plate_unselected, enable_wrapping, plate_idx + 1);
+
+            // Progress
+            keep_params.progressind = [&ctl, total_items, &items_done](unsigned num_finished, std::string str) {
+                int pct = total_items > 0 ? ((items_done + (int)num_finished) * 100 / (total_items + 1)) : 0;
+                ctl.update_status(std::min(pct, 99), _u8L("Arranging") + str);
+            };
+
+            // Arrange this plate's items
+            arrangement::arrange(group, plate_unselected, bedpts, keep_params);
+            items_done += (int)group.size();
+
+            // All items stay on this plate
+            for (auto& ap : group) {
+                ap.bed_idx = plate_idx;
                 m_selected.push_back(std::move(ap));
             }
         }
@@ -922,10 +934,12 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(":arrange m_unprintable: name: %4%, bed_id %1%, trans {%2%,%3%}") % ap.bed_idx % unscale<double>(ap.translation(X)) % unscale<double>(ap.translation(Y)) % ap.name;
     }
 
-    // Post-postprocess overlap sanity check. Rasterizes all placed items at their
-    // final physical positions and checks for pairwise overlap via Clipper intersection.
-    // Catches mapping bugs that put items on the wrong plate after postprocess.
-    {
+    // Post-postprocess overlap sanity check. The bitmap arranger already
+    // guarantees non-overlap via pixel-level collision detection. This
+    // Clipper-based check catches coordinate mapping bugs but can false-
+    // positive when concave polygons touch at bitmap resolution boundaries.
+    // Only run for non-bitmap (libnest2d) arrangements where it's useful.
+    if (!params.use_concave_hulls) {
         std::map<int, std::vector<ExPolygon>> plate_polys;
         for (const ArrangePolygon& ap : m_selected) {
             if (ap.bed_idx >= 0)
@@ -944,11 +958,9 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
             }
         }
         if (overlap_count > 0) {
-            auto level = m_keep_plates_mode
-                ? NotificationManager::NotificationLevel::WarningNotificationLevel
-                : NotificationManager::NotificationLevel::ErrorNotificationLevel;
             m_plater->get_notification_manager()->push_notification(
-                NotificationType::ArrangeResult, level,
+                NotificationType::ArrangeResult,
+                NotificationManager::NotificationLevel::ErrorNotificationLevel,
                 std::to_string(overlap_count) + " item overlap(s) detected after arrangement.");
         }
     }

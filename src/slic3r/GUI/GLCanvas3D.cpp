@@ -5893,119 +5893,77 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         ImGui::SetTooltip("%s", _u8L("Pack using each part's real outline instead of its bounding hull.\n"
                                      "Concave shapes (L-brackets, U-channels) interlock tightly.").c_str());
 
-    {
-        if (!settings_out.use_concave_hulls) imgui->disabled_begin(true);
+    // Teal collapsible header style (shared by all sections)
+    auto push_section_style = []() {
+        ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0.00f, 0.59f, 0.53f, 0.30f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered,  ImVec4(0.00f, 0.59f, 0.53f, 0.50f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive,   ImVec4(0.00f, 0.59f, 0.53f, 0.70f));
+    };
+    auto pop_section_style = []() { ImGui::PopStyleColor(3); };
 
+    // ====== PACKING (collapsible) ======
+    push_section_style();
+    if (ImGui::CollapsingHeader(_u8L("Packing").c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (imgui->bbl_checkbox(_L("Auto rotate"), settings.enable_rotation)) {
+            settings_out.enable_rotation = settings.enable_rotation;
+            appcfg->set("arrange", rot_key.c_str(), settings_out.enable_rotation ? "1" : "0");
+            settings_changed = true;
+        }
+
+        {
+            std::string rot_step_key = "rotation_step_deg_fff";
+            if (!settings_out.enable_rotation) imgui->disabled_begin(true);
+
+            const char* rot_step_labels[] = { "90\xC2\xB0 (fast)", "45\xC2\xB0 (balanced)", "15\xC2\xB0 (best packing)" };
+            const int rot_step_values[] = { 90, 45, 15 };
+            int rot_step_idx = 1;
+            for (int i = 0; i < 3; i++)
+                if (rot_step_values[i] == settings.rotation_step_deg) rot_step_idx = i;
+
+            ImGui::AlignTextToFramePadding();
+            imgui->text(_L("Step"));
+            ImGui::SameLine(1.2 * cursor_slider_left);
+            ImGui::PushItemWidth(window_width);
+            if (ImGui::Combo("##rotation_step", &rot_step_idx, rot_step_labels, 3)) {
+                settings.rotation_step_deg = rot_step_values[rot_step_idx];
+                settings_out.rotation_step_deg = settings.rotation_step_deg;
+                appcfg->set("arrange", rot_step_key.c_str(), std::to_string(settings_out.rotation_step_deg));
+                settings_changed = true;
+            }
+            ImGui::PopItemWidth();
+
+            if (!settings_out.enable_rotation) imgui->disabled_end();
+        }
+
+        const char* placement_labels[] = { "Center", "Corner" };
         ImGui::AlignTextToFramePadding();
-        imgui->text(_L("Resolution"));
+        imgui->text(_L("Placement"));
         ImGui::SameLine(1.2 * cursor_slider_left);
-        ImGui::PushItemWidth(window_width - slider_icon_width);
-        bool res_changed = imgui->bbl_slider_float_style("##bitmap_res", &settings.bitmap_resolution_mm, 0.3f, 2.0f, "%.1f");
-        ImGui::SameLine(window_width - slider_icon_width + 1.3 * cursor_slider_left);
-        ImGui::PushItemWidth(1.5 * slider_icon_width);
-        bool res_input = ImGui::BBLDragFloat("##bitmap_res_input", &settings.bitmap_resolution_mm, 0.1f, 0.3f, 2.0f, "%.1f");
-        if (res_changed || res_input) {
-            settings.bitmap_resolution_mm = std::clamp(settings.bitmap_resolution_mm, 0.3f, 2.0f);
-            settings_out.bitmap_resolution_mm = settings.bitmap_resolution_mm;
-            appcfg->set("arrange", "bitmap_resolution_mm", float_to_string_decimal_point(settings_out.bitmap_resolution_mm));
-            settings_changed = true;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", _u8L("mm per pixel. Lower = more precise, slower.\n"
-                                         "0.5 recommended. 0.1 for fine detail.").c_str());
-
-        if (!settings_out.use_concave_hulls) imgui->disabled_end();
-    }
-
-    ImGui::Separator();
-
-    // ====== PLATES ======
-    {
-        std::string multi_plate_key = "allow_multi_plate";
-        std::string consolidate_key = "consolidate_plates";
-
-        // Gray out checkboxes that conflict with the current arrange mode.
-        // 0=Arrange All, 1=Keep Plates, 2=This Plate, 3=Stragglers
-        // Only Keep Plates (1) and Stragglers (3) override these checkboxes.
-        // "Arrange This Plate" (2) uses the existing prepare_partplate path which respects them.
-        bool mode_disables_checkboxes = (settings.arrange_mode == 1 || settings.arrange_mode == 3);
-        if (!settings_out.use_concave_hulls || mode_disables_checkboxes)
-            imgui->disabled_begin(true);
-
-        if (imgui->bbl_checkbox(_L("Fill multiple plates"), settings.allow_multi_plate)) {
-            settings_out.allow_multi_plate = settings.allow_multi_plate;
-            appcfg->set("arrange", multi_plate_key.c_str(), settings_out.allow_multi_plate ? "1" : "0");
-            settings_changed = true;
-        }
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-            if (mode_disables_checkboxes)
-                ImGui::SetTooltip("%s", _u8L("Controlled automatically by the arrangement mode.").c_str());
-            else
-                ImGui::SetTooltip("%s", _u8L("Overflow onto additional plates when one is full.").c_str());
-        }
-
-        if (imgui->bbl_checkbox(_L("Consolidate plates"), settings.consolidate_plates)) {
-            settings_out.consolidate_plates = settings.consolidate_plates;
-            appcfg->set("arrange", consolidate_key.c_str(), settings_out.consolidate_plates ? "1" : "0");
-            settings_changed = true;
-        }
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-            if (mode_disables_checkboxes)
-                ImGui::SetTooltip("%s", _u8L("Controlled automatically by the arrangement mode.").c_str());
-            else
-                ImGui::SetTooltip("%s", _u8L("Re-pack all plates into the fewest possible.").c_str());
-        }
-
-        if (!settings_out.use_concave_hulls || mode_disables_checkboxes)
-            imgui->disabled_end();
-    }
-
-    ImGui::Separator();
-
-    // ====== PURGE ZONE ======
-    std::string purge_pad_key = "avoid_purge_pad";
-    if (imgui->bbl_checkbox(_L("Reserve purge zone"), settings.avoid_purge_pad)) {
-        settings_out.avoid_purge_pad = settings.avoid_purge_pad;
-        appcfg->set("arrange", purge_pad_key.c_str(), settings_out.avoid_purge_pad ? "1" : "0");
-        settings_changed = true;
-    }
-
-    {
-        if (!settings_out.avoid_purge_pad) imgui->disabled_begin(true);
-
-        const char* edge_labels[] = { "Front", "Back", "Left", "Right" };
-        ImGui::AlignTextToFramePadding();
-        imgui->text(_L("Edge"));
         ImGui::PushItemWidth(window_width);
-        if (ImGui::Combo("##purge_edge", &settings.purge_pad_edge, edge_labels, 4)) {
-            settings_out.purge_pad_edge = settings.purge_pad_edge;
-            appcfg->set("arrange", "purge_pad_edge", std::to_string(settings_out.purge_pad_edge));
+        if (ImGui::Combo("##placement_bias", &settings.placement_bias, placement_labels, IM_ARRAYSIZE(placement_labels))) {
+            settings_out.placement_bias = settings.placement_bias;
+            appcfg->set("arrange", "placement_bias", std::to_string(settings_out.placement_bias));
             settings_changed = true;
         }
         ImGui::PopItemWidth();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", _u8L("Center: cluster parts toward the middle of the bed.\n"
+                                         "Corner: pack toward back-right, away from purge zone.").c_str());
 
-        ImGui::AlignTextToFramePadding();
-        imgui->text(_L("Width"));
-        ImGui::SameLine(1.2 * cursor_slider_left);
-        ImGui::PushItemWidth(window_width - slider_icon_width);
-        bool pad_changed = imgui->bbl_slider_float_style("##purge_pad_mm", &settings.purge_pad_mm, 0.f, 20.0f, "%.1f");
-        ImGui::SameLine(window_width - slider_icon_width + 1.3 * cursor_slider_left);
-        ImGui::PushItemWidth(1.5 * slider_icon_width);
-        bool pad_input = ImGui::BBLDragFloat("##purge_pad_input", &settings.purge_pad_mm, 0.1f, 0.0f, 20.0f, "%.1f");
-        if (pad_changed || pad_input) {
-            settings.purge_pad_mm = std::clamp(settings.purge_pad_mm, 0.f, 20.f);
-            settings_out.purge_pad_mm = settings.purge_pad_mm;
-            appcfg->set("arrange", "purge_pad_mm", float_to_string_decimal_point(settings_out.purge_pad_mm));
+        if (imgui->bbl_checkbox(_L("Separate materials"), settings.allow_multi_materials_on_same_plate)) {
+            settings_out.allow_multi_materials_on_same_plate = settings.allow_multi_materials_on_same_plate;
+            appcfg->set("arrange", multi_material_key.c_str(), settings_out.allow_multi_materials_on_same_plate ? "1" : "0");
             settings_changed = true;
         }
-
-        if (!settings_out.avoid_purge_pad) imgui->disabled_end();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", _u8L("When checked, parts using different filaments\n"
+                                         "can share the same plate.").c_str());
     }
+    pop_section_style();
 
-    ImGui::Separator();
-
-    // ====== 3D NESTING ======
-    {
+    // ====== 3D NESTING (collapsible) ======
+    push_section_style();
+    if (ImGui::CollapsingHeader(_u8L("3D Nesting").c_str())) {
         if (!settings_out.use_concave_hulls) imgui->disabled_begin(true);
 
         if (imgui->bbl_checkbox(_L("3D-aware nesting"), settings.nesting_3d)) {
@@ -6055,123 +6013,116 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
 
         if (!settings_out.use_concave_hulls) imgui->disabled_end();
     }
+    pop_section_style();
 
-    ImGui::Separator();
-
-    // ====== COMPACTION ======
-    const char* compact_labels[] = { "None", "Bitmap scan", "Skyline match", "Both" };
-    ImGui::AlignTextToFramePadding();
-    imgui->text(_L("Compaction"));
-    ImGui::PushItemWidth(window_width);
-    if (ImGui::Combo("##compaction", &settings.compaction_mode, compact_labels, 4)) {
-        settings_out.compaction_mode = settings.compaction_mode;
-        appcfg->set("arrange", "compaction_mode", std::to_string(settings_out.compaction_mode));
-        settings_changed = true;
-    }
-    ImGui::PopItemWidth();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", _u8L("Reduce plate count after placement.\n"
-                                     "Bitmap scan: finds gaps below the skyline\n"
-                                     "Skyline match: fast profile matching\n"
-                                     "Both: try skyline first, then bitmap").c_str());
-
-    if (imgui->bbl_checkbox(_L("Best-fit plate selection"), settings.best_fit_compact)) {
-        settings_out.best_fit_compact = settings.best_fit_compact;
-        appcfg->set("arrange", "best_fit_compact", settings_out.best_fit_compact ? "1" : "0");
-        settings_changed = true;
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", _u8L("Try all plates, pick the tightest fit.").c_str());
-
-    // ====== PLACEMENT BIAS ======
-    const char* placement_labels[] = { "Center", "Corner" };
-    ImGui::AlignTextToFramePadding();
-    imgui->text(_L("Placement"));
-    ImGui::PushItemWidth(window_width);
-    if (ImGui::Combo("##placement_bias", &settings.placement_bias, placement_labels, IM_ARRAYSIZE(placement_labels))) {
-        settings_out.placement_bias = settings.placement_bias;
-        appcfg->set("arrange", "placement_bias", std::to_string(settings_out.placement_bias));
-        settings_changed = true;
-    }
-    ImGui::PopItemWidth();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", _u8L("Center: cluster parts toward the middle of the bed.\n"
-                                     "Corner: pack from back-left corner outward.").c_str());
-
-    ImGui::Separator();
-
-    // ====== ROTATION ======
-    if (imgui->bbl_checkbox(_L("Auto rotate"), settings.enable_rotation)) {
-        settings_out.enable_rotation = settings.enable_rotation;
-        appcfg->set("arrange", rot_key.c_str(), settings_out.enable_rotation ? "1" : "0");
-        settings_changed = true;
-    }
-
-    {
-        std::string rot_step_key = "rotation_step_deg_fff";
-        if (!settings_out.enable_rotation) imgui->disabled_begin(true);
-
-        const char* rot_step_labels[] = { "90\xC2\xB0 (fast)", "45\xC2\xB0 (balanced)", "15\xC2\xB0 (best packing)" };
-        const int rot_step_values[] = { 90, 45, 15 };
-        int rot_step_idx = 1;
-        for (int i = 0; i < 3; i++)
-            if (rot_step_values[i] == settings.rotation_step_deg) rot_step_idx = i;
-
+    // ====== ADVANCED (collapsible) ======
+    push_section_style();
+    if (ImGui::CollapsingHeader(_u8L("Advanced").c_str())) {
+        // Resolution
+        if (!settings_out.use_concave_hulls) imgui->disabled_begin(true);
         ImGui::AlignTextToFramePadding();
-        imgui->text(_L("Step"));
-        ImGui::PushItemWidth(window_width);
-        if (ImGui::Combo("##rotation_step", &rot_step_idx, rot_step_labels, 3)) {
-            settings.rotation_step_deg = rot_step_values[rot_step_idx];
-            settings_out.rotation_step_deg = settings.rotation_step_deg;
-            appcfg->set("arrange", rot_step_key.c_str(), std::to_string(settings_out.rotation_step_deg));
+        imgui->text(_L("Resolution"));
+        ImGui::SameLine(1.2 * cursor_slider_left);
+        ImGui::PushItemWidth(window_width - slider_icon_width);
+        bool res_changed = imgui->bbl_slider_float_style("##bitmap_res", &settings.bitmap_resolution_mm, 0.3f, 2.0f, "%.1f");
+        ImGui::SameLine(window_width - slider_icon_width + 1.3 * cursor_slider_left);
+        ImGui::PushItemWidth(1.5 * slider_icon_width);
+        bool res_input = ImGui::BBLDragFloat("##bitmap_res_input", &settings.bitmap_resolution_mm, 0.1f, 0.3f, 2.0f, "%.1f");
+        if (res_changed || res_input) {
+            settings.bitmap_resolution_mm = std::clamp(settings.bitmap_resolution_mm, 0.3f, 2.0f);
+            settings_out.bitmap_resolution_mm = settings.bitmap_resolution_mm;
+            appcfg->set("arrange", "bitmap_resolution_mm", float_to_string_decimal_point(settings_out.bitmap_resolution_mm));
             settings_changed = true;
         }
-        ImGui::PopItemWidth();
+        if (!settings_out.use_concave_hulls) imgui->disabled_end();
 
-        if (!settings_out.enable_rotation) imgui->disabled_end();
-    }
-
-    ImGui::Separator();
-
-    // ====== MATERIAL SEPARATION ======
-    if (imgui->bbl_checkbox(_L("Allow multiple materials on same plate"), settings.allow_multi_materials_on_same_plate)) {
-        settings_out.allow_multi_materials_on_same_plate = settings.allow_multi_materials_on_same_plate;
-        appcfg->set("arrange", multi_material_key.c_str(), settings_out.allow_multi_materials_on_same_plate ? "1" : "0");
-        settings_changed = true;
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", _u8L("When unchecked, parts using different filaments\n"
-                                     "are placed on separate plates.").c_str());
-
-    // only show this option if the printer has micro Lidar and can do first layer scan
-    DynamicPrintConfig &current_config = wxGetApp().preset_bundle->printers.get_edited_preset().config;
-    const bool has_lidar = wxGetApp().preset_bundle->is_bbl_vendor();
-    auto                op             = current_config.option("scan_first_layer");
-    if (has_lidar && op && op->getBool()) {
-        if (imgui->bbl_checkbox(_L("Avoid extrusion calibration region"), settings.avoid_extrusion_cali_region)) {
-            settings_out.avoid_extrusion_cali_region = settings.avoid_extrusion_cali_region;
-            appcfg->set("arrange", avoid_extrusion_key.c_str(), settings_out.avoid_extrusion_cali_region ? "1" : "0");
+        // Purge zone
+        std::string purge_pad_key = "avoid_purge_pad";
+        if (imgui->bbl_checkbox(_L("Reserve purge zone"), settings.avoid_purge_pad)) {
+            settings_out.avoid_purge_pad = settings.avoid_purge_pad;
+            appcfg->set("arrange", purge_pad_key.c_str(), settings_out.avoid_purge_pad ? "1" : "0");
             settings_changed = true;
         }
-    } else {
-        settings_out.avoid_extrusion_cali_region = false;
-    }
-
-    // Align to Y axis. Only enable this option when auto rotation not enabled
-    {
-        if (settings_out.enable_rotation) {  // do not allow align to Y axis if rotation is enabled
-            imgui->disabled_begin(true);
-            settings_out.align_to_y_axis = false;
+        {
+            if (!settings_out.avoid_purge_pad) imgui->disabled_begin(true);
+            const char* edge_labels[] = { "Front", "Back", "Left", "Right" };
+            ImGui::AlignTextToFramePadding();
+            imgui->text(_L("Edge"));
+            ImGui::SameLine(1.2 * cursor_slider_left);
+            ImGui::PushItemWidth(window_width);
+            if (ImGui::Combo("##purge_edge", &settings.purge_pad_edge, edge_labels, 4)) {
+                settings_out.purge_pad_edge = settings.purge_pad_edge;
+                appcfg->set("arrange", "purge_pad_edge", std::to_string(settings_out.purge_pad_edge));
+                settings_changed = true;
+            }
+            ImGui::PopItemWidth();
+            ImGui::AlignTextToFramePadding();
+            imgui->text(_L("Width"));
+            ImGui::SameLine(1.2 * cursor_slider_left);
+            ImGui::PushItemWidth(window_width - slider_icon_width);
+            bool pad_changed = imgui->bbl_slider_float_style("##purge_pad_mm", &settings.purge_pad_mm, 0.f, 20.0f, "%.1f");
+            ImGui::SameLine(window_width - slider_icon_width + 1.3 * cursor_slider_left);
+            ImGui::PushItemWidth(1.5 * slider_icon_width);
+            bool pad_input = ImGui::BBLDragFloat("##purge_pad_input", &settings.purge_pad_mm, 0.1f, 0.0f, 20.0f, "%.1f");
+            if (pad_changed || pad_input) {
+                settings.purge_pad_mm = std::clamp(settings.purge_pad_mm, 0.f, 20.f);
+                settings_out.purge_pad_mm = settings.purge_pad_mm;
+                appcfg->set("arrange", "purge_pad_mm", float_to_string_decimal_point(settings_out.purge_pad_mm));
+                settings_changed = true;
+            }
+            if (!settings_out.avoid_purge_pad) imgui->disabled_end();
         }
 
-        if (imgui->bbl_checkbox(_L("Align to Y axis"), settings.align_to_y_axis)) {
-            settings_out.align_to_y_axis = settings.align_to_y_axis;
-            appcfg->set("arrange", align_to_y_axis_key, settings_out.align_to_y_axis ? "1" : "0");
-            settings_changed = true;
+        // Fill multiple plates
+        {
+            std::string multi_plate_key = "allow_multi_plate";
+            std::string consolidate_key = "consolidate_plates";
+            bool mode_disables_checkboxes = (settings.arrange_mode == 1 || settings.arrange_mode == 3);
+            if (!settings_out.use_concave_hulls || mode_disables_checkboxes)
+                imgui->disabled_begin(true);
+            if (imgui->bbl_checkbox(_L("Fill multiple plates"), settings.allow_multi_plate)) {
+                settings_out.allow_multi_plate = settings.allow_multi_plate;
+                appcfg->set("arrange", multi_plate_key.c_str(), settings_out.allow_multi_plate ? "1" : "0");
+                settings_changed = true;
+            }
+            if (imgui->bbl_checkbox(_L("Consolidate plates"), settings.consolidate_plates)) {
+                settings_out.consolidate_plates = settings.consolidate_plates;
+                appcfg->set("arrange", consolidate_key.c_str(), settings_out.consolidate_plates ? "1" : "0");
+                settings_changed = true;
+            }
+            if (!settings_out.use_concave_hulls || mode_disables_checkboxes)
+                imgui->disabled_end();
         }
 
-        if (settings_out.enable_rotation == true) { imgui->disabled_end(); }
+        // Bambu LIDAR
+        DynamicPrintConfig &current_config = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+        const bool has_lidar = wxGetApp().preset_bundle->is_bbl_vendor();
+        auto op = current_config.option("scan_first_layer");
+        if (has_lidar && op && op->getBool()) {
+            if (imgui->bbl_checkbox(_L("Avoid extrusion calibration region"), settings.avoid_extrusion_cali_region)) {
+                settings_out.avoid_extrusion_cali_region = settings.avoid_extrusion_cali_region;
+                appcfg->set("arrange", avoid_extrusion_key.c_str(), settings_out.avoid_extrusion_cali_region ? "1" : "0");
+                settings_changed = true;
+            }
+        } else {
+            settings_out.avoid_extrusion_cali_region = false;
+        }
+
+        // Align to Y axis
+        {
+            if (settings_out.enable_rotation) {
+                imgui->disabled_begin(true);
+                settings_out.align_to_y_axis = false;
+            }
+            if (imgui->bbl_checkbox(_L("Align to Y axis"), settings.align_to_y_axis)) {
+                settings_out.align_to_y_axis = settings.align_to_y_axis;
+                appcfg->set("arrange", align_to_y_axis_key, settings_out.align_to_y_axis ? "1" : "0");
+                settings_changed = true;
+            }
+            if (settings_out.enable_rotation == true) { imgui->disabled_end(); }
+        }
     }
+    pop_section_style();
 
     ImGui::Separator();
 
@@ -6286,39 +6237,6 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         appcfg->set("arrange", multi_material_key.c_str(), settings_out.allow_multi_materials_on_same_plate ? "1" : "0");
         appcfg->set("arrange", align_to_y_axis_key, settings_out.align_to_y_axis ? "1" : "0");
         appcfg->set("arrange", "arrange_mode", std::to_string(settings_out.arrange_mode));
-        settings_changed = true;
-    }
-    ImGui::SameLine();
-
-    if (imgui->button(_L("Reset"))) {
-        settings_out = ArrangeSettings{};
-        settings_out.distance = std::max(dist_min, settings_out.distance);
-        //BBS: add specific arrange settings
-        if (seq_print) settings_out.is_seq_print = true;
-
-        if (auto printer_structure_opt = wxGetApp().preset_bundle->printers.get_edited_preset().config.option<ConfigOptionEnum<PrinterStructure>>("printer_structure")) {
-            settings_out.align_to_y_axis = (printer_structure_opt->value == PrinterStructure::psI3);
-        }
-        else
-            settings_out.align_to_y_axis = false;
-
-        appcfg->set("arrange", dist_key, float_to_string_decimal_point(settings_out.distance));
-        appcfg->set("arrange", rot_key, settings_out.enable_rotation ? "1" : "0");
-        appcfg->set("arrange", align_to_y_axis_key, settings_out.align_to_y_axis ? "1" : "0");
-        appcfg->set("arrange", "use_concave_hulls", settings_out.use_concave_hulls ? "1" : "0");
-        appcfg->set("arrange", "allow_multi_plate", settings_out.allow_multi_plate ? "1" : "0");
-        appcfg->set("arrange", "consolidate_plates", settings_out.consolidate_plates ? "1" : "0");
-        appcfg->set("arrange", "rotation_step_deg_fff", std::to_string(settings_out.rotation_step_deg));
-        appcfg->set("arrange", "avoid_purge_pad", settings_out.avoid_purge_pad ? "1" : "0");
-        appcfg->set("arrange", "purge_pad_edge", std::to_string(settings_out.purge_pad_edge));
-        appcfg->set("arrange", "purge_pad_mm", float_to_string_decimal_point(settings_out.purge_pad_mm));
-        appcfg->set("arrange", "bitmap_resolution_mm", float_to_string_decimal_point(settings_out.bitmap_resolution_mm));
-        appcfg->set("arrange", "compaction_mode", std::to_string(settings_out.compaction_mode));
-        appcfg->set("arrange", "best_fit_compact", settings_out.best_fit_compact ? "1" : "0");
-        appcfg->set("arrange", "nesting_3d", settings_out.nesting_3d ? "1" : "0");
-        appcfg->set("arrange", "slice_height_mm", float_to_string_decimal_point(settings_out.slice_height_mm));
-        appcfg->set("arrange", "z_clearance_mm", float_to_string_decimal_point(settings_out.z_clearance_mm));
-        appcfg->set("arrange", "placement_bias", std::to_string(settings_out.placement_bias));
         settings_changed = true;
     }
     ImGui::PopStyleVar(1);
