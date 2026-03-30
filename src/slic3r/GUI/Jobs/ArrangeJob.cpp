@@ -489,8 +489,9 @@ void ArrangeJob::prepare_keep_plates() {
             into_u8(_L("No items on unlocked plates to arrange.")));
     }
 
-    // Don't allow creating new plates in keep-plates mode
+    // Force sane params for keep-plates mode — override conflicting checkboxes
     params.allow_multi_plate = false;
+    params.consolidate_plates = false;
 
     prepare_wipe_tower();
 
@@ -551,7 +552,9 @@ void ArrangeJob::prepare_stragglers() {
             into_u8(_L("No unassigned items to place.")));
     }
 
+    // Force sane params for stragglers mode — override conflicting checkboxes
     params.allow_multi_plate = true;
+    params.consolidate_plates = false;
 
     prepare_wipe_tower();
 
