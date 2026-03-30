@@ -38,6 +38,13 @@ class ArrangeJob : public Job
     // existing plate assignments (keep-plates, place-stragglers).
     bool skip_plate_clear{false};
 
+    // Per-plate arrangement mode — process() runs arrange() per plate
+    bool m_keep_plates_mode{false};
+
+    // Stragglers mode — offset bed_idx past existing plates
+    bool m_stragglers_mode{false};
+    int m_existing_plate_count{0};
+
     // clear m_selected and m_unselected, reserve space for next usage
     void clear_input();
 

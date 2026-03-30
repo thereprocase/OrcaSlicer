@@ -506,43 +506,28 @@ void ArrangeJob::prepare_stragglers() {
     PartPlateList& plate_list = m_plater->get_partplate_list();
     Model& model = m_plater->model();
 
-    // Items on plates become fixed obstacles.
-    // Items not on any plate get arranged onto new/existing plates.
+    // Only collect unassigned items. Existing plate items are invisible —
+    // stragglers arrange in their own clean universe on fresh plates.
     for (size_t oidx = 0; oidx < model.objects.size(); ++oidx) {
         ModelObject* mo = model.objects[oidx];
         for (size_t i = 0; i < mo->instances.size(); ++i) {
-            ArrangePolygon&& ap = prepare_arrange_polygon(mo->instances[i]);
-
-            // Check if instance is on any plate
+            // Skip items already on plates — don't touch them at all
             bool on_plate = false;
             for (int pi = 0; pi < (int)plate_list.get_plate_count(); pi++) {
                 PartPlate* plate = plate_list.get_plate(pi);
                 if (plate->contain_instance(oidx, i) || plate->intersect_instance(oidx, i)) {
                     on_plate = true;
-                    // Fixed obstacle — preserve its position
-                    bool locked = plate_list.preprocess_arrange_polygon(oidx, i, ap, false);
-                    if (!locked && mo->instances[i]->printable) {
-                        ap.itemid = m_unselected.size();
-                        m_unselected.emplace_back(std::move(ap));
-                    } else {
-                        ap.itemid = m_locked.size();
-                        m_locked.emplace_back(std::move(ap));
-                    }
                     break;
                 }
             }
+            if (on_plate) continue;
 
-            if (!on_plate) {
-                if (!mo->instances[i]->printable) {
-                    ap.itemid = m_unprintable.size();
-                    m_unprintable.emplace_back(std::move(ap));
-                    continue;
-                }
-                // Unassigned item — arrange it
-                ap.bed_idx = arrangement::UNARRANGED;
-                ap.itemid = m_selected.size();
-                m_selected.emplace_back(std::move(ap));
-            }
+            if (!mo->instances[i]->printable) continue;
+
+            ArrangePolygon&& ap = prepare_arrange_polygon(mo->instances[i]);
+            ap.bed_idx = arrangement::UNARRANGED;
+            ap.itemid = m_selected.size();
+            m_selected.emplace_back(std::move(ap));
         }
     }
 
@@ -552,15 +537,14 @@ void ArrangeJob::prepare_stragglers() {
             into_u8(_L("No unassigned items to place.")));
     }
 
-    // Force sane params for stragglers mode — override conflicting checkboxes
+    // Stragglers get fresh plates — allow multi-plate, no consolidate
     params.allow_multi_plate = true;
     params.consolidate_plates = false;
 
-    prepare_wipe_tower();
-
+    // Exclude zones still apply (physical bed obstacles)
     const DynamicPrintConfig& current_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
     bool enable_wrapping = current_config.option<ConfigOptionBool>("enable_wrapping_detection")->value;
-    plate_list.preprocess_exclude_areas(m_unselected, enable_wrapping, MAX_NUM_PLATES);
+    plate_list.preprocess_exclude_areas(m_unselected, enable_wrapping, 1);
 }
 
 //BBS: add partplate logic
@@ -593,11 +577,14 @@ void ArrangeJob::prepare()
     else if (state == Job::JobPrepareState::PREPARE_STATE_KEEP_PLATES) {
         only_on_partplate = false;
         skip_plate_clear = true;
+        m_keep_plates_mode = true;
         prepare_keep_plates();
     }
     else if (state == Job::JobPrepareState::PREPARE_STATE_STRAGGLERS) {
         only_on_partplate = false;
         skip_plate_clear = true;
+        m_stragglers_mode = true;
+        m_existing_plate_count = m_plater->get_partplate_list().get_plate_count();
         prepare_stragglers();
     }
 
@@ -706,7 +693,45 @@ void ArrangeJob::process(Ctl &ctl)
             <<", bbox:"<<get_extents(item.poly).min.transpose()<<","<<get_extents(item.poly).max.transpose();
     }
 
-    arrangement::arrange(m_selected, m_unselected, bedpts, params);
+    if (m_keep_plates_mode) {
+        // Per-plate arrangement: group items by their plate, arrange each group
+        // independently on a single-plate bed. The arranger never sees other plates'
+        // items — no guards needed. Overflow items get placed at the plate corner.
+        std::map<int, ArrangePolygons> plate_groups;
+        for (auto& ap : m_selected)
+            plate_groups[ap.bed_idx].push_back(std::move(ap));
+        m_selected.clear();
+
+        auto keep_params = params;
+        keep_params.allow_multi_plate = false;
+        keep_params.consolidate_plates = false;
+
+        for (auto& [plate_idx, group] : plate_groups) {
+            arrangement::arrange(group, m_unselected, bedpts, keep_params);
+
+            for (auto& ap : group) {
+                if (ap.bed_idx >= 0) {
+                    // Placed successfully — assign to real plate
+                    ap.bed_idx = plate_idx;
+                } else {
+                    // Overflow — place at plate corner, keep plate assignment
+                    ap.bed_idx = plate_idx;
+                    ap.translation = {0, 0};
+                }
+                m_selected.push_back(std::move(ap));
+            }
+        }
+    } else {
+        arrangement::arrange(m_selected, m_unselected, bedpts, params);
+    }
+
+    // Stragglers: offset bed_idx so new items land AFTER existing plates
+    if (m_stragglers_mode) {
+        for (auto& ap : m_selected) {
+            if (ap.bed_idx >= 0)
+                ap.bed_idx += m_existing_plate_count;
+        }
+    }
 
     // sort by item id
     std::sort(m_selected.begin(), m_selected.end(), [](auto a, auto b) {return a.itemid < b.itemid; });
@@ -780,17 +805,6 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
     }
     else
         plate_list.clear(false, false, true, -1);
-    // For stragglers: offset bed_idx so new items go to plates AFTER existing ones.
-    // The arranger assigns bed_idx starting from 0, but plates 0..N-1 are already occupied.
-    int straggler_plate_offset = 0;
-    if (skip_plate_clear && !only_on_partplate) {
-        straggler_plate_offset = (int)plate_list.get_plate_count();
-        for (ArrangePolygon& ap : m_selected) {
-            if (ap.bed_idx >= 0)
-                ap.bed_idx += straggler_plate_offset;
-        }
-    }
-
     //BBS: adjust the bed_index, create new plates, get the max bed_index
     for (ArrangePolygon& ap : m_selected) {
         //BBS: partplate postprocess

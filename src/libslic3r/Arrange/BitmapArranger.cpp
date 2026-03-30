@@ -1034,7 +1034,6 @@ void BitmapArranger::arrange(
         coord_t inflation;
         int filament_temp_type = -1;
         std::set<int> extrude_ids; // extruder indices used by this object
-        int preferred_plate = -1; // keep-plates mode: only place on this plate
     };
 
     std::vector<ItemEntry> entries;
@@ -1050,7 +1049,6 @@ void BitmapArranger::arrange(
         e.filament_temp_type = arrangables[i].filament_temp_type;
         e.extrude_ids = std::set<int>(arrangables[i].extrude_ids.begin(),
                                        arrangables[i].extrude_ids.end());
-        e.preferred_plate = arrangables[i].bed_idx;
         entries.push_back(std::move(e));
     }
 
@@ -1737,19 +1735,6 @@ void BitmapArranger::arrange(
 
     bool use_3d = params.nesting_3d;
 
-    // Pre-create plates for keep-plates mode so preferred_plate indices are valid.
-    // Without this, an item with preferred_plate=2 would skip plate 0 (the only
-    // plate that exists initially) and never get placed.
-    {
-        int max_preferred = 0;
-        for (int i = 0; i < n; i++)
-            max_preferred = std::max(max_preferred, entries[i].preferred_plate);
-        while ((use_3d ? (int)plates_3d.size() : (int)plates.size()) <= max_preferred) {
-            if (use_3d) new_3d_plate();
-            else new_2d_plate();
-        }
-    }
-
     int current_plate = 0;
 
     for (;;) {
@@ -1761,10 +1746,6 @@ void BitmapArranger::arrange(
 
             auto &entry = entries[i];
             bool placed = false;
-
-            // keep-plates: skip plates that don't match the preferred plate
-            if (entry.preferred_plate >= 0 && current_plate != entry.preferred_plate)
-                continue;
 
             if (use_3d && !rot_stacks_all[i].empty()) {
                 if (is_material_compatible(
@@ -1796,26 +1777,15 @@ void BitmapArranger::arrange(
         if (remaining == 0) break;
 
         if (!any_placed_this_plate) {
-            int total_plates = use_3d ? (int)plates_3d.size() : (int)plates.size();
-            // Try advancing to the next existing plate (keep-plates pre-creates them)
-            if (current_plate + 1 < total_plates) {
-                current_plate++;
-                continue;
-            }
-            // No more existing plates — create one if allowed
-            if (params.allow_multi_plate && total_plates < MAX_PLATES) {
+            if (params.allow_multi_plate &&
+                (use_3d ? (int)plates_3d.size() : (int)plates.size()) < MAX_PLATES) {
                 current_plate = use_3d ? new_3d_plate() : new_2d_plate();
             } else {
-                // Can't create new plates — overflow items to plate origin (0,0)
-                // so the user sees them stacked at the corner with an exclusion warning,
-                // rather than scattered to random positions or silently disappearing.
+                // Can't create new plates — mark remaining items as unarranged.
+                // The caller (ArrangeJob) handles overflow placement for keep-plates.
                 for (int i = 0; i < n; i++) {
                     if (!item_placed[i]) {
-                        int overflow_plate = entries[i].preferred_plate >= 0
-                            ? entries[i].preferred_plate : 0;
-                        arrangables[entries[i].orig_idx].bed_idx = overflow_plate;
-                        arrangables[entries[i].orig_idx].translation = {
-                            effective_bed.min.x(), effective_bed.min.y()};
+                        arrangables[entries[i].orig_idx].bed_idx = -1;
                         item_placed[i] = true;
                         failed_count++;
                     }
@@ -1825,17 +1795,6 @@ void BitmapArranger::arrange(
         }
     }
     done:
-
-    // Keep-plates overflow: items that had a preferred plate but couldn't be placed
-    for (int i = 0; i < n; i++) {
-        if (!item_placed[i] && entries[i].preferred_plate >= 0) {
-            auto &entry = entries[i];
-            arrangables[entry.orig_idx].bed_idx = entry.preferred_plate;
-            arrangables[entry.orig_idx].translation = {effective_bed.min.x(), effective_bed.min.y()};
-            item_placed[i] = true;
-            failed_count++;
-        }
-    }
 
     {
         auto t_now = std::chrono::high_resolution_clock::now();
@@ -1865,9 +1824,6 @@ void BitmapArranger::arrange(
 
                 int n_plates_try = use_3d ? (int)plates_3d.size() : (int)plates.size();
                 for (int pi = 0; pi < n_plates_try && !placed; pi++) {
-                    // keep-plates: only try the preferred plate
-                    if (entry.preferred_plate >= 0 && pi != entry.preferred_plate)
-                        continue;
                     if (use_3d && !rot_stacks_all[idx].empty()) {
                         if (!is_material_compatible(
                                 plates_3d[pi].material_group,
@@ -2078,13 +2034,7 @@ void BitmapArranger::arrange(
         }
     };
 
-    // Skip compaction when keep-plates is active — compaction moves items between
-    // plates to reduce plate count, which contradicts keep-plates' preservation goal.
-    bool has_preferred_plates = false;
-    for (int i = 0; i < n; i++)
-        if (entries[i].preferred_plate >= 0) { has_preferred_plates = true; break; }
-
-    if (use_3d && plates_3d.size() > 1 && params.compaction_mode > 0 && !has_preferred_plates) {
+    if (use_3d && plates_3d.size() > 1 && params.compaction_mode > 0) {
         bool compacted = true;
         while (compacted && plates_3d.size() > 1) {
             compacted = false;
@@ -2187,7 +2137,7 @@ void BitmapArranger::arrange(
         }
     }
 
-    if (!use_3d && plates.size() > 1 && params.compaction_mode > 0 && !has_preferred_plates) {
+    if (!use_3d && plates.size() > 1 && params.compaction_mode > 0) {
         bool compacted = true;
         while (compacted && plates.size() > 1) {
             compacted = false;
@@ -2389,11 +2339,9 @@ void BitmapArranger::arrange(
                     int py = (int)((ty + s0.offset_y - effective_bed.min.y()) / res);
 
                     if (collides_3d(verify_stack, bed_w_words, bed_w_px, bed_h_px, *cur_stack, px, py)) {
-                        if (entries[i].preferred_plate < 0) {
-                            BOOST_LOG_TRIVIAL(error) << "BitmapArranger: 3D OVERLAP detected for item "
-                                                     << entries[i].orig_idx << " on plate " << pi;
-                            arrangables[entries[i].orig_idx].bed_idx = -1;
-                        }
+                        BOOST_LOG_TRIVIAL(error) << "BitmapArranger: 3D OVERLAP detected for item "
+                                                 << entries[i].orig_idx << " on plate " << pi;
+                        arrangables[entries[i].orig_idx].bed_idx = -1;
                     } else {
                         stamp_3d(verify_stack, bed_w_words, bed_w_px, bed_h_px, *cur_stack, px, py, stamp_excludes);
                     }
@@ -2421,13 +2369,9 @@ void BitmapArranger::arrange(
                     int py = (int)((ty + cur_bmp->offset_y - effective_bed.min.y()) / res);
 
                     if (collides(verify_bits, bed_w_words, bed_w_px, bed_h_px, *cur_bmp, px, py)) {
-                        // Overflow items (placed at corner because they didn't fit) will
-                        // naturally overlap. Don't un-place them — that's intentional.
-                        if (entries[i].preferred_plate < 0) {
-                            BOOST_LOG_TRIVIAL(error) << "BitmapArranger: OVERLAP detected for item "
-                                                     << entries[i].orig_idx << " on plate " << pi;
-                            arrangables[entries[i].orig_idx].bed_idx = -1;
-                        }
+                        BOOST_LOG_TRIVIAL(error) << "BitmapArranger: OVERLAP detected for item "
+                                                 << entries[i].orig_idx << " on plate " << pi;
+                        arrangables[entries[i].orig_idx].bed_idx = -1;
                     } else {
                         stamp(verify_bits, bed_w_words, bed_w_px, bed_h_px, *cur_bmp, px, py);
                     }
