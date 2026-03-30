@@ -2659,6 +2659,44 @@ void BitmapArranger::arrange(
         }
     }
 
+    // ============================================================
+    // POST-PLACEMENT: Corner bias shift
+    // ============================================================
+    // Pack bottom-left for max density, then shift each plate's cluster
+    // to the back-right corner. Items stay in the same relative positions
+    // so no collisions are introduced. Moves items away from front-left
+    // purge/exclusion zones.
+    if (params.placement_bias == 1) {
+        int n_plates_shift = use_3d ? (int)plates_3d.size() : (int)plates.size();
+        for (int pi = 0; pi < n_plates_shift; pi++) {
+            coord_t max_right = effective_bed.min.x();
+            coord_t max_top = effective_bed.min.y();
+            bool has_items = false;
+
+            for (size_t i = 0; i < arrangables.size(); i++) {
+                if (arrangables[i].bed_idx != pi) continue;
+                has_items = true;
+                ExPolygon rotated = arrangables[i].poly;
+                rotated.rotate(arrangables[i].rotation);
+                BoundingBox bb = get_extents(rotated);
+                max_right = std::max(max_right, arrangables[i].translation.x() + bb.max.x());
+                max_top   = std::max(max_top,   arrangables[i].translation.y() + bb.max.y());
+            }
+            if (!has_items) continue;
+
+            coord_t shift_x = effective_bed.max.x() - max_right;
+            coord_t shift_y = effective_bed.max.y() - max_top;
+
+            for (auto &arr : arrangables) {
+                if (arr.bed_idx == pi) {
+                    arr.translation.x() += shift_x;
+                    arr.translation.y() += shift_y;
+                }
+            }
+        }
+        ARRANGE_LOG("Corner bias: shifted " << n_plates_shift << " plate(s) to back-right");
+    }
+
     int total_plates = params.nesting_3d ? (int)plates_3d.size() : (int)plates.size();
     {
         auto t_now = std::chrono::high_resolution_clock::now();

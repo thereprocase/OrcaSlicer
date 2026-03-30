@@ -6167,15 +6167,16 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         settings.bitmap_resolution_mm = 1.0f;
         settings.compaction_mode = 3;
         settings.best_fit_compact = true;
-        settings.rotation_step_deg = 15;
+        settings.rotation_step_deg = 45;
         settings.enable_rotation = true;
         settings.nesting_3d = false;
         settings.slice_height_mm = 10.0f;
         settings.z_clearance_mm = 2.0f;
-        settings.avoid_purge_pad = false;
+        settings.avoid_purge_pad = true;
         settings.purge_pad_mm = 5.0f;
         settings.purge_pad_edge = 0;
-        settings.placement_bias = 0;
+        settings.placement_bias = 1;
+        settings.allow_multi_materials_on_same_plate = true;
 
         settings_out = settings;
         // Save all to config
@@ -6191,6 +6192,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         appcfg->set("arrange", "purge_pad_mm", float_to_string_decimal_point(settings_out.purge_pad_mm));
         appcfg->set("arrange", "purge_pad_edge", std::to_string(settings_out.purge_pad_edge));
         appcfg->set("arrange", "placement_bias", std::to_string(settings_out.placement_bias));
+        appcfg->set("arrange", multi_material_key.c_str(), settings_out.allow_multi_materials_on_same_plate ? "1" : "0");
         settings_changed = true;
     }
     ImGui::SameLine();
