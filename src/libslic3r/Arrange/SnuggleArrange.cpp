@@ -90,10 +90,29 @@ void snuggle_arrange(
         nester_parts.push_back(std::move(pd.info));
     }
 
+    // ── Step 2b: Build volume check ────────────────────────────────
+    // Warn about parts that exceed the printable height
+    float max_z = params.printable_height;
+    for (size_t i = 0; i < part_data.size(); ++i) {
+        if (part_data[i].info.max_height_mm > max_z) {
+            BOOST_LOG_TRIVIAL(warning) << "[SnuggleArrange] Part '" << part_data[i].name
+                << "' height " << part_data[i].info.max_height_mm
+                << " mm exceeds printable height " << max_z << " mm";
+        }
+    }
+
     // ── Step 3: Configure and run nester ─────────────────────────────
     snuggle::NesterConfig cfg;
-    cfg.bed_width_mm  = bed_width_mm;
-    cfg.bed_height_mm = bed_height_mm;
+
+    // Conservative bed size: shrink by one voxel on each side so that
+    // the voxelizer's outward rounding can't push parts off the bed edge.
+    float bed_margin = DEFAULT_VOXEL_SIZE_MM;
+    cfg.bed_width_mm  = std::max(1.0f, bed_width_mm  - 2.0f * bed_margin);
+    cfg.bed_height_mm = std::max(1.0f, bed_height_mm - 2.0f * bed_margin);
+
+    BOOST_LOG_TRIVIAL(debug) << "[SnuggleArrange] Conservative bed: "
+        << cfg.bed_width_mm << " x " << cfg.bed_height_mm << " mm"
+        << " (shrunk " << bed_margin << " mm per side for voxel rounding)";
 
     // Convert min_obj_distance from scaled coords to mm via SnuggleTransform
     cfg.min_gap_mm = snuggle_xform::scaled_to_mm(params.min_obj_distance);
