@@ -127,6 +127,7 @@ struct ArrangeParams {
     bool  snuggle_lock_rotation  = false; // true = XY only, preserve user Z rotation
     float snuggle_padding_mm     = 5.0f;  // min gap between parts (mm)
     int   snuggle_quality        = 5;     // 1-10: maps to population/generations
+    bool  snuggle_compact        = true;  // post-GA jiggle toward center
 
     //BBS: add specific arrange params
     bool  allow_multi_materials_on_same_plate = true;

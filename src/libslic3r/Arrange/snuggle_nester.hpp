@@ -63,6 +63,11 @@ struct NesterConfig {
     float  w_clustering      = 1.5f;   // penalize spread-out layouts
     float  w_height_center   = 0.3f;
 
+    // Compaction
+    bool   compact           = true;   // post-GA jiggle toward center
+    double compact_timeout_s = 2.0;    // max seconds for compaction phase
+    int    compact_max_sweeps = 20;    // max full sweeps
+
     // Politeness
     double timeout_seconds   = 30.0;   // Hard timeout
     size_t yield_every_gens  = 1;      // Yield CPU this often
@@ -275,16 +280,182 @@ public:
         result.generations_run = cfg_.max_generations;
         result.time_ms        = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
+        // Post-GA compaction: jiggle parts toward cluster center with
+        // micro-rotations until gaps close to min_gap. Runs for up to
+        // 2 seconds or 20 sweeps, whichever comes first.
+        if (cfg_.compact) {
+            compact_toward_center(result, parts);
+        }
+
         // Resolve where each part's instance origin ends up on the bed.
-        // The nester placed grids at (pl.x, pl.y). The grid rotates around
-        // its min corner, but OrcaSlicer rotates around the instance origin.
-        // This compensates for the pivot difference.
         compute_origin_positions(result, parts);
 
         return result;
     }
 
 private:
+    // ── Post-GA compaction ──────────────────────────────────
+    // Iteratively jiggle each part toward the cluster centroid.
+    // Each sweep: sort by distance from center (farthest first),
+    // binary-search the max inward step, optionally micro-rotate.
+    // Stops after time limit or convergence.
+    void compact_toward_center(
+        NesterResult &result,
+        const std::vector<PartInfo> &parts)
+    {
+        size_t n = result.placements.size();
+        if (n < 2) return;
+
+        auto t_start = std::chrono::steady_clock::now();
+        bool allow_rot = !cfg_.lock_rotation;
+        float vs = parts[0].grid.voxel_size;
+
+        for (int sweep = 0; sweep < cfg_.compact_max_sweeps; sweep++) {
+            // Timeout check
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(now - t_start).count() > cfg_.compact_timeout_s)
+                break;
+
+            // Compute cluster centroid
+            float cx = 0, cy = 0;
+            for (size_t i = 0; i < n; i++) {
+                cx += result.placements[i].x;
+                cy += result.placements[i].y;
+            }
+            cx /= n; cy /= n;
+
+            // Sort indices by distance from centroid (farthest first)
+            std::vector<size_t> order(n);
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                float da = (result.placements[a].x - cx) * (result.placements[a].x - cx)
+                         + (result.placements[a].y - cy) * (result.placements[a].y - cy);
+                float db = (result.placements[b].x - cx) * (result.placements[b].x - cx)
+                         + (result.placements[b].y - cy) * (result.placements[b].y - cy);
+                return da > db;
+            });
+
+            int total_moved = 0;
+
+            for (size_t idx : order) {
+                auto &pl = result.placements[idx];
+                float dx = cx - pl.x;
+                float dy = cy - pl.y;
+                float dist = std::sqrt(dx*dx + dy*dy);
+                if (dist < vs) continue;  // already at center
+
+                float dir_x = dx / dist;
+                float dir_y = dy / dist;
+
+                // Build rotated grid for this part
+                VoxelGrid rot_i = parts[idx].grid.rotated_copy(pl.zrot);
+
+                // Binary search: max step toward center without collision
+                float lo = 0, hi = dist;
+                float best_step = 0;
+                float best_rot_delta = 0;
+
+                for (int bs = 0; bs < 12; bs++) {
+                    float mid = (lo + hi) * 0.5f;
+                    float test_x = pl.x + dir_x * mid;
+                    float test_y = pl.y + dir_y * mid;
+
+                    // Check collision with all other parts at test position
+                    bool collides = false;
+                    Vec3f off_test = {test_x, test_y, 0.0f};
+                    for (size_t j = 0; j < n; j++) {
+                        if (j == idx) continue;
+                        VoxelGrid rot_j = parts[j].grid.rotated_copy(result.placements[j].zrot);
+                        Vec3f off_j = {result.placements[j].x, result.placements[j].y, 0.0f};
+                        if (VoxelGrid::collision_count(rot_i, off_test, rot_j, off_j) > 0) {
+                            collides = true;
+                            break;
+                        }
+                    }
+
+                    // Also check bed bounds
+                    float margin = cfg_.bed_margin_mm;
+                    float pmin_x = test_x + rot_i.origin.x;
+                    float pmin_y = test_y + rot_i.origin.y;
+                    float pmax_x = pmin_x + rot_i.nx * rot_i.voxel_size;
+                    float pmax_y = pmin_y + rot_i.ny * rot_i.voxel_size;
+                    if (pmin_x < margin || pmin_y < margin ||
+                        pmax_x > cfg_.bed_width_mm - margin ||
+                        pmax_y > cfg_.bed_height_mm - margin)
+                        collides = true;
+
+                    if (!collides) {
+                        best_step = mid;
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+
+                // Try micro-rotations at the best step position
+                if (allow_rot && best_step > vs) {
+                    float base_x = pl.x + dir_x * best_step;
+                    float base_y = pl.y + dir_y * best_step;
+                    float test_angles[] = {-0.05f, 0.05f, -0.1f, 0.1f};
+
+                    for (float da : test_angles) {
+                        float test_rot = pl.zrot + da;
+                        VoxelGrid rot_test = parts[idx].grid.rotated_copy(test_rot);
+                        Vec3f off_test = {base_x, base_y, 0.0f};
+
+                        bool ok = true;
+                        for (size_t j = 0; j < n && ok; j++) {
+                            if (j == idx) continue;
+                            VoxelGrid rot_j = parts[j].grid.rotated_copy(result.placements[j].zrot);
+                            Vec3f off_j = {result.placements[j].x, result.placements[j].y, 0.0f};
+                            if (VoxelGrid::collision_count(rot_test, off_test, rot_j, off_j) > 0)
+                                ok = false;
+                        }
+
+                        if (ok) {
+                            // Try stepping even further with this rotation
+                            float extra_lo = best_step, extra_hi = dist;
+                            float extra_best = best_step;
+                            for (int bs2 = 0; bs2 < 8; bs2++) {
+                                float mid2 = (extra_lo + extra_hi) * 0.5f;
+                                float tx = pl.x + dir_x * mid2;
+                                float ty = pl.y + dir_y * mid2;
+                                VoxelGrid rot2 = parts[idx].grid.rotated_copy(test_rot);
+                                Vec3f off2 = {tx, ty, 0.0f};
+                                bool col2 = false;
+                                for (size_t j = 0; j < n && !col2; j++) {
+                                    if (j == idx) continue;
+                                    VoxelGrid rj2 = parts[j].grid.rotated_copy(result.placements[j].zrot);
+                                    Vec3f oj2 = {result.placements[j].x, result.placements[j].y, 0.0f};
+                                    if (VoxelGrid::collision_count(rot2, off2, rj2, oj2) > 0)
+                                        col2 = true;
+                                }
+                                if (!col2) { extra_best = mid2; extra_lo = mid2; }
+                                else { extra_hi = mid2; }
+                            }
+                            if (extra_best > best_step) {
+                                best_step = extra_best;
+                                best_rot_delta = da;
+                            }
+                            break;  // take first improving rotation
+                        }
+                    }
+                }
+
+                // Apply the move
+                if (best_step > vs) {
+                    pl.x += dir_x * best_step;
+                    pl.y += dir_y * best_step;
+                    pl.zrot += best_rot_delta;
+                    total_moved++;
+                }
+            }
+
+            if (total_moved == 0) break;  // converged
+            polite_yield();
+        }
+    }
+
     // Compute where each part's instance origin (mesh-local 0,0) lands
     // on the bed, given the grid placement and rotation.
     void compute_origin_positions(

@@ -1154,6 +1154,10 @@ void GLCanvas3D::load_arrange_settings()
     if (!snuggle_quality_str.empty())
         try { m_arrange_settings_fff.snuggle_quality = std::stoi(snuggle_quality_str); } catch (...) {}
 
+    std::string snuggle_compact_str = wxGetApp().app_config->get("arrange", "snuggle_compact");
+    if (!snuggle_compact_str.empty())
+        m_arrange_settings_fff.snuggle_compact = (snuggle_compact_str == "1" || snuggle_compact_str == "true");
+
     //BBS: add specific arrange settings
     m_arrange_settings_fff_seq_print.is_seq_print = true;
 }
@@ -5947,6 +5951,14 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", _u8L("Higher = better packing, slower").c_str());
 
+        if (imgui->bbl_checkbox(_L("Compact after arrange"), settings.snuggle_compact)) {
+            settings_out.snuggle_compact = settings.snuggle_compact;
+            appcfg->set("arrange", "snuggle_compact", settings_out.snuggle_compact ? "1" : "0");
+            settings_changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", _u8L("Jiggle parts toward center after arrangement to close gaps.").c_str());
+
         if (!settings_out.use_snuggle) { imgui->disabled_end(); }
     }
 
@@ -5979,6 +5991,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         settings_out.snuggle_lock_rotation = false;
         settings_out.snuggle_padding_mm = 5.0f;
         settings_out.snuggle_quality = 5;
+        settings_out.snuggle_compact = true;
 
         appcfg->set("arrange", dist_key, float_to_string_decimal_point(settings_out.distance));
         appcfg->set("arrange", rot_key, settings_out.enable_rotation ? "1" : "0");
@@ -5987,6 +6000,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         appcfg->set("arrange", "snuggle_lock_rotation", "0");
         appcfg->set("arrange", "snuggle_padding_mm", float_to_string_decimal_point(5.0f));
         appcfg->set("arrange", "snuggle_quality", "5");
+        appcfg->set("arrange", "snuggle_compact", "1");
         settings_changed = true;
     }
     ImGui::PopStyleVar(1);

@@ -500,6 +500,7 @@ public:
         bool  snuggle_lock_rotation = false;
         float snuggle_padding_mm    = 5.0f;
         int   snuggle_quality       = 5;
+        bool  snuggle_compact       = true;
     };
 
     struct OrientSettings

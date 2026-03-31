@@ -172,6 +172,7 @@ void snuggle_arrange(
     cfg.timeout_seconds = 5.0 + quality * 5.0;  // 10s to 55s
 
     cfg.lock_rotation   = params.snuggle_lock_rotation;
+    cfg.compact         = params.snuggle_compact;
 
     // Shrink effective bed by voxel padding (1 voxel per side) + min gap
     cfg.bed_margin_mm   = voxel_size + cfg.min_gap_mm;
