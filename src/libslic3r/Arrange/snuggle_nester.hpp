@@ -38,11 +38,16 @@ struct NesterConfig {
     size_t tournament_size   = 4;      // Tournament selection bracket
 
     // Mutation rates
-    float  mutation_nudge_prob    = 0.70f;  // Small XY + rotation tweak
+    float  mutation_nudge_prob    = 0.60f;  // Small XY + rotation tweak
     float  mutation_shuffle_prob  = 0.20f;  // Swap two parts' positions
     float  mutation_wild_prob     = 0.10f;  // Random new position for one part
+    float  mutation_push_prob     = 0.10f;  // Push apart from nearest neighbor
     float  nudge_xy_mm           = 10.0f;   // Max nudge distance
     float  nudge_rot_deg         = 30.0f;   // Max rotation nudge
+
+    // Adaptive mutation
+    bool   adaptive_mutation     = true;    // Increase mutation when stagnant
+    size_t stagnation_window     = 15;      // Generations without improvement to trigger
 
     // Bed definition
     float  bed_width_mm      = 256.0f;
@@ -139,21 +144,29 @@ public:
         }
 
         // ── Initialize population ──────────────────────────
+        // Four seeds, rest random. Simple and proven.
         std::vector<Individual> pop(cfg_.population_size);
         for (auto &ind : pop) {
             ind.placements.resize(n_parts);
             randomize_placement(ind, parts);
         }
 
-        // Seed a few individuals with a greedy center placement
+        // Seed first four with heuristic strategies
         if (pop.size() >= 4) {
             seed_greedy_center(pop[0], parts);
             seed_greedy_line(pop[1], parts);
+            seed_greedy_grid(pop[2], parts);
+            seed_bottom_left(pop[3], parts);
         }
 
         // ── Evolution loop ─────────────────────────────────
         Individual best;
         best.collision_count = SIZE_MAX;
+
+        // Stagnation tracking
+        float best_fitness_seen = -1e18f;
+        size_t gens_without_improvement = 0;
+        float current_mutation_scale = 1.0f;
 
         for (size_t gen = 0; gen < cfg_.max_generations; gen++) {
             // Timeout check
@@ -176,23 +189,38 @@ public:
                 }
             }
 
+            // Track stagnation
+            if (best.is_feasible() && best.fitness > best_fitness_seen + 0.001f) {
+                best_fitness_seen = best.fitness;
+                gens_without_improvement = 0;
+                current_mutation_scale = 1.0f; // Reset to normal
+            } else {
+                gens_without_improvement++;
+            }
+
+            // Adaptive mutation: crank it up when stagnant
+            if (cfg_.adaptive_mutation && gens_without_improvement >= cfg_.stagnation_window) {
+                current_mutation_scale = std::min(3.0f, current_mutation_scale + 0.3f);
+
+                // (adaptive scale increase is sufficient)
+            }
+
+            // Early exit: converged well
+            if (best.is_feasible() && gens_without_improvement > cfg_.stagnation_window * 3) {
+                result.generations_run = gen + 1;
+                break; // Not improving, save time
+            }
+
             // Progress callback
             if (progress && !progress(gen, cfg_.max_generations, best)) {
                 break; // User abort
-            }
-
-            // Early exit: found a good feasible solution and fitness is stable
-            if (gen > 20 && best.is_feasible()) {
-                // Check if we've improved in the last 20 generations
-                // (tracked via simple heuristic: if fitness hasn't changed much)
-                // For now, let it run — the timeout is the real exit
             }
 
             // ── Selection + Crossover + Mutation ───────────
             std::vector<Individual> next_pop;
             next_pop.reserve(cfg_.population_size);
 
-            // Elitism: keep top N unchanged
+            // Elitism: keep top N, with local search refinement
             std::vector<size_t> ranking(pop.size());
             std::iota(ranking.begin(), ranking.end(), 0);
             std::sort(ranking.begin(), ranking.end(), [&](size_t a, size_t b) {
@@ -201,8 +229,16 @@ public:
 
             size_t n_elite = std::max((size_t)1,
                 (size_t)(cfg_.elitism_ratio * cfg_.population_size));
+
             for (size_t i = 0; i < n_elite && i < ranking.size(); i++) {
-                next_pop.push_back(pop[ranking[i]]);
+                Individual elite = pop[ranking[i]];
+
+                // Local search on elites every 10 generations
+                if (gen % 10 == 0 && elite.is_feasible()) {
+                    local_refine(elite, parts);
+                }
+
+                next_pop.push_back(std::move(elite));
             }
 
             // Fill rest with offspring
@@ -216,8 +252,8 @@ public:
                 child.placements.resize(n_parts);
                 crossover(parentA, parentB, child, n_parts);
 
-                // Mutation
-                mutate(child, parts);
+                // Mutation (scaled by stagnation pressure)
+                mutate(child, parts, current_mutation_scale);
 
                 next_pop.push_back(std::move(child));
             }
@@ -313,15 +349,95 @@ private:
             p.x = cursor_x + part_width * 0.5f;
             p.y = cursor_y;
             p.zrot = cfg_.lock_rotation ? parts[i].initial_zrot : 0.0f;
-
-            // Clamp to bed
             p.x = std::clamp(p.x, 0.0f, cfg_.bed_width_mm);
 
             cursor_x += part_width + cfg_.min_gap_mm;
-            // Wrap to next row if needed
             if (cursor_x > cfg_.bed_width_mm - 10.0f) {
                 cursor_x = cfg_.min_gap_mm;
-                cursor_y += 40.0f; // rough row height
+                cursor_y += 40.0f;
+            }
+        }
+    }
+
+    // ── Greedy seed: grid placement ──────────────────────
+    void seed_greedy_grid(Individual &ind, const std::vector<PartInfo> &parts) {
+        // Sort by size descending, place in grid cells
+        std::vector<size_t> order(parts.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return parts[a].hull_area_mm2 > parts[b].hull_area_mm2;
+        });
+
+        float avg_size = 0;
+        for (const auto &p : parts)
+            avg_size += std::sqrt(p.hull_area_mm2);
+        avg_size = avg_size / parts.size() + cfg_.min_gap_mm;
+
+        int cols = std::max(1, (int)(cfg_.bed_width_mm / avg_size));
+        float cell_w = cfg_.bed_width_mm / cols;
+        float cell_h = avg_size;
+
+        for (size_t idx = 0; idx < order.size(); idx++) {
+            size_t pi = order[idx];
+            int col = idx % cols;
+            int row = idx / cols;
+            auto &p = ind.placements[pi];
+            p.x = (col + 0.5f) * cell_w;
+            p.y = (row + 0.5f) * cell_h + cfg_.min_gap_mm;
+            p.zrot = cfg_.lock_rotation ? parts[pi].initial_zrot : 0.0f;
+            p.x = std::clamp(p.x, 0.0f, cfg_.bed_width_mm);
+            p.y = std::clamp(p.y, 0.0f, cfg_.bed_height_mm);
+        }
+    }
+
+    // ── Greedy seed: bottom-left fill ────────────────────
+    void seed_bottom_left(Individual &ind, const std::vector<PartInfo> &parts) {
+        // Sort largest first, place each at lowest-leftmost non-colliding spot
+        std::vector<size_t> order(parts.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return parts[a].hull_area_mm2 > parts[b].hull_area_mm2;
+        });
+
+        // Simple occupied tracking via bounding boxes
+        struct PlacedRect { float x, y, w, h; };
+        std::vector<PlacedRect> placed;
+
+        for (size_t idx : order) {
+            float pw = parts[idx].grid.nx * parts[idx].grid.voxel_size;
+            float ph = parts[idx].grid.ny * parts[idx].grid.voxel_size;
+            auto &p = ind.placements[idx];
+            p.zrot = cfg_.lock_rotation ? parts[idx].initial_zrot : 0.0f;
+
+            // Scan bottom-left: try Y rows, find leftmost X that doesn't overlap
+            bool found = false;
+            for (float try_y = cfg_.min_gap_mm; try_y < cfg_.bed_height_mm - ph; try_y += cfg_.min_gap_mm) {
+                for (float try_x = cfg_.min_gap_mm; try_x < cfg_.bed_width_mm - pw; try_x += cfg_.min_gap_mm) {
+                    bool collides = false;
+                    for (const auto &pr : placed) {
+                        if (try_x < pr.x + pr.w + cfg_.min_gap_mm &&
+                            try_x + pw > pr.x - cfg_.min_gap_mm &&
+                            try_y < pr.y + pr.h + cfg_.min_gap_mm &&
+                            try_y + ph > pr.y - cfg_.min_gap_mm) {
+                            collides = true;
+                            try_x = pr.x + pr.w + cfg_.min_gap_mm - cfg_.min_gap_mm; // skip past
+                            break;
+                        }
+                    }
+                    if (!collides) {
+                        p.x = try_x + pw * 0.5f;
+                        p.y = try_y + ph * 0.5f;
+                        placed.push_back({try_x, try_y, pw, ph});
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) break;
+            }
+            if (!found) {
+                // Fallback: random
+                p.x = randf(pw, cfg_.bed_width_mm - pw);
+                p.y = randf(ph, cfg_.bed_height_mm - ph);
             }
         }
     }
@@ -338,43 +454,76 @@ private:
         return pop[best_idx];
     }
 
-    // ── Crossover: uniform per-part ───────────────────────
+    // ── Crossover: inherit from fitter, mix in some from other ─
     void crossover(const Individual &a, const Individual &b,
                    Individual &child, size_t n_parts)
     {
+        const Individual &fitter = a.is_better_than(b) ? a : b;
+        const Individual &other  = a.is_better_than(b) ? b : a;
+
+        child.placements = fitter.placements;
         for (size_t i = 0; i < n_parts; i++) {
-            if (randf(0, 1) < 0.5f) {
-                child.placements[i] = a.placements[i];
-            } else {
-                child.placements[i] = b.placements[i];
-            }
+            if (randf(0, 1) < 0.3f)
+                child.placements[i] = other.placements[i];
         }
     }
 
-    // ── Mutation ──────────────────────────────────────────
-    void mutate(Individual &ind, const std::vector<PartInfo> &parts) {
+    // ── Mutation (with adaptive scaling) ───────────────────
+    void mutate(Individual &ind, const std::vector<PartInfo> &parts,
+                float scale = 1.0f)
+    {
+        float nudge_range = cfg_.nudge_xy_mm * scale;
+        float rot_range = cfg_.nudge_rot_deg * scale;
+        float thresh_nudge = cfg_.mutation_nudge_prob;
+        float thresh_shuffle = thresh_nudge + cfg_.mutation_shuffle_prob;
+        float thresh_push = thresh_shuffle + cfg_.mutation_push_prob;
+        // remainder = wildcard
+
         for (size_t i = 0; i < ind.placements.size(); i++) {
             float roll = randf(0, 1);
             auto &p = ind.placements[i];
 
-            if (roll < cfg_.mutation_nudge_prob) {
-                // Nudge: small XY perturbation (+ rotation if unlocked)
-                p.x += randf(-cfg_.nudge_xy_mm, cfg_.nudge_xy_mm);
-                p.y += randf(-cfg_.nudge_xy_mm, cfg_.nudge_xy_mm);
+            if (roll < thresh_nudge) {
+                // Nudge: small XY perturbation scaled by stagnation pressure
+                p.x += randf(-nudge_range, nudge_range);
+                p.y += randf(-nudge_range, nudge_range);
                 if (!cfg_.lock_rotation)
-                    p.zrot += randf(-cfg_.nudge_rot_deg, cfg_.nudge_rot_deg) * (3.14159265f / 180.0f);
-            } else if (roll < cfg_.mutation_nudge_prob + cfg_.mutation_shuffle_prob) {
-                // Shuffle: swap XY with another random part (rotation stays with original part if locked)
+                    p.zrot += randf(-rot_range, rot_range) * (3.14159265f / 180.0f);
+
+            } else if (roll < thresh_shuffle) {
+                // Shuffle: swap positions with another part
                 size_t j = randi(0, ind.placements.size() - 1);
                 if (cfg_.lock_rotation) {
-                    // Only swap XY, keep each part's locked rotation
                     std::swap(p.x, ind.placements[j].x);
                     std::swap(p.y, ind.placements[j].y);
                 } else {
                     std::swap(ind.placements[i], ind.placements[j]);
                 }
+
+            } else if (roll < thresh_push) {
+                // Push-apart: find nearest neighbor and move away from it
+                float best_dist = 1e18f;
+                size_t nearest = i;
+                for (size_t j = 0; j < ind.placements.size(); j++) {
+                    if (j == i) continue;
+                    float dx = ind.placements[j].x - p.x;
+                    float dy = ind.placements[j].y - p.y;
+                    float d = dx * dx + dy * dy;
+                    if (d < best_dist) { best_dist = d; nearest = j; }
+                }
+                if (nearest != i) {
+                    float dx = p.x - ind.placements[nearest].x;
+                    float dy = p.y - ind.placements[nearest].y;
+                    float len = std::sqrt(dx * dx + dy * dy);
+                    if (len > 0.01f) {
+                        float push = cfg_.min_gap_mm * scale;
+                        p.x += dx / len * push;
+                        p.y += dy / len * push;
+                    }
+                }
+
             } else {
-                // Wildcard: completely random new XY (+ rotation if unlocked)
+                // Wildcard: completely random new position
                 float margin = parts[i].grid.nx * parts[i].grid.voxel_size * 0.5f;
                 p.x = randf(margin, cfg_.bed_width_mm - margin);
                 p.y = randf(margin, cfg_.bed_height_mm - margin);
@@ -382,7 +531,7 @@ private:
                     p.zrot = randf(0, 2.0f * 3.14159265f);
             }
 
-            // Clamp to bed bounds (always)
+            // Clamp to bed bounds
             p.x = std::clamp(p.x, 0.0f, cfg_.bed_width_mm);
             p.y = std::clamp(p.y, 0.0f, cfg_.bed_height_mm);
 
@@ -390,6 +539,40 @@ private:
             while (p.zrot < 0) p.zrot += 2.0f * 3.14159265f;
             while (p.zrot > 2.0f * 3.14159265f) p.zrot -= 2.0f * 3.14159265f;
         }
+    }
+
+    // ── Local refinement: nudge each part toward centroid ──
+    void local_refine(Individual &ind, const std::vector<PartInfo> &parts) {
+        size_t n = ind.placements.size();
+
+        float cx = 0, cy = 0;
+        for (size_t i = 0; i < n; i++) {
+            cx += ind.placements[i].x;
+            cy += ind.placements[i].y;
+        }
+        cx /= n; cy /= n;
+
+        Individual trial = ind;
+        evaluate(trial, parts);
+        float step = cfg_.min_gap_mm * 0.5f;
+
+        for (size_t i = 0; i < n; i++) {
+            float dx = cx - trial.placements[i].x;
+            float dy = cy - trial.placements[i].y;
+            float len = std::sqrt(dx*dx + dy*dy);
+            if (len < 0.1f) continue;
+
+            Individual attempt = trial;
+            attempt.placements[i].x += dx / len * step;
+            attempt.placements[i].y += dy / len * step;
+            attempt.placements[i].x = std::clamp(attempt.placements[i].x, 0.0f, cfg_.bed_width_mm);
+            attempt.placements[i].y = std::clamp(attempt.placements[i].y, 0.0f, cfg_.bed_height_mm);
+
+            evaluate(attempt, parts);
+            if (attempt.is_feasible() && attempt.fitness > trial.fitness)
+                trial = attempt;
+        }
+        ind = trial;
     }
 
     // ── Evaluate an individual ────────────────────────────
@@ -436,7 +619,7 @@ private:
 
         // ── Fitness (only meaningful if feasible) ──────────
         if (ind.is_feasible()) {
-            // Compactness: minimize bounding rectangle of all part centers
+            // 1. Compactness: minimize bounding rectangle
             float min_x = 1e18f, max_x = -1e18f;
             float min_y = 1e18f, max_y = -1e18f;
 
@@ -459,26 +642,55 @@ private:
             float compactness = 1.0f - (bbox_area / bed_area);
             compactness = std::clamp(compactness, 0.0f, 1.0f);
 
-            // Height centering: tall parts near center score better
+            // 2. Packing density: sum of part areas / bounding area
+            //    Rewards arrangements where parts fill their bounding box tightly
+            float sum_part_area = 0;
+            for (const auto &p : parts) sum_part_area += p.hull_area_mm2;
+            float density = (bbox_area > 0) ? (sum_part_area / bbox_area) : 0.0f;
+            density = std::clamp(density, 0.0f, 1.0f);
+
+            // 3. Neighbor proximity: reward close (but not colliding) pairs
+            //    This creates evolutionary pressure to pack tighter
+            float proximity_score = 0.0f;
+            float n_pair_count = 0;
+            for (size_t i = 0; i < n; i++) {
+                for (size_t j = i + 1; j < n; j++) {
+                    float dx = ind.placements[i].x - ind.placements[j].x;
+                    float dy = ind.placements[i].y - ind.placements[j].y;
+                    float dist = std::sqrt(dx*dx + dy*dy);
+                    // Ideal distance: sum of half-sizes + gap
+                    float ri = std::sqrt(parts[i].hull_area_mm2) * 0.5f;
+                    float rj = std::sqrt(parts[j].hull_area_mm2) * 0.5f;
+                    float ideal = ri + rj + cfg_.min_gap_mm;
+                    // Score: 1.0 at ideal distance, drops off with wasted space
+                    if (dist > 0.01f) {
+                        float ratio = ideal / dist;
+                        proximity_score += std::min(ratio, 1.0f);
+                    }
+                    n_pair_count++;
+                }
+            }
+            if (n_pair_count > 0) proximity_score /= n_pair_count;
+
+            // 4. Height centering: tall parts near center
             float height_score = 0.0f;
             float bed_cx = cfg_.bed_width_mm * 0.5f;
             float bed_cy = cfg_.bed_height_mm * 0.5f;
             float max_dist = std::sqrt(bed_cx * bed_cx + bed_cy * bed_cy);
-
+            float max_possible_height = 0;
             for (size_t i = 0; i < n; i++) {
                 float dx = ind.placements[i].x - bed_cx;
                 float dy = ind.placements[i].y - bed_cy;
                 float dist = std::sqrt(dx*dx + dy*dy);
                 float centrality = 1.0f - (dist / max_dist);
                 height_score += parts[i].max_height_mm * centrality;
+                max_possible_height += parts[i].max_height_mm;
             }
-            // Normalize
-            float max_possible_height = 0;
-            for (const auto &p : parts) max_possible_height += p.max_height_mm;
-            if (max_possible_height > 0)
-                height_score /= max_possible_height;
+            if (max_possible_height > 0) height_score /= max_possible_height;
 
             ind.fitness = cfg_.w_compactness * compactness
+                        + cfg_.w_compactness * 0.5f * density
+                        + cfg_.w_compactness * 0.3f * proximity_score
                         + cfg_.w_height_center * height_score;
         }
     }
