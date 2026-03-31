@@ -592,16 +592,10 @@ void GpuCollisionEvaluator::cleanup()
 
 std::unique_ptr<CollisionEvaluator> create_collision_evaluator()
 {
-#ifdef SLIC3R_GUI
-    auto gpu = std::make_unique<GpuCollisionEvaluator>();
-    if (gpu->is_available()) {
-        BOOST_LOG_TRIVIAL(info) << "Snuggle: using GPU collision evaluator";
-        return gpu;
-    }
-    BOOST_LOG_TRIVIAL(info) << "Snuggle: GPU not available, using CPU collision evaluator";
-#else
-    BOOST_LOG_TRIVIAL(info) << "Snuggle: headless build, using CPU collision evaluator";
-#endif
+    // TODO: GPU backend has a collision detection bug — parts that overlap
+    // report 0 collisions. Force CPU until the shader is debugged.
+    // The CPU path is verified correct by standalone tests.
+    BOOST_LOG_TRIVIAL(warning) << "Snuggle: GPU collision disabled (debugging), using CPU";
     return std::make_unique<CpuCollisionEvaluator>();
 }
 
