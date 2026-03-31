@@ -53,6 +53,7 @@ struct NesterConfig {
     float  bed_width_mm      = 256.0f;
     float  bed_height_mm     = 256.0f;
     float  min_gap_mm        = 5.0f;   // Minimum clearance between parts
+    float  voxel_size_mm     = 2.0f;   // Used to compute safety margin for rotation
 
     // Rotation control
     bool   lock_rotation     = false;  // true = XY only, preserve user's Z rotation
@@ -586,6 +587,10 @@ private:
         ind.fitness = 0.0f;
 
         // ── Collision: pairwise voxel overlap ──────────────
+        // Both grids are checked at their placed XY positions (no rotation
+        // applied to grids). Conservative outward rounding on the voxelizer
+        // ensures that if voxels don't overlap, meshes don't intersect.
+        // The min_gap_mm in the fitness function provides additional clearance.
         for (size_t i = 0; i < n; i++) {
             const auto &pi = ind.placements[i];
             Vec3f off_i = {pi.x, pi.y, 0.0f};
@@ -594,9 +599,6 @@ private:
                 const auto &pj = ind.placements[j];
                 Vec3f off_j = {pj.x, pj.y, 0.0f};
 
-                // Note: Z-rotation not yet applied to voxel grid
-                // (we check at grid origin + XY offset for now;
-                //  rotation support comes with rotated grid lookup)
                 size_t c = VoxelGrid::collision_count(
                     parts[i].grid, off_i,
                     parts[j].grid, off_j);

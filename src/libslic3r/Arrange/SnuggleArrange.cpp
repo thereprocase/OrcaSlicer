@@ -100,9 +100,16 @@ void snuggle_arrange(
     if (cfg.min_gap_mm < 1.0f)
         cfg.min_gap_mm = 1.0f; // Minimum 1mm gap for safety
 
-    // Rotation control: snuggle_lock_rotation takes priority if set,
-    // otherwise fall back to the inverse of allow_rotations
-    cfg.lock_rotation = params.snuggle_lock_rotation || !params.allow_rotations;
+    // Rotation control: default to LOCKED (safe — XY only, no rotation).
+    // Snuggle's voxel collision check doesn't rotate grids, so rotated
+    // placements are not collision-verified. Lock rotation unless the user
+    // explicitly enables it AND snuggle_lock_rotation is false.
+    cfg.lock_rotation = true; // Safe default: XY placement only
+    if (params.allow_rotations && !params.snuggle_lock_rotation) {
+        cfg.lock_rotation = false; // User explicitly wants rotation
+        BOOST_LOG_TRIVIAL(warning) << "[SnuggleArrange] Rotation UNLOCKED — "
+            "rotated placements are NOT collision-verified in this version.";
+    }
 
     // Time budget: use 80% of any configured timeout, or 30s default
     cfg.timeout_seconds = 30.0;
