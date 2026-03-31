@@ -393,14 +393,24 @@ private:
     }
 
     // ── Evaluate an individual ────────────────────────────
-    //    1. Collision check (pairwise voxel AND)
-    //    2. Bed bounds check
-    //    3. Fitness scoring (only matters if feasible)
+    //    1. Build rotation-corrected voxel grids
+    //    2. Collision check (pairwise voxel AND)
+    //    3. Bed bounds check
+    //    4. Fitness scoring (only matters if feasible)
     void evaluate(Individual &ind, const std::vector<PartInfo> &parts) {
         size_t n = parts.size();
         ind.collision_count = 0;
         ind.oob_count = 0;
         ind.fitness = 0.0f;
+
+        // ── Build rotated grids for each part ──────────────
+        // Each part's voxel grid was voxelized at its original orientation.
+        // The placement includes a Z-rotation that changes the collision
+        // footprint, so we rotate the grid to match.
+        std::vector<VoxelGrid> rotated(n);
+        for (size_t i = 0; i < n; i++) {
+            rotated[i] = parts[i].grid.rotated_copy(ind.placements[i].zrot);
+        }
 
         // ── Collision: pairwise voxel overlap ──────────────
         for (size_t i = 0; i < n; i++) {
@@ -411,18 +421,15 @@ private:
                 const auto &pj = ind.placements[j];
                 Vec3f off_j = {pj.x, pj.y, 0.0f};
 
-                // Note: Z-rotation not yet applied to voxel grid
-                // (we check at grid origin + XY offset for now;
-                //  rotation support comes with rotated grid lookup)
                 size_t c = VoxelGrid::collision_count(
-                    parts[i].grid, off_i,
-                    parts[j].grid, off_j);
+                    rotated[i], off_i,
+                    rotated[j], off_j);
                 ind.collision_count += c;
             }
 
             // ── Bed bounds check ───────────────────────────
-            // Check if any part of the voxel grid extends beyond bed
-            const auto &g = parts[i].grid;
+            // Use the rotated grid's origin and dimensions
+            const auto &g = rotated[i];
             float part_min_x = pi.x + g.origin.x;
             float part_min_y = pi.y + g.origin.y;
             float part_max_x = pi.x + g.origin.x + g.nx * g.voxel_size;
@@ -436,13 +443,13 @@ private:
 
         // ── Fitness (only meaningful if feasible) ──────────
         if (ind.is_feasible()) {
-            // Compactness: minimize bounding rectangle of all part centers
+            // Compactness: minimize bounding rectangle of all parts
             float min_x = 1e18f, max_x = -1e18f;
             float min_y = 1e18f, max_y = -1e18f;
 
             for (size_t i = 0; i < n; i++) {
                 const auto &pi = ind.placements[i];
-                const auto &g = parts[i].grid;
+                const auto &g = rotated[i];
                 float px_min = pi.x + g.origin.x;
                 float py_min = pi.y + g.origin.y;
                 float px_max = pi.x + g.origin.x + g.nx * g.voxel_size;

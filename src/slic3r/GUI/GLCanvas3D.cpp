@@ -1138,6 +1138,14 @@ void GLCanvas3D::load_arrange_settings()
     if (!en_rot_sla_str.empty())
         m_arrange_settings_sla.enable_rotation = (en_rot_sla_str == "1" || en_rot_sla_str == "true");
 
+    std::string snuggle_str = wxGetApp().app_config->get("arrange", "use_snuggle");
+    if (!snuggle_str.empty())
+        m_arrange_settings_fff.use_snuggle = (snuggle_str == "1" || snuggle_str == "true");
+
+    std::string snuggle_lock_str = wxGetApp().app_config->get("arrange", "snuggle_lock_rotation");
+    if (!snuggle_lock_str.empty())
+        m_arrange_settings_fff.snuggle_lock_rotation = (snuggle_lock_str == "1" || snuggle_lock_str == "true");
+
     //BBS: add specific arrange settings
     m_arrange_settings_fff_seq_print.is_seq_print = true;
 }
@@ -5872,6 +5880,37 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         if (settings_out.enable_rotation == true) { imgui->disabled_end(); }
     }
 
+    // Snuggle (experimental) section
+    ImGui::Separator();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.00f, 0.59f, 0.53f, 1.00f));
+    imgui->text(_L("Snuggle (experimental)"));
+    ImGui::PopStyleColor();
+
+    if (imgui->bbl_checkbox(_L("Use Snuggle 3D nester"), settings.use_snuggle)) {
+        settings_out.use_snuggle = settings.use_snuggle;
+        appcfg->set("arrange", "use_snuggle", settings_out.use_snuggle ? "1" : "0");
+        settings_changed = true;
+    }
+
+    {
+        if (!settings_out.use_snuggle) {
+            imgui->disabled_begin(true);
+            settings.snuggle_lock_rotation = false;
+        }
+
+        if (imgui->bbl_checkbox(_L("Lock rotation"), settings.snuggle_lock_rotation)) {
+            settings_out.snuggle_lock_rotation = settings.snuggle_lock_rotation;
+            appcfg->set("arrange", "snuggle_lock_rotation", settings_out.snuggle_lock_rotation ? "1" : "0");
+            settings_changed = true;
+        }
+
+        if (!settings_out.use_snuggle) { imgui->disabled_end(); }
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+    imgui->text(_L("Genetic algorithm \u2014 slower but better 3D interlocking"));
+    ImGui::PopStyleColor();
+
     ImGui::Separator();
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(15.0f, 10.0f));
     if (imgui->button(_L("Arrange"))) {
@@ -5893,9 +5932,14 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         else
             settings_out.align_to_y_axis = false;
 
+        settings_out.use_snuggle = false;
+        settings_out.snuggle_lock_rotation = false;
+
         appcfg->set("arrange", dist_key, float_to_string_decimal_point(settings_out.distance));
         appcfg->set("arrange", rot_key, settings_out.enable_rotation ? "1" : "0");
         appcfg->set("arrange", align_to_y_axis_key, settings_out.align_to_y_axis ? "1" : "0");
+        appcfg->set("arrange", "use_snuggle", "0");
+        appcfg->set("arrange", "snuggle_lock_rotation", "0");
         settings_changed = true;
     }
     ImGui::PopStyleVar(1);

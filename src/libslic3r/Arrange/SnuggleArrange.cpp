@@ -25,6 +25,11 @@ void snuggle_arrange(
 
     if (items.empty()) return;
 
+    if (!excludes.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << "Snuggle: " << excludes.size()
+            << " excluded items (locked parts, wipe tower) will be IGNORED — not yet implemented";
+    }
+
     // ── Determine bed dimensions from bed points ───────────
     BoundingBox bed_bb(bed);
     float bed_w = unscale_(bed_bb.max.x() - bed_bb.min.x());
@@ -51,8 +56,9 @@ void snuggle_arrange(
             pi.name = obj->name;
             pi.initial_zrot = (float)inst->get_rotation().z();
 
-            // Get the combined mesh for this object
-            const TriangleMesh& mesh = obj->volumes[0]->mesh();
+            // Get the combined mesh for this object (all model-part volumes,
+            // each transformed by its volume matrix, in object-local frame).
+            TriangleMesh mesh = obj->raw_mesh();
             const auto& its = mesh.its;
 
             // Extract vertices and indices for voxelizer

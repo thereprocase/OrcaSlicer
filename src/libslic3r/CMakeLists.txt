@@ -73,6 +73,10 @@ set(lisbslic3r_sources
     ArcFitter.hpp
     Arrange.cpp
     Arrange.hpp
+    Arrange/SnuggleArrange.cpp
+    Arrange/SnuggleArrange.hpp
+    Arrange/polite_voxelizer.hpp
+    Arrange/snuggle_nester.hpp
     BlacklistedLibraryCheck.cpp
     BlacklistedLibraryCheck.hpp
     BoundingBox.cpp

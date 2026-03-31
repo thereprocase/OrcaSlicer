@@ -169,6 +169,93 @@ public:
         };
     }
 
+    // ── Rotated copy: produce a new grid with XY rotation ───
+    //    Allocates a new grid sized to the rotated bounding box,
+    //    then stamps each source voxel into its rotated position.
+    //    Z axis is unchanged (bed-locked parts only rotate in XY).
+    VoxelGrid rotated_copy(float angle_rad) const {
+        // Skip work for zero rotation
+        if (std::abs(angle_rad) < 1e-6f) {
+            VoxelGrid copy;
+            copy.nx = nx; copy.ny = ny; copy.nz = nz;
+            copy.voxel_size = voxel_size;
+            copy.origin = origin;
+            copy.bits_ = bits_;
+            return copy;
+        }
+
+        float ca = std::cos(angle_rad), sa = std::sin(angle_rad);
+
+        // Compute rotated bounding box from the four XY corners
+        // of the source grid (in local space relative to origin)
+        float ext_x = (float)nx * voxel_size;
+        float ext_y = (float)ny * voxel_size;
+        float corners_x[4] = {0, ext_x, 0,     ext_x};
+        float corners_y[4] = {0, 0,     ext_y, ext_y};
+        float min_rx = 1e18f, max_rx = -1e18f;
+        float min_ry = 1e18f, max_ry = -1e18f;
+        for (int c = 0; c < 4; c++) {
+            float rx = corners_x[c] * ca - corners_y[c] * sa;
+            float ry = corners_x[c] * sa + corners_y[c] * ca;
+            min_rx = std::min(min_rx, rx);
+            max_rx = std::max(max_rx, rx);
+            min_ry = std::min(min_ry, ry);
+            max_ry = std::max(max_ry, ry);
+        }
+
+        // Pad by one voxel on each side to avoid clipping
+        size_t rnx = (size_t)std::ceil((max_rx - min_rx) / voxel_size) + 2;
+        size_t rny = (size_t)std::ceil((max_ry - min_ry) / voxel_size) + 2;
+
+        VoxelGrid rot;
+        VoxError err = rot.allocate(rnx, rny, nz);
+        if (err != VoxError::OK) {
+            // Allocation failed — return unrotated copy as fallback
+            VoxelGrid copy;
+            copy.nx = nx; copy.ny = ny; copy.nz = nz;
+            copy.voxel_size = voxel_size;
+            copy.origin = origin;
+            copy.bits_ = bits_;
+            return copy;
+        }
+        rot.clear();
+        rot.voxel_size = voxel_size;
+        // New origin: original origin shifted by the rotated bounding box offset,
+        // minus one voxel of padding
+        rot.origin = {
+            origin.x + min_rx - voxel_size,
+            origin.y + min_ry - voxel_size,
+            origin.z
+        };
+
+        // Rasterize: rotate each source voxel center into dest grid
+        for (size_t z = 0; z < nz; z++) {
+            for (size_t y = 0; y < ny; y++) {
+                for (size_t x = 0; x < nx; x++) {
+                    if (!get(x, y, z)) continue;
+
+                    // Source voxel center in local coords (relative to origin)
+                    float sx = (x + 0.5f) * voxel_size;
+                    float sy = (y + 0.5f) * voxel_size;
+
+                    // Rotate around origin's corner (0,0)
+                    float rx = sx * ca - sy * sa;
+                    float ry = sx * sa + sy * ca;
+
+                    // Convert to dest grid indices
+                    int dx = (int)std::floor((rx - min_rx + voxel_size) / voxel_size);
+                    int dy = (int)std::floor((ry - min_ry + voxel_size) / voxel_size);
+                    rot.set((size_t)dx, (size_t)dy, z);
+                }
+            }
+            // Yield every Z-layer to stay polite
+            if ((z + 1) % 4 == 0)
+                polite_yield();
+        }
+
+        return rot;
+    }
+
     // ── Count solid voxels ─────────────────────────────────
     size_t count_solid() const {
         size_t count = 0;
