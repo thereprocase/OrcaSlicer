@@ -317,8 +317,12 @@ void snuggle_arrange(
         std::vector<size_t> accepted;
 
         for (size_t i = 0; i < items.size() && i < result.placements.size(); i++) {
+            // Skip parts with empty grids (failed voxelization, already marked off-plate)
+            if (items[i].bed_idx == -1) { rejected++; continue; }
+
             const auto& pl = result.placements[i];
             const auto& grid_i = parts[i].grid;
+            if (grid_i.total_voxels() == 0) { items[i].bed_idx = -1; rejected++; continue; }
             auto rot_i = grid_i.rotated_copy(pl.zrot);
 
             // Bounds check

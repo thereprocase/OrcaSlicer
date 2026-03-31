@@ -248,7 +248,7 @@ public:
                     // Convert to dest grid indices
                     int dx = (int)std::floor((rx - min_rx + voxel_size) / voxel_size);
                     int dy = (int)std::floor((ry - min_ry + voxel_size) / voxel_size);
-                    if (dx >= 0 && dy >= 0)
+                    if (dx >= 0 && dx < (int)rnx && dy >= 0 && dy < (int)rny)
                         rot.set((size_t)dx, (size_t)dy, z);
                 }
             }
