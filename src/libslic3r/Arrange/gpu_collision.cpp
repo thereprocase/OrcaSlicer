@@ -399,6 +399,27 @@ void GpuCollisionEvaluator::upload_grids(
                             << ROT_BINS << " rotations = "
                             << (total_voxel_bytes / (1024 * 1024)) << " MB voxel data";
 
+    // Check GPU SSBO size limit — fall back to CPU if data is too large
+    GLint64 max_ssbo_size = 0;
+    glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &max_ssbo_size);
+    if (max_ssbo_size <= 0) max_ssbo_size = 128 * 1024 * 1024; // GL 4.3 minimum: 128 MB
+
+    if ((int64_t)total_voxel_bytes > max_ssbo_size) {
+        BOOST_LOG_TRIVIAL(warning) << "Snuggle GPU: voxel data (" << (total_voxel_bytes / (1024*1024))
+            << " MB) exceeds GPU SSBO limit (" << (max_ssbo_size / (1024*1024))
+            << " MB). Falling back to CPU evaluator.";
+        available_ = false;
+        return;
+    }
+
+    // Guard against uint32 offset overflow (shader uses uint32 data_offset)
+    if (total_voxel_bytes > (size_t)UINT32_MAX) {
+        BOOST_LOG_TRIVIAL(warning) << "Snuggle GPU: voxel data exceeds 4 GB uint32 addressing limit. "
+            "Falling back to CPU evaluator.";
+        available_ = false;
+        return;
+    }
+
     // Allocate CPU-side buffers
     std::vector<uint8_t> voxel_data(total_voxel_bytes, 0);
     std::vector<GridMeta> meta_data(total_metas);
