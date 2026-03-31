@@ -1,5 +1,6 @@
 #include "ArrangeJob.hpp"
 
+#include "libslic3r/Arrange/SnuggleArrange.hpp"
 #include "libslic3r/BuildVolume.hpp"
 #include "libslic3r/SVG.hpp"
 #include "libslic3r/MTUtils.hpp"
@@ -564,7 +565,14 @@ void ArrangeJob::process(Ctl &ctl)
             <<", bbox:"<<get_extents(item.poly).min.transpose()<<","<<get_extents(item.poly).max.transpose();
     }
 
-    arrangement::arrange(m_selected, m_unselected, bedpts, params);
+    // Snuggle: 3D-aware genetic nesting (proof-of-concept)
+    if (params.use_snuggle) {
+        BOOST_LOG_TRIVIAL(info) << "Using Snuggle 3D-aware arrangement";
+        arrangement::snuggle_arrange(m_selected, m_unselected, bedpts, params,
+                                     m_plater->model());
+    } else {
+        arrangement::arrange(m_selected, m_unselected, bedpts, params);
+    }
 
     // sort by item id
     std::sort(m_selected.begin(), m_selected.end(), [](auto a, auto b) {return a.itemid < b.itemid; });
