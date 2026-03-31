@@ -29,7 +29,9 @@
 
 namespace snuggle {
 
-// Forward declaration — full definition in gpu_collision.hpp
+// Forward declaration — full type needed by callers that invoke
+// evaluator methods. SnuggleArrange.cpp includes gpu_collision.hpp
+// before this header to satisfy the dependency.
 class CollisionEvaluator;
 
 // ── Configuration ─────────────────────────────────────────

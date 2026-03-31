@@ -5,8 +5,8 @@
 
 #include "SnuggleArrange.hpp"
 #include "polite_voxelizer.hpp"
-#include "snuggle_nester.hpp"
 #include "gpu_collision.hpp"
+#include "snuggle_nester.hpp"
 
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/BoundingBox.hpp"
@@ -192,10 +192,12 @@ void snuggle_arrange(
         float world_x = pl.x + grid.origin.x + bed_origin_x;
         float world_y = pl.y + grid.origin.y + bed_origin_y;
 
-        // The arrange polygon's poly.contour has its own bounding box.
-        // The translation maps poly-local to world. For the part to appear
-        // at (world_x, world_y), we need: translation + poly_min = world_pos
-        BoundingBox poly_bb = get_extents(items[i].poly);
+        // The translation maps poly-local to world. OrcaSlicer applies
+        // rotation BEFORE translation, so we need the ROTATED polygon's
+        // bounding box to compute the correct offset.
+        ExPolygon rotated_poly = items[i].poly;
+        rotated_poly.rotate(pl.zrot);
+        BoundingBox poly_bb = get_extents(rotated_poly);
         items[i].translation = Vec2crd(
             scaled(world_x) - poly_bb.min.x(),
             scaled(world_y) - poly_bb.min.y()
