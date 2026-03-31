@@ -50,15 +50,15 @@ void snuggle_arrange(
     float voxel_size = 2.0f;
     constexpr size_t MAX_TRIS_FOR_VOXEL = 5000;
 
-    // Walk items (ArrangePolygons) — NOT the model directly.
-    // items is m_selected, which may skip locked/unprintable instances.
-    // Each item has a setter closure that captures the ModelInstance pointer.
-    // We find the matching ModelObject by name to get the mesh.
-    //
-    // Build a name→object lookup for the model.
-    std::unordered_map<std::string, const ModelObject*> obj_by_name;
+    // Walk the model to match items to instances. Build a flat list of
+    // (object, instance) pairs in the same order prepare_all() enumerates,
+    // then match by name. This gives us the ModelInstance pointer needed
+    // to apply the correct instance transform.
+    struct ObjInst { const ModelObject* obj; const ModelInstance* inst; };
+    std::vector<ObjInst> all_instances;
     for (const ModelObject* obj : model.objects)
-        obj_by_name[obj->name] = obj;
+        for (const ModelInstance* inst : obj->instances)
+            all_instances.push_back({obj, inst});
 
     std::vector<snuggle::PartInfo> parts;
     auto t_vox_start = std::chrono::steady_clock::now();
@@ -68,14 +68,20 @@ void snuggle_arrange(
         pi.name = items[i].name;
         pi.initial_zrot = (float)items[i].rotation;
 
-        // Find the ModelObject by name to get the 3D mesh
+        // Find matching instance by name (first unused match)
         const ModelObject* obj = nullptr;
-        auto it = obj_by_name.find(items[i].name);
-        if (it != obj_by_name.end())
-            obj = it->second;
+        const ModelInstance* inst = nullptr;
+        for (auto& oi : all_instances) {
+            if (oi.obj && oi.obj->name == items[i].name) {
+                obj = oi.obj;
+                inst = oi.inst;
+                oi.obj = nullptr;  // mark used
+                break;
+            }
+        }
 
-        if (!obj) {
-            BOOST_LOG_TRIVIAL(warning) << "Snuggle: no model object for item '"
+        if (!obj || !inst) {
+            BOOST_LOG_TRIVIAL(warning) << "Snuggle: no model instance for item '"
                 << items[i].name << "', skipping voxelization";
             pi.max_height_mm = 0;
             pi.hull_area_mm2 = 0;
@@ -83,7 +89,23 @@ void snuggle_arrange(
             continue;
         }
 
+        // Apply the SAME transform as get_arrange_polygon():
+        // Instance scale + mirror + X/Y rotation + Z offset
+        // but NOT XY offset (nester handles placement) or Z rotation (nester handles rotation).
+        // This matches the ArrangePolygon's polygon coordinate frame exactly.
+        Geometry::Transformation t(inst->get_transformation());
+        t.set_offset(Vec3d(0, 0, t.get_offset().z()));  // keep Z offset, zero XY
+        Vec3d rot = t.get_rotation();
+        rot.z() = 0;
+        t.set_rotation(rot);  // keep X/Y rotation, zero Z
+
         TriangleMesh mesh = obj->raw_mesh();
+        mesh.transform(t.get_matrix());
+
+        // Clip at Z=0: if user sank the part into the bed, only voxelize
+        // the portion above the bed surface. Clamp vertices below Z=0.
+        for (auto& v : mesh.its.vertices)
+            if (v.z() < 0) v.z() = 0;
 
         size_t orig_tris = mesh.its.indices.size();
         if (orig_tris > MAX_TRIS_FOR_VOXEL) {
