@@ -132,7 +132,7 @@ struct ArrangeParams {
     float snuggle_timeout_s      = 15.0f;  // seconds per plate
     int   snuggle_rotation_step  = 15;     // 0=locked, 1/5/15/45/90 deg snaps
     bool  snuggle_multi_plate    = true;
-    bool  snuggle_use_gpu        = true;   // try GPU collision, fall back to CPU
+    bool  snuggle_use_gpu        = false;  // GPU shader not yet implemented — default off
     // Legacy GA fields (unused by radial nester, kept for config compat)
     int   snuggle_population     = 64;
     int   snuggle_generations    = 30;

@@ -1150,14 +1150,6 @@ void GLCanvas3D::load_arrange_settings()
     if (!snuggle_padding_str.empty())
         try { m_arrange_settings_fff.snuggle_padding_mm = std::clamp(std::stof(snuggle_padding_str), 0.0f, 20.0f); } catch (...) {}
 
-    std::string snuggle_pop_str = wxGetApp().app_config->get("arrange", "snuggle_population");
-    if (!snuggle_pop_str.empty())
-        try { m_arrange_settings_fff.snuggle_population = std::clamp(std::stoi(snuggle_pop_str), 16, 1024); } catch (...) {}
-
-    std::string snuggle_gen_str = wxGetApp().app_config->get("arrange", "snuggle_generations");
-    if (!snuggle_gen_str.empty())
-        try { m_arrange_settings_fff.snuggle_generations = std::clamp(std::stoi(snuggle_gen_str), 10, 500); } catch (...) {}
-
     std::string snuggle_voxel_str = wxGetApp().app_config->get("arrange", "snuggle_voxel_mm");
     if (!snuggle_voxel_str.empty())
         try { m_arrange_settings_fff.snuggle_voxel_mm = std::clamp(std::stof(snuggle_voxel_str), 0.5f, 5.0f); } catch (...) {}
