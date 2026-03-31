@@ -50,67 +50,84 @@ void snuggle_arrange(
     float voxel_size = 2.0f;
     constexpr size_t MAX_TRIS_FOR_VOXEL = 5000;
 
+    // Walk items (ArrangePolygons) — NOT the model directly.
+    // items is m_selected, which may skip locked/unprintable instances.
+    // Each item has a setter closure that captures the ModelInstance pointer.
+    // We find the matching ModelObject by name to get the mesh.
+    //
+    // Build a name→object lookup for the model.
+    std::unordered_map<std::string, const ModelObject*> obj_by_name;
+    for (const ModelObject* obj : model.objects)
+        obj_by_name[obj->name] = obj;
+
     std::vector<snuggle::PartInfo> parts;
-    size_t instance_idx = 0;
     auto t_vox_start = std::chrono::steady_clock::now();
 
-    for (const ModelObject* obj : model.objects) {
-        for (const ModelInstance* inst : obj->instances) {
-            if (instance_idx >= items.size()) break;
+    for (size_t i = 0; i < items.size(); i++) {
+        snuggle::PartInfo pi;
+        pi.name = items[i].name;
+        pi.initial_zrot = (float)items[i].rotation;
 
-            snuggle::PartInfo pi;
-            pi.name = obj->name;
-            pi.initial_zrot = (float)inst->get_rotation().z();
+        // Find the ModelObject by name to get the 3D mesh
+        const ModelObject* obj = nullptr;
+        auto it = obj_by_name.find(items[i].name);
+        if (it != obj_by_name.end())
+            obj = it->second;
 
-            TriangleMesh mesh = obj->raw_mesh();
-
-            // Decimate high-poly meshes for faster voxelization.
-            // At 2mm voxels, sub-2mm mesh detail is invisible. 5K tris is plenty.
-            size_t orig_tris = mesh.its.indices.size();
-            if (orig_tris > MAX_TRIS_FOR_VOXEL) {
-                its_quadric_edge_collapse(mesh.its, (uint32_t)MAX_TRIS_FOR_VOXEL);
-                BOOST_LOG_TRIVIAL(warning) << "Snuggle: decimated " << obj->name
-                    << " from " << orig_tris << " to " << mesh.its.indices.size() << " tris";
-            }
-
-            const auto& its = mesh.its;
-
-            std::vector<float> verts(its.vertices.size() * 3);
-            std::vector<uint32_t> indices(its.indices.size() * 3);
-
-            for (size_t vi = 0; vi < its.vertices.size(); vi++) {
-                verts[vi * 3 + 0] = its.vertices[vi].x();
-                verts[vi * 3 + 1] = its.vertices[vi].y();
-                verts[vi * 3 + 2] = its.vertices[vi].z();
-            }
-            for (size_t ti = 0; ti < its.indices.size(); ti++) {
-                indices[ti * 3 + 0] = its.indices[ti](0);
-                indices[ti * 3 + 1] = its.indices[ti](1);
-                indices[ti * 3 + 2] = its.indices[ti](2);
-            }
-
-            auto err = snuggle::voxelize_indexed_mesh(
-                verts.data(), its.vertices.size(),
-                indices.data(), its.indices.size(),
-                voxel_size, pi.grid);
-
-            if (err != snuggle::VoxError::OK) {
-                BOOST_LOG_TRIVIAL(warning) << "Snuggle: voxelization failed for "
-                    << obj->name << ": " << snuggle::vox_error_str(err);
-                pi.max_height_mm = 0;
-                pi.hull_area_mm2 = 0;
-            } else {
-                pi.max_height_mm = pi.grid.nz * pi.grid.voxel_size;
-                pi.hull_area_mm2 = pi.grid.nx * pi.grid.ny * voxel_size * voxel_size;
-                BOOST_LOG_TRIVIAL(warning) << "Snuggle: voxelized " << obj->name
-                    << " (" << its.indices.size() << " tris) -> "
-                    << pi.grid.nx << "x" << pi.grid.ny << "x" << pi.grid.nz
-                    << " (" << pi.grid.count_solid() << " solid voxels)";
-            }
-
+        if (!obj) {
+            BOOST_LOG_TRIVIAL(warning) << "Snuggle: no model object for item '"
+                << items[i].name << "', skipping voxelization";
+            pi.max_height_mm = 0;
+            pi.hull_area_mm2 = 0;
             parts.push_back(std::move(pi));
-            instance_idx++;
+            continue;
         }
+
+        TriangleMesh mesh = obj->raw_mesh();
+
+        size_t orig_tris = mesh.its.indices.size();
+        if (orig_tris > MAX_TRIS_FOR_VOXEL) {
+            its_quadric_edge_collapse(mesh.its, (uint32_t)MAX_TRIS_FOR_VOXEL);
+            BOOST_LOG_TRIVIAL(warning) << "Snuggle: decimated " << pi.name
+                << " from " << orig_tris << " to " << mesh.its.indices.size() << " tris";
+        }
+
+        const auto& its = mesh.its;
+
+        std::vector<float> verts(its.vertices.size() * 3);
+        std::vector<uint32_t> indices(its.indices.size() * 3);
+
+        for (size_t vi = 0; vi < its.vertices.size(); vi++) {
+            verts[vi * 3 + 0] = its.vertices[vi].x();
+            verts[vi * 3 + 1] = its.vertices[vi].y();
+            verts[vi * 3 + 2] = its.vertices[vi].z();
+        }
+        for (size_t ti = 0; ti < its.indices.size(); ti++) {
+            indices[ti * 3 + 0] = its.indices[ti](0);
+            indices[ti * 3 + 1] = its.indices[ti](1);
+            indices[ti * 3 + 2] = its.indices[ti](2);
+        }
+
+        auto err = snuggle::voxelize_indexed_mesh(
+            verts.data(), its.vertices.size(),
+            indices.data(), its.indices.size(),
+            voxel_size, pi.grid);
+
+        if (err != snuggle::VoxError::OK) {
+            BOOST_LOG_TRIVIAL(warning) << "Snuggle: voxelization failed for "
+                << pi.name << ": " << snuggle::vox_error_str(err);
+            pi.max_height_mm = 0;
+            pi.hull_area_mm2 = 0;
+        } else {
+            pi.max_height_mm = pi.grid.nz * pi.grid.voxel_size;
+            pi.hull_area_mm2 = pi.grid.nx * pi.grid.ny * voxel_size * voxel_size;
+            BOOST_LOG_TRIVIAL(warning) << "Snuggle: [" << i << "] " << pi.name
+                << " (" << its.indices.size() << " tris) -> "
+                << pi.grid.nx << "x" << pi.grid.ny << "x" << pi.grid.nz
+                << " grid_origin=(" << pi.grid.origin.x << "," << pi.grid.origin.y << ")";
+        }
+
+        parts.push_back(std::move(pi));
     }
 
     auto t_vox_end = std::chrono::steady_clock::now();
@@ -187,14 +204,20 @@ void snuggle_arrange(
         const auto& pl = result.placements[i];
         const auto& grid = (i < parts.size()) ? parts[i].grid : parts[0].grid;
 
-        // Nester places the grid at (pl.x + grid.origin.x, pl.y + grid.origin.y)
-        // in bed-relative coordinates. Convert to Orca's scaled frame.
-        float world_x = pl.x + grid.origin.x + bed_origin_x;
-        float world_y = pl.y + grid.origin.y + bed_origin_y;
+        // The nester placement (pl.x, pl.y) is an XY offset for the voxel grid.
+        // grid.origin is the padded mesh AABB min (expanded by 1 voxel).
+        // The mesh's actual min corner is grid.origin + voxel_size (undo padding).
+        // We want to place the mesh's min corner at the nester's intended position
+        // on the bed.
+        float mesh_min_x = grid.origin.x + grid.voxel_size;  // undo 1-voxel padding
+        float mesh_min_y = grid.origin.y + grid.voxel_size;
+        float bed_x = pl.x + mesh_min_x;  // position on bed in mm (0 to bed_w)
+        float bed_y = pl.y + mesh_min_y;
+        float world_x = bed_x + bed_origin_x;  // convert to Orca world coords
+        float world_y = bed_y + bed_origin_y;
 
-        // The translation maps poly-local to world. OrcaSlicer applies
-        // rotation BEFORE translation, so we need the ROTATED polygon's
-        // bounding box to compute the correct offset.
+        // OrcaSlicer applies rotation BEFORE translation, so compensate
+        // with the ROTATED polygon bounding box.
         ExPolygon rotated_poly = items[i].poly;
         rotated_poly.rotate(pl.zrot);
         BoundingBox poly_bb = get_extents(rotated_poly);
@@ -205,8 +228,13 @@ void snuggle_arrange(
         items[i].rotation = (double)pl.zrot;
         items[i].bed_idx = 0;
 
-        BOOST_LOG_TRIVIAL(warning) << "Snuggle: " << items[i].name
-            << " -> bed(" << (pl.x + grid.origin.x) << ", " << (pl.y + grid.origin.y) << ")"
+        BOOST_LOG_TRIVIAL(warning) << "Snuggle: [" << i << "] " << items[i].name
+            << " placement=(" << pl.x << "," << pl.y << ")"
+            << " mesh_min=(" << mesh_min_x << "," << mesh_min_y << ")"
+            << " bed_pos=(" << bed_x << "," << bed_y << ")"
+            << " world=(" << world_x << "," << world_y << ")"
+            << " poly_bb_min=(" << unscale_(poly_bb.min.x()) << "," << unscale_(poly_bb.min.y()) << ")"
+            << " translation=(" << unscale_(items[i].translation.x()) << "," << unscale_(items[i].translation.y()) << ")"
             << " rot=" << (int)(pl.zrot * 180.0 / 3.14159265) << "deg";
     }
 }
