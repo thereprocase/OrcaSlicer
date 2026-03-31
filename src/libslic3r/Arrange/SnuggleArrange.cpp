@@ -129,7 +129,8 @@ void snuggle_arrange(
 
         if (!obj || !inst) {
             BOOST_LOG_TRIVIAL(warning) << "Snuggle: no model instance for item '"
-                << items[i].name << "', skipping voxelization";
+                << items[i].name << "', marking off-plate";
+            items[i].bed_idx = -1; // Let overflow fallback handle it
             pi.max_height_mm = 0;
             pi.hull_area_mm2 = 0;
             parts.push_back(std::move(pi));

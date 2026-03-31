@@ -152,7 +152,7 @@ public:
         NesterResult result;
         size_t n_parts = parts.size();
 
-        if (n_parts == 0) {
+        if (n_parts == 0 || cfg_.population_size == 0) {
             result.time_ms = 0;
             return result;
         }
@@ -654,6 +654,7 @@ private:
 
     // ── Greedy seed: grid placement ──────────────────────
     void seed_greedy_grid(Individual &ind, const std::vector<PartInfo> &parts) {
+        if (parts.empty()) return;
         std::vector<size_t> order(parts.size());
         std::iota(order.begin(), order.end(), 0);
         std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
@@ -704,7 +705,10 @@ private:
                 }
                 if (found) break;
             }
-            if (!found) { p.x=randf(pw,cfg_.bed_width_mm-pw); p.y=randf(ph,cfg_.bed_height_mm-ph); }
+            if (!found) {
+                float hx=std::max(pw+0.1f,cfg_.bed_width_mm-pw), hy=std::max(ph+0.1f,cfg_.bed_height_mm-ph);
+                p.x=randf(std::min(pw,hx),hx); p.y=randf(std::min(ph,hy),hy);
+            }
         }
     }
 
