@@ -221,7 +221,7 @@ void snuggle_arrange(
             pi.hull_area_mm2 = 0;
         } else {
             pi.max_height_mm = pi.grid.nz * pi.grid.voxel_size;
-            pi.hull_area_mm2 = pi.grid.nx * pi.grid.ny * voxel_size * voxel_size;
+            pi.hull_area_mm2 = pi.grid.nx * pi.grid.ny * pi.grid.voxel_size * pi.grid.voxel_size;
             BOOST_LOG_TRIVIAL(warning) << "Snuggle: [" << i << "] " << pi.name
                 << " (" << its.indices.size() << " tris) -> "
                 << pi.grid.nx << "x" << pi.grid.ny << "x" << pi.grid.nz
@@ -266,7 +266,7 @@ void snuggle_arrange(
     BOOST_LOG_TRIVIAL(info) << "Snuggle config:"
         << " pop=" << cfg.population_size << " gens=" << cfg.max_generations
         << " timeout=" << cfg.timeout_seconds << "s"
-        << " voxel=" << voxel_size << "mm"
+        << " voxel=" << base_voxel_size << "mm (base)"
         << " rot_step=" << params.snuggle_rotation_step << "deg"
         << " lock_rot=" << cfg.lock_rotation;
 
