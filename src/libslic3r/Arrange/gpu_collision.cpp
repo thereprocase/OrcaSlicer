@@ -136,6 +136,7 @@ layout(std430, binding = 3) writeonly buffer Results   { uvec2 results[];  };
 uniform uint u_n_parts;
 uniform float u_bed_w;
 uniform float u_bed_h;
+uniform float u_bed_margin;
 uniform uint u_rot_bins;
 
 uint angle_to_bin(float zrot) {
@@ -171,10 +172,10 @@ void main() {
         float pmax_x = pmin_x + float(mi.nx) * mi.voxel_size;
         float pmax_y = pmin_y + float(mi.ny) * mi.voxel_size;
 
-        if (pmin_x < 0.0) total_oob += uint(-pmin_x / mi.voxel_size);
-        if (pmin_y < 0.0) total_oob += uint(-pmin_y / mi.voxel_size);
-        if (pmax_x > u_bed_w) total_oob += uint((pmax_x - u_bed_w) / mi.voxel_size);
-        if (pmax_y > u_bed_h) total_oob += uint((pmax_y - u_bed_h) / mi.voxel_size);
+        if (pmin_x < u_bed_margin) total_oob += uint((u_bed_margin - pmin_x) / mi.voxel_size);
+        if (pmin_y < u_bed_margin) total_oob += uint((u_bed_margin - pmin_y) / mi.voxel_size);
+        if (pmax_x > u_bed_w - u_bed_margin) total_oob += uint((pmax_x - u_bed_w + u_bed_margin) / mi.voxel_size);
+        if (pmax_y > u_bed_h - u_bed_margin) total_oob += uint((pmax_y - u_bed_h + u_bed_margin) / mi.voxel_size);
 
         // Pairwise collision with parts j > i
         for (uint j = i + 1u; j < u_n_parts; j++) {
@@ -473,8 +474,6 @@ void GpuCollisionEvaluator::evaluate_batch(
     const std::vector<PartInfo>& parts,
     float bed_w, float bed_h, float bed_margin)
 {
-    // TODO: pass bed_margin to shader as uniform for GPU OOB check
-    (void)bed_margin;
     if (!available_ || individuals.empty()) return;
 
     size_t pop_size = individuals.size();
@@ -515,6 +514,7 @@ void GpuCollisionEvaluator::evaluate_batch(
     glUniform1ui(glGetUniformLocation(program_, "u_n_parts"), (GLuint)n);
     glUniform1f(glGetUniformLocation(program_, "u_bed_w"), bed_w);
     glUniform1f(glGetUniformLocation(program_, "u_bed_h"), bed_h);
+    glUniform1f(glGetUniformLocation(program_, "u_bed_margin"), bed_margin);
     glUniform1ui(glGetUniformLocation(program_, "u_rot_bins"), (GLuint)ROT_BINS);
 
     // Dispatch: one invocation per individual
