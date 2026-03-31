@@ -188,8 +188,9 @@ public:
         float best_fitness_seen = -1e18f;
         size_t gens_without_improvement = 0;
         float current_mutation_scale = 1.0f;
+        size_t gen = 0;
 
-        for (size_t gen = 0; gen < cfg_.max_generations; gen++) {
+        for (; gen < cfg_.max_generations; gen++) {
             // Timeout check
             auto now = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double>(now - t_start).count();
@@ -296,7 +297,7 @@ public:
         result.collisions     = best.collision_count;
         result.oob            = best.oob_count;
         result.feasible       = best.is_feasible();
-        result.generations_run = cfg_.max_generations;
+        result.generations_run = gen; // actual generations completed
         result.time_ms        = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
         // Post-GA compaction: jiggle parts toward cluster center with
@@ -374,6 +375,16 @@ private:
                 // Build rotated grid for this part
                 VoxelGrid rot_i = parts[idx].grid.rotated_copy(pl.zrot);
 
+                // Pre-compute rotated copies for collision partners (avoid redundant copies)
+                std::vector<const VoxelGrid*> rot_others(n, nullptr);
+                std::vector<VoxelGrid> rot_others_storage;
+                rot_others_storage.reserve(n);
+                for (size_t j = 0; j < n; j++) {
+                    if (j == idx) continue;
+                    rot_others_storage.push_back(parts[j].grid.rotated_copy(result.placements[j].zrot));
+                    rot_others[j] = &rot_others_storage.back();
+                }
+
                 // Binary search: max step toward center without collision
                 float lo = 0, hi = dist;
                 float best_step = 0;
@@ -388,10 +399,9 @@ private:
                     bool collides = false;
                     Vec3f off_test = {test_x, test_y, 0.0f};
                     for (size_t j = 0; j < n; j++) {
-                        if (j == idx) continue;
-                        VoxelGrid rot_j = parts[j].grid.rotated_copy(result.placements[j].zrot);
+                        if (j == idx || !rot_others[j]) continue;
                         Vec3f off_j = {result.placements[j].x, result.placements[j].y, 0.0f};
-                        if (VoxelGrid::collision_count(rot_i, off_test, rot_j, off_j) > 0) {
+                        if (VoxelGrid::collision_count(rot_i, off_test, *rot_others[j], off_j) > 0) {
                             collides = true;
                             break;
                         }
@@ -518,12 +528,12 @@ private:
         rot_cache_.resize(n);
 
         if (cfg_.lock_rotation) {
-            // Only build the single needed angle per part (saves 359x memory)
+            // Build one rotated copy per part and replicate to all bins.
+            // This avoids 360x the compute while ensuring any bin lookup
+            // returns a valid (non-empty) grid — critical for GPU evaluator.
             for (size_t i = 0; i < n; i++) {
-                rot_cache_[i].resize(ROT_CACHE_BINS);
-                int bin = (int)std::floor(parts[i].initial_zrot * ROT_CACHE_BINS / (2.0f * 3.14159265f));
-                bin = ((bin % ROT_CACHE_BINS) + ROT_CACHE_BINS) % ROT_CACHE_BINS;
-                rot_cache_[i][bin] = parts[i].grid.rotated_copy(parts[i].initial_zrot);
+                VoxelGrid rotated = parts[i].grid.rotated_copy(parts[i].initial_zrot);
+                rot_cache_[i].resize(ROT_CACHE_BINS, rotated); // fill all bins with same copy
                 polite_yield();
             }
         } else {
