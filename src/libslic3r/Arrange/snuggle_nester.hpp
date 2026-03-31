@@ -587,8 +587,9 @@ private:
             float part_margin = parts[i].grid.nx * parts[i].grid.voxel_size * 0.5f;
             float lo = std::max(part_margin, cfg_.bed_margin_mm);
             // Ensure lo < hi to avoid UB in uniform_real_distribution
-            float hi_x = std::max(lo + 0.1f, cfg_.bed_width_mm - lo);
-            float hi_y = std::max(lo + 0.1f, cfg_.bed_height_mm - lo);
+            // Right bound must also account for part margin
+            float hi_x = std::max(lo + 0.1f, cfg_.bed_width_mm - std::max(part_margin, cfg_.bed_margin_mm));
+            float hi_y = std::max(lo + 0.1f, cfg_.bed_height_mm - std::max(part_margin, cfg_.bed_margin_mm));
             p.x = randf(lo, hi_x);
             p.y = randf(lo, hi_y);
             p.zrot = cfg_.lock_rotation
@@ -788,8 +789,10 @@ private:
                 // Wildcard: completely random new position
                 float wild_margin = std::max(parts[i].grid.nx * parts[i].grid.voxel_size * 0.5f,
                                              cfg_.bed_margin_mm);
-                p.x = randf(wild_margin, cfg_.bed_width_mm - wild_margin);
-                p.y = randf(wild_margin, cfg_.bed_height_mm - wild_margin);
+                float wx_hi = std::max(wild_margin + 0.1f, cfg_.bed_width_mm - wild_margin);
+                float wy_hi = std::max(wild_margin + 0.1f, cfg_.bed_height_mm - wild_margin);
+                p.x = randf(wild_margin, wx_hi);
+                p.y = randf(wild_margin, wy_hi);
                 if (!cfg_.lock_rotation)
                     p.zrot = randf(0, 2.0f * 3.14159265f);
             }
