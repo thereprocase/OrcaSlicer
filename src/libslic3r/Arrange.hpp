@@ -122,6 +122,10 @@ struct ArrangeParams {
 
     bool do_final_align = true;
 
+    // Snuggle: 3D-aware genetic nesting
+    bool use_snuggle = false;
+    bool snuggle_lock_rotation = false;
+
     //BBS: add specific arrange params
     bool  allow_multi_materials_on_same_plate = true;
     bool  avoid_extrusion_cali_region         = true;
@@ -172,6 +176,8 @@ struct ArrangeParams {
         ret += "\"clearance_height_to_lid\":" + std::to_string(clearance_height_to_lid) + ",";
         ret += "\"clearance_radius\":" + std::to_string(clearance_radius) + ",";
         ret += "\"printable_height\":" + std::to_string(printable_height) + ",";
+        ret += "\"use_snuggle\":" + std::to_string(use_snuggle) + ",";
+        ret += "\"snuggle_lock_rotation\":" + std::to_string(snuggle_lock_rotation);
         return ret;
     }
 

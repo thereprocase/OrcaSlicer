@@ -15,6 +15,7 @@
 #include "slic3r/GUI/GUI_ObjectList.hpp"
 
 #include "libnest2d/common.hpp"
+#include "libslic3r/Arrange/SnuggleArrange.hpp"
 
 #define SAVE_ARRANGE_POLY 0
 
@@ -564,7 +565,12 @@ void ArrangeJob::process(Ctl &ctl)
             <<", bbox:"<<get_extents(item.poly).min.transpose()<<","<<get_extents(item.poly).max.transpose();
     }
 
-    arrangement::arrange(m_selected, m_unselected, bedpts, params);
+    if (params.use_snuggle) {
+        BOOST_LOG_TRIVIAL(info) << "Snuggle: starting 3D-aware arrangement for " << m_selected.size() << " items";
+        arrangement::snuggle_arrange(m_selected, m_unselected, bedpts, params, m_plater->model());
+    } else {
+        arrangement::arrange(m_selected, m_unselected, bedpts, params);
+    }
 
     // sort by item id
     std::sort(m_selected.begin(), m_selected.end(), [](auto a, auto b) {return a.itemid < b.itemid; });
@@ -712,6 +718,11 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
             _L("Arrangement ignored the following objects which can't fit into a single bed:\n%s"),
             concat_strings(names, "\n")));
     }
+    if (params.use_snuggle) {
+        m_plater->get_notification_manager()->push_notification(NotificationType::BBLPlateInfo,
+            NotificationManager::NotificationLevel::RegularNotificationLevel,
+            into_u8(_L("Snuggle arrangement complete.")));
+    }
     m_plater->get_notification_manager()->close_notification_of_type(NotificationType::ArrangeOngoing);
 
     //BBS: reload all objects due to arrange
@@ -780,6 +791,8 @@ arrangement::ArrangeParams init_arrange_params(Plater *p)
     params.is_seq_print                        = settings.is_seq_print;
     params.min_obj_distance                    = scaled(settings.distance);
     params.align_to_y_axis                     = settings.align_to_y_axis;
+    params.use_snuggle                         = settings.use_snuggle;
+    params.snuggle_lock_rotation               = settings.snuggle_lock_rotation;
 
     int state = p->get_prepare_state();
     if (state == Job::JobPrepareState::PREPARE_STATE_MENU) {

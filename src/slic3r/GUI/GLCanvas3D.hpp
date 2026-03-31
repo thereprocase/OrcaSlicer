@@ -496,6 +496,8 @@ public:
         //BBS: add more arrangeSettings
         bool is_seq_print        = false;
         bool  align_to_y_axis    = false;
+        bool  use_snuggle        = false;
+        bool  snuggle_lock_rotation = false;
     };
 
     struct OrientSettings
