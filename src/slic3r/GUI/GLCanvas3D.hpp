@@ -498,15 +498,14 @@ public:
         bool  align_to_y_axis    = false;
         bool  use_snuggle           = false;
         bool  snuggle_lock_rotation = false;
-        float snuggle_padding_mm    = 1.0f;
-        int   snuggle_population    = 64;
-        int   snuggle_generations   = 30;
+        float snuggle_padding_mm    = 1.5f;
         float snuggle_voxel_mm      = 2.0f;
         bool  snuggle_compact       = false;
-        int   snuggle_max_parts     = 200;
-        float snuggle_timeout_s     = 5.0f;
+        int   snuggle_max_parts     = 50;
+        float snuggle_timeout_s     = 15.0f;
         int   snuggle_rotation_step = 15;
         bool  snuggle_multi_plate   = true;
+        bool  snuggle_use_gpu       = true;
     };
 
     struct OrientSettings
