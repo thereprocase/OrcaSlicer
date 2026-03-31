@@ -35,7 +35,7 @@ void CpuCollisionEvaluator::upload_grids(
 
 const VoxelGrid& CpuCollisionEvaluator::get_rotated(size_t part_idx, float angle) const
 {
-    int bin = (int)std::floor(angle * ROT_CACHE_BINS / (2.0f * 3.14159265f));
+    int bin = (int)std::floor(angle * ROT_CACHE_BINS / TWO_PI_F);
     bin = ((bin % ROT_CACHE_BINS) + ROT_CACHE_BINS) % ROT_CACHE_BINS;
     return (*rot_cache_)[part_idx][bin];
 }
@@ -140,7 +140,7 @@ uniform float u_bed_margin;
 uniform uint u_rot_bins;
 
 uint angle_to_bin(float zrot) {
-    int bin = int(floor(zrot * float(u_rot_bins) / 6.2831853));
+    int bin = int(floor(zrot * float(u_rot_bins) / 6.28318530717959));
     return uint(((bin % int(u_rot_bins)) + int(u_rot_bins)) % int(u_rot_bins));
 }
 
@@ -269,6 +269,7 @@ bool GpuCollisionEvaluator::init_context()
         BOOST_LOG_TRIVIAL(warning) << "Snuggle GPU: CreateWindow failed";
         return false;
     }
+    // Store immediately so cleanup() can release on any failure below
     gl_hwnd_ = (void*)hwnd;
 
     HDC hdc = GetDC(hwnd);
@@ -381,12 +382,12 @@ void GpuCollisionEvaluator::upload_grids(
     if (!available_) return;
 
     n_parts_ = parts.size();
-    size_t total_metas = n_parts_ * ROT_BINS;
+    size_t total_metas = n_parts_ * ROT_CACHE_BINS;
 
     // Pass 1: compute total voxel data size (repacked to uint32 alignment)
     size_t total_voxel_bytes = 0;
     for (size_t p = 0; p < n_parts_; p++) {
-        for (int r = 0; r < ROT_BINS; r++) {
+        for (int r = 0; r < ROT_CACHE_BINS; r++) {
             const auto& grid = rot_cache[p][r];
             size_t total_bits = grid.nx * grid.ny * grid.nz;
             // Round up to 4-byte boundary for uint32 word alignment
@@ -396,7 +397,7 @@ void GpuCollisionEvaluator::upload_grids(
     }
 
     BOOST_LOG_TRIVIAL(info) << "Snuggle GPU: uploading " << n_parts_ << " parts x "
-                            << ROT_BINS << " rotations = "
+                            << ROT_CACHE_BINS << " rotations = "
                             << (total_voxel_bytes / (1024 * 1024)) << " MB voxel data";
 
     // Check GPU SSBO size limit — fall back to CPU if data is too large
@@ -429,13 +430,13 @@ void GpuCollisionEvaluator::upload_grids(
     // Dest:   bit N is at uint32[N/32], bit (N%32)
     size_t offset = 0;
     for (size_t p = 0; p < n_parts_; p++) {
-        for (int r = 0; r < ROT_BINS; r++) {
+        for (int r = 0; r < ROT_CACHE_BINS; r++) {
             const auto& grid = rot_cache[p][r];
             size_t total_bits = grid.nx * grid.ny * grid.nz;
             size_t grid_bytes = ((total_bits + 31) / 32) * 4;
 
             // Fill metadata
-            size_t meta_idx = p * ROT_BINS + r;
+            size_t meta_idx = p * ROT_CACHE_BINS + r;
             meta_data[meta_idx].data_offset = (uint32_t)offset;
             meta_data[meta_idx].nx = (uint32_t)grid.nx;
             meta_data[meta_idx].ny = (uint32_t)grid.ny;
@@ -536,7 +537,7 @@ void GpuCollisionEvaluator::evaluate_batch(
     glUniform1f(glGetUniformLocation(program_, "u_bed_w"), bed_w);
     glUniform1f(glGetUniformLocation(program_, "u_bed_h"), bed_h);
     glUniform1f(glGetUniformLocation(program_, "u_bed_margin"), bed_margin);
-    glUniform1ui(glGetUniformLocation(program_, "u_rot_bins"), (GLuint)ROT_BINS);
+    glUniform1ui(glGetUniformLocation(program_, "u_rot_bins"), (GLuint)ROT_CACHE_BINS);
 
     // Dispatch: one invocation per individual
     glDispatchCompute((GLuint)pop_size, 1, 1);
@@ -569,12 +570,13 @@ void GpuCollisionEvaluator::evaluate_batch(
 
 void GpuCollisionEvaluator::cleanup()
 {
-    // Delete GL objects if context is still current
+    // Delete GL objects if context was successfully created
     if (gl_context_) {
 #ifdef _WIN32
         HDC hdc = (HDC)gl_dc_;
         HGLRC ctx = (HGLRC)gl_context_;
-        wglMakeCurrent(hdc, ctx);
+        if (hdc)
+            wglMakeCurrent(hdc, ctx);
 #endif
         if (program_) { glDeleteProgram(program_); program_ = 0; }
         if (voxel_ssbo_) { glDeleteBuffers(1, &voxel_ssbo_); voxel_ssbo_ = 0; }
@@ -586,18 +588,22 @@ void GpuCollisionEvaluator::cleanup()
         wglMakeCurrent(NULL, NULL);
         wglDeleteContext(ctx);
         gl_context_ = nullptr;
-
-        if (gl_hwnd_) {
-            HWND hwnd = (HWND)gl_hwnd_;
-            if (gl_dc_) {
-                ReleaseDC(hwnd, (HDC)gl_dc_);
-                gl_dc_ = nullptr;
-            }
-            DestroyWindow(hwnd);
-            gl_hwnd_ = nullptr;
-        }
 #endif
     }
+
+    // Release DC and destroy window even if GL context creation failed.
+    // Handles partial init where GetDC succeeded but wglCreateContext did not.
+#ifdef _WIN32
+    if (gl_hwnd_) {
+        HWND hwnd = (HWND)gl_hwnd_;
+        if (gl_dc_) {
+            ReleaseDC(hwnd, (HDC)gl_dc_);
+            gl_dc_ = nullptr;
+        }
+        DestroyWindow(hwnd);
+        gl_hwnd_ = nullptr;
+    }
+#endif
 }
 
 #endif // SLIC3R_GUI

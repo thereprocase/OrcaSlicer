@@ -5938,7 +5938,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     // When Snuggle is on, explain that it manages rotation differently
     if (settings_out.use_snuggle) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
-        imgui->text(_L("Snuggle controls rotation \u2014 see Lock Rotation below"));
+        imgui->text(_L("Snuggle controls rotation \u2014 see Rotation dropdown below"));
         ImGui::PopStyleColor();
     }
 
@@ -5950,16 +5950,18 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         imgui->text(_L("Part gap"));
         ImGui::SameLine(1.2 * cursor_slider_left);
         ImGui::PushItemWidth(window_width - slider_icon_width);
-        bool b_padding = imgui->bbl_slider_float_style("##SnugglePadding", &settings.snuggle_padding_mm, 0.0f, 20.0f, "%4.1f");
+        bool b_padding = imgui->bbl_slider_float_style("##SnugglePadding", &settings.snuggle_padding_mm, 1.0f, 20.0f, "%4.1f");
         ImGui::SameLine(window_width - slider_icon_width + 1.3 * cursor_slider_left);
         ImGui::PushItemWidth(1.5 * slider_icon_width);
-        bool b_padding_input = ImGui::BBLDragFloat("##snuggle_padding_input", &settings.snuggle_padding_mm, 0.1f, 0.0f, 20.0f, "%.1f");
+        bool b_padding_input = ImGui::BBLDragFloat("##snuggle_padding_input", &settings.snuggle_padding_mm, 0.1f, 1.0f, 20.0f, "%.1f");
         if (b_padding || b_padding_input) {
-            settings.snuggle_padding_mm = std::clamp(settings.snuggle_padding_mm, 0.0f, 20.0f);
+            settings.snuggle_padding_mm = std::clamp(settings.snuggle_padding_mm, 1.0f, 20.0f);
             settings_out.snuggle_padding_mm = settings.snuggle_padding_mm;
             appcfg->set("arrange", "snuggle_padding_mm", float_to_string_decimal_point(settings_out.snuggle_padding_mm));
             settings_changed = true;
         }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", _u8L("Minimum clearance between parts in millimeters.").c_str());
 
         if (imgui->bbl_checkbox(_L("Compact after arrange"), settings.snuggle_compact)) {
             settings_out.snuggle_compact = settings.snuggle_compact;
@@ -6020,7 +6022,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
                                           "2.0 mm is a good default. 0.5 mm for tight packing.").c_str());
 
         // ── Collapsible effort / debug menu ───────────────────
-        if (ImGui::TreeNode(_u8L("Effort / Advanced").c_str())) {
+        if (ImGui::TreeNode(_u8L("Advanced settings").c_str())) {
             ImGui::AlignTextToFramePadding();
             imgui->text(_L("Population"));
             ImGui::SameLine(1.2 * cursor_slider_left);
@@ -6059,6 +6061,9 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
                 appcfg->set("arrange", "snuggle_timeout_s", float_to_string_decimal_point(settings_out.snuggle_timeout_s));
                 settings_changed = true;
             }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", _u8L("Maximum time allowed for arrangement.\n"
+                                              "If time runs out, the best result found so far is used.").c_str());
 
             ImGui::AlignTextToFramePadding();
             imgui->text(_L("Max parts"));
@@ -6070,21 +6075,18 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
                 appcfg->set("arrange", "snuggle_max_parts", std::to_string(settings_out.snuggle_max_parts));
                 settings_changed = true;
             }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", _u8L("Maximum number of parts for Snuggle to handle.\n"
+                                              "Above this limit, standard arrange is used instead.").c_str());
 
             if (imgui->bbl_checkbox(_L("Multi-plate overflow"), settings.snuggle_multi_plate)) {
                 settings_out.snuggle_multi_plate = settings.snuggle_multi_plate;
                 appcfg->set("arrange", "snuggle_multi_plate", settings_out.snuggle_multi_plate ? "1" : "0");
                 settings_changed = true;
             }
-
-            if (imgui->bbl_checkbox(_L("Post-GA compaction"), settings.snuggle_compact)) {
-                settings_out.snuggle_compact = settings.snuggle_compact;
-                appcfg->set("arrange", "snuggle_compact", settings_out.snuggle_compact ? "1" : "0");
-                settings_changed = true;
-            }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", _u8L("Jiggle parts toward center after GA. Usually not needed —\n"
-                                              "the GA's fitness function already optimizes for tight clusters.").c_str());
+                ImGui::SetTooltip("%s", _u8L("When enabled, parts that don't fit on the current plate\n"
+                                              "overflow to additional plates. When disabled, they remain unplaced.").c_str());
 
             ImGui::TreePop();
         }
@@ -6100,7 +6102,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
             ImGui::PopStyleColor();
         } else {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
-            imgui->text(_L("Genetic 3D nester \u2014 voxel collision detection"));
+            imgui->text(_L("3D-aware arrangement \u2014 places parts considering their full shape"));
             ImGui::PopStyleColor();
         }
     }

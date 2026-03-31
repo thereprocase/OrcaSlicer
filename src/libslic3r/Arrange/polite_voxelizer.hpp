@@ -161,6 +161,7 @@ public:
     // ── World <-> grid coordinate conversion ───────────────
     // World to grid (conservative outward: floor for min, ceil for max)
     void world_to_grid(const Vec3f &world, int &gx, int &gy, int &gz) const {
+        if (voxel_size <= 0.0f) { gx = gy = gz = 0; return; }
         gx = (int)std::floor((world.x - origin.x) / voxel_size);
         gy = (int)std::floor((world.y - origin.y) / voxel_size);
         gz = (int)std::floor((world.z - origin.z) / voxel_size);
@@ -304,6 +305,7 @@ public:
 
         // Iterate overlap region at the coarser voxel size
         float vs = std::max(a.voxel_size, b.voxel_size);
+        if (vs <= 0.0f) return 0;
         size_t collisions = 0;
         size_t iters = 0;
 

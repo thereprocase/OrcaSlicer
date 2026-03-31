@@ -669,7 +669,7 @@ void ArrangeJob::process(Ctl &ctl)
             // Full fallback (seq print, too many parts, etc.) — all items bed_idx=-1
             // The overflow handler already passed them to the default arranger,
             // so show a neutral message rather than "Snuggle complete — 0 parts"
-            finish_msg = _u8L("Arranging done.");
+            finish_msg = _u8L("Snuggle skipped \u2014 standard arrange used.");
         }
     } else if (we_have_unpackable_items) {
         finish_msg = _u8L("Arranging is done but there are unpacked items. Reduce spacing and try again.");

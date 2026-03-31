@@ -11,6 +11,7 @@
 #pragma once
 
 #include "polite_voxelizer.hpp"
+#include "snuggle_constants.hpp"
 #include <vector>
 #include <memory>
 #include <atomic>
@@ -55,7 +56,6 @@ public:
                         float bed_margin = 0.0f) override;
 private:
     const std::vector<std::vector<VoxelGrid>>* rot_cache_ = nullptr;
-    static constexpr int ROT_CACHE_BINS = 360;
 
     const VoxelGrid& get_rotated(size_t part_idx, float angle) const;
 };
@@ -91,7 +91,6 @@ private:
     void* gl_hwnd_ = nullptr;
 
     size_t n_parts_ = 0;
-    static constexpr int ROT_BINS = 360;
 
     bool init_context();
     bool compile_shader();

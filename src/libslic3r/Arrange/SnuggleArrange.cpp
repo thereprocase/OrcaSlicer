@@ -13,6 +13,7 @@
 #include "libslic3r/QuadricEdgeCollapse.hpp"
 
 #include <boost/log/trivial.hpp>
+#include <map>
 
 namespace Slic3r { namespace arrangement {
 
@@ -102,10 +103,10 @@ void snuggle_arrange(
     // then match by name. This gives us the ModelInstance pointer needed
     // to apply the correct instance transform.
     struct ObjInst { const ModelObject* obj; const ModelInstance* inst; };
-    std::vector<ObjInst> all_instances;
+    std::multimap<std::string, ObjInst> instance_lookup;
     for (const ModelObject* obj : model.objects)
         for (const ModelInstance* inst : obj->instances)
-            all_instances.push_back({obj, inst});
+            instance_lookup.emplace(obj->name, ObjInst{obj, inst});
 
     std::vector<snuggle::PartInfo> parts;
     auto t_vox_start = std::chrono::steady_clock::now();
@@ -115,15 +116,15 @@ void snuggle_arrange(
         pi.name = items[i].name;
         pi.initial_zrot = (float)items[i].rotation;
 
-        // Find matching instance by name (first unused match)
+        // Find matching instance by name (first unused match, O(log N) lookup)
         const ModelObject* obj = nullptr;
         const ModelInstance* inst = nullptr;
-        for (auto& oi : all_instances) {
-            if (oi.obj && oi.obj->name == items[i].name) {
-                obj = oi.obj;
-                inst = oi.inst;
-                oi.obj = nullptr;  // mark used
-                break;
+        {
+            auto it = instance_lookup.find(items[i].name);
+            if (it != instance_lookup.end()) {
+                obj = it->second.obj;
+                inst = it->second.inst;
+                instance_lookup.erase(it);  // consume this instance
             }
         }
 
@@ -191,9 +192,7 @@ void snuggle_arrange(
             items[i].bed_idx = -1; // Let overflow fallback handle this part
             pi.max_height_mm = 0;
             pi.hull_area_mm2 = 0;
-            parts.push_back(std::move(pi));
-            continue;
-        } {
+        } else {
             pi.max_height_mm = pi.grid.nz * pi.grid.voxel_size;
             pi.hull_area_mm2 = pi.grid.nx * pi.grid.ny * voxel_size * voxel_size;
             BOOST_LOG_TRIVIAL(warning) << "Snuggle: [" << i << "] " << pi.name
@@ -229,7 +228,7 @@ void snuggle_arrange(
         cfg.lock_rotation = false;
         // Quantize allowed rotations to the step size
         // The nester's rotation_step_rad limits what angles the GA explores
-        cfg.rotation_step_rad = (float)params.snuggle_rotation_step * (3.14159265f / 180.0f);
+        cfg.rotation_step_rad = (float)params.snuggle_rotation_step * (snuggle::PI_F / 180.0f);
     }
     // Lock rotation override from the checkbox takes priority
     if (params.snuggle_lock_rotation)
@@ -276,10 +275,10 @@ void snuggle_arrange(
         // Progress string includes backend, gen count, and collision status
         if (params.progressind) {
             unsigned progress = (unsigned)(gen * 100 / std::max(max_gen, (size_t)1));
-            std::string status = " (Snuggle " + backend_name
-                + " gen " + std::to_string(gen) + "/" + std::to_string(max_gen)
-                + (best.is_feasible() ? " OK" : " " + std::to_string(best.collision_count) + " collisions")
-                + ")";
+            std::string status = best.is_feasible()
+                ? " Optimizing... " + std::to_string(progress) + "% (all parts fit)"
+                : " Optimizing... " + std::to_string(progress) + "% ("
+                  + std::to_string(best.collision_count) + " parts overlapping)";
             params.progressind(progress, status);
         }
         // Check stop condition
@@ -373,7 +372,7 @@ void snuggle_arrange(
         const auto& pl = result.placements[i];
         BOOST_LOG_TRIVIAL(warning) << "Snuggle: [" << i << "] " << items[i].name
             << " origin_bed=(" << pl.origin_bed_x << "," << pl.origin_bed_y << ")"
-            << " rot=" << (int)(pl.zrot * 180.0 / 3.14159265) << "deg";
+            << " rot=" << (int)(pl.zrot * 180.0 / snuggle::PI_F) << "deg";
     }
 
     if (rejected > 0)

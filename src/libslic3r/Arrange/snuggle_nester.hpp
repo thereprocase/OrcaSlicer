@@ -19,6 +19,7 @@
 #pragma once
 
 #include "polite_voxelizer.hpp"
+#include "snuggle_constants.hpp"
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -515,7 +516,6 @@ private:
     // ── Rotation cache ────────────────────────────────────
     // Quantize angles to 1-degree bins. Pre-build on first access.
     // Avoids rebuilding rotated grids every evaluation (~100x speedup).
-    static constexpr int ROT_CACHE_BINS = 360;
     std::vector<std::vector<VoxelGrid>> rot_cache_; // [part][angle_bin]
     bool rot_cache_built_ = false;
 
@@ -538,7 +538,7 @@ private:
             for (size_t i = 0; i < n; i++) {
                 rot_cache_[i].resize(ROT_CACHE_BINS);
                 for (int bin = 0; bin < ROT_CACHE_BINS; bin++) {
-                    float angle = (float)bin * (2.0f * 3.14159265f / ROT_CACHE_BINS);
+                    float angle = (float)bin * (TWO_PI_F / ROT_CACHE_BINS);
                     rot_cache_[i][bin] = parts[i].grid.rotated_copy(angle);
                 }
                 polite_yield();
@@ -560,17 +560,17 @@ private:
         if (cfg_.lock_rotation) return initial_zrot;
         if (cfg_.rotation_step_rad <= 0.001f) return angle_rad; // continuous
         float delta = angle_rad - initial_zrot;
-        // Normalize delta to [0, 2pi)
-        constexpr float TWO_PI = 2.0f * 3.14159265f;
-        while (delta < 0) delta += TWO_PI;
-        while (delta >= TWO_PI) delta -= TWO_PI;
+        // Normalize delta to [0, 2pi) using fmod to avoid O(N) loop on extreme values
+        constexpr float TWO_PI = TWO_PI_F;
+        delta = std::fmod(delta, TWO_PI);
+        if (delta < 0) delta += TWO_PI;
         // Snap to nearest step
         float steps = std::round(delta / cfg_.rotation_step_rad);
         return initial_zrot + steps * cfg_.rotation_step_rad;
     }
 
     const VoxelGrid& cached_rotated(size_t part_idx, float angle_rad) const {
-        int bin = (int)std::floor(angle_rad * ROT_CACHE_BINS / (2.0f * 3.14159265f));
+        int bin = (int)std::floor(angle_rad * ROT_CACHE_BINS / TWO_PI_F);
         bin = ((bin % ROT_CACHE_BINS) + ROT_CACHE_BINS) % ROT_CACHE_BINS;
         return rot_cache_[part_idx][bin];
     }
@@ -597,7 +597,7 @@ private:
             p.y = randf(lo, hi_y);
             p.zrot = cfg_.lock_rotation
                 ? parts[i].initial_zrot
-                : randf(0.0f, 2.0f * 3.14159265f);
+                : randf(0.0f, TWO_PI_F);
         }
     }
 
@@ -757,7 +757,7 @@ private:
                 p.x += randf(-nudge_range, nudge_range);
                 p.y += randf(-nudge_range, nudge_range);
                 if (!cfg_.lock_rotation)
-                    p.zrot += randf(-rot_range, rot_range) * (3.14159265f / 180.0f);
+                    p.zrot += randf(-rot_range, rot_range) * (PI_F / 180.0f);
             } else if (roll < 0.75f) {
                 // Shuffle: swap positions with another part
                 size_t j = randi(0, ind.placements.size() - 1);
@@ -797,7 +797,7 @@ private:
                 p.x = randf(wild_margin, wx_hi);
                 p.y = randf(wild_margin, wy_hi);
                 if (!cfg_.lock_rotation)
-                    p.zrot = randf(0, 2.0f * 3.14159265f);
+                    p.zrot = randf(0, TWO_PI_F);
             }
 
             // Clamp to bed (respect bed margin)
