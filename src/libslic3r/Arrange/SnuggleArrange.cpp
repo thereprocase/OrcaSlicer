@@ -23,21 +23,59 @@ void snuggle_arrange(
     const ArrangeParams&      params,
     const Model&              model)
 {
-    BOOST_LOG_TRIVIAL(warning) << "Snuggle: starting 3D-aware arrangement for " << items.size() << " items";
+    BOOST_LOG_TRIVIAL(info) << "Snuggle: starting 3D-aware arrangement for " << items.size() << " items";
 
     if (items.empty()) return;
 
-    if (!excludes.empty()) {
-        BOOST_LOG_TRIVIAL(warning) << "Snuggle: " << excludes.size()
-            << " excluded items (locked parts, wipe tower) will be IGNORED — not yet implemented";
-    }
-
-    // ── Determine bed dimensions from bed points ───────────
+    // ── Determine bed dimensions ──────────────────────────
     BoundingBox bed_bb(bed);
     float bed_w = unscale_(bed_bb.max.x() - bed_bb.min.x());
     float bed_h = unscale_(bed_bb.max.y() - bed_bb.min.y());
     float bed_origin_x = unscale_(bed_bb.min.x());
     float bed_origin_y = unscale_(bed_bb.min.y());
+
+    // ── Single-part: center instantly, no GA ──────────────
+    if (items.size() == 1) {
+        BOOST_LOG_TRIVIAL(info) << "Snuggle: single part — centering on bed";
+        float cx = bed_origin_x + bed_w * 0.5f;
+        float cy = bed_origin_y + bed_h * 0.5f;
+        items[0].translation = Vec2crd(scaled(cx), scaled(cy));
+        items[0].rotation = 0.0;
+        items[0].bed_idx = 0;
+        return;
+    }
+
+    // ── Too many parts: fall back to standard arranger ────
+    constexpr size_t MAX_SNUGGLE_PARTS = 50;
+    if (items.size() > MAX_SNUGGLE_PARTS) {
+        BOOST_LOG_TRIVIAL(warning) << "Snuggle: " << items.size() << " parts exceeds limit ("
+            << MAX_SNUGGLE_PARTS << "). Falling back to standard arranger.";
+        return; // Items stay UNARRANGED, ArrangeJob fallback handles them
+    }
+
+    // ── Sequential printing: hard block ───────────────────
+    if (params.is_seq_print) {
+        BOOST_LOG_TRIVIAL(warning) << "Snuggle: sequential printing active — "
+            "cannot verify toolhead clearance. Falling back to standard arranger.";
+        return;
+    }
+
+    // ── Pre-flight: flag oversized parts ──────────────────
+    for (size_t i = 0; i < items.size(); ++i) {
+        auto bb = get_extents(items[i].poly);
+        float pw = unscale_(bb.max.x() - bb.min.x());
+        float ph = unscale_(bb.max.y() - bb.min.y());
+        if (pw > bed_w || ph > bed_h) {
+            BOOST_LOG_TRIVIAL(warning) << "Snuggle: part '" << items[i].name
+                << "' (" << pw << "x" << ph << " mm) exceeds bed. Marking off-plate.";
+            items[i].bed_idx = -1;
+        }
+    }
+
+    if (!excludes.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << "Snuggle: " << excludes.size()
+            << " excluded items (locked parts, wipe tower) — passed as obstacles to overflow arranger";
+    }
 
     BOOST_LOG_TRIVIAL(warning) << "Snuggle: bed " << bed_w << " x " << bed_h
                                << " mm, origin (" << bed_origin_x << ", " << bed_origin_y << ")";
@@ -137,12 +175,15 @@ void snuggle_arrange(
             indices.data(), its.indices.size(),
             voxel_size, pi.grid);
 
-        if (err != snuggle::VoxError::OK) {
-            BOOST_LOG_TRIVIAL(warning) << "Snuggle: voxelization failed for "
-                << pi.name << ": " << snuggle::vox_error_str(err);
+        if (err != snuggle::VoxError::OK || pi.grid.count_solid() == 0) {
+            BOOST_LOG_TRIVIAL(warning) << "Snuggle: voxelization failed for '"
+                << pi.name << "' — marking off-plate, fallback will handle it";
+            items[i].bed_idx = -1; // Let overflow fallback handle this part
             pi.max_height_mm = 0;
             pi.hull_area_mm2 = 0;
-        } else {
+            parts.push_back(std::move(pi));
+            continue;
+        } {
             pi.max_height_mm = pi.grid.nz * pi.grid.voxel_size;
             pi.hull_area_mm2 = pi.grid.nx * pi.grid.ny * voxel_size * voxel_size;
             BOOST_LOG_TRIVIAL(warning) << "Snuggle: [" << i << "] " << pi.name

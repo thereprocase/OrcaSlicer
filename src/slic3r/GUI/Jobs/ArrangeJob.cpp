@@ -634,14 +634,40 @@ void ArrangeJob::process(Ctl &ctl)
     if (ctl.was_canceled()) {
         finish_msg = _u8L("Arranging canceled.");
     } else if (params.use_snuggle) {
-        // Count placed vs total for Snuggle-specific message
+        // Count placed vs total, compute bed utilization
         int placed = 0;
-        for (const auto &item : m_selected)
-            if (item.bed_idx >= 0) placed++;
-        if (we_have_unpackable_items)
-            finish_msg = GUI::format(_L("Snuggle placed %1% of %2% parts. Some couldn't fit."), placed, (int)m_selected.size());
-        else
+        BoundingBox placed_bb;
+        bool has_placed = false;
+        for (const auto &item : m_selected) {
+            if (item.bed_idx >= 0) {
+                placed++;
+                // Accumulate bounding box of placed items
+                Polygon hull = item.poly.contour;
+                hull.rotate(item.rotation);
+                hull.translate(item.translation);
+                auto bb = get_extents(hull);
+                if (!has_placed) { placed_bb = bb; has_placed = true; }
+                else { placed_bb.merge(bb); }
+            }
+        }
+
+        if (we_have_unpackable_items) {
+            finish_msg = GUI::format(_L("Snuggle placed %1% of %2% parts. Some overflow to next plate."),
+                                    placed, (int)m_selected.size());
+        } else if (has_placed) {
+            // Compute bed utilization
+            float bbox_area = unscale_(placed_bb.max.x() - placed_bb.min.x())
+                            * unscale_(placed_bb.max.y() - placed_bb.min.y());
+            float bed_area = 1.0f;
+            BoundingBox bed_bb(bedpts);
+            bed_area = unscale_(bed_bb.max.x() - bed_bb.min.x())
+                     * unscale_(bed_bb.max.y() - bed_bb.min.y());
+            int pct = (bed_area > 0) ? (int)(bbox_area / bed_area * 100.0f) : 0;
+            finish_msg = GUI::format(_L("Snuggle complete \u2014 %1% parts arranged. Bed usage: %2%%%"),
+                                    placed, pct);
+        } else {
             finish_msg = GUI::format(_L("Snuggle complete \u2014 %1% parts arranged."), placed);
+        }
     } else if (we_have_unpackable_items) {
         finish_msg = _u8L("Arranging is done but there are unpacked items. Reduce spacing and try again.");
     } else {
