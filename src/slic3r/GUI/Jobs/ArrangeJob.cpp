@@ -568,6 +568,36 @@ void ArrangeJob::process(Ctl &ctl)
     if (params.use_snuggle) {
         BOOST_LOG_TRIVIAL(info) << "Snuggle: starting 3D-aware arrangement for " << m_selected.size() << " items";
         arrangement::snuggle_arrange(m_selected, m_unselected, bedpts, params, m_plater->model());
+
+        // Check if Snuggle left any items unarranged — fall back to default arranger for those
+        bool has_unarranged = false;
+        for (const auto& item : m_selected)
+            if (item.bed_idx < 0) { has_unarranged = true; break; }
+
+        if (has_unarranged) {
+            BOOST_LOG_TRIVIAL(warning) << "Snuggle left unarranged items — falling back to default arranger for overflow";
+            // Collect unarranged items and run default arranger on them
+            ArrangePolygons snuggle_placed, overflow;
+            for (auto& item : m_selected) {
+                if (item.bed_idx >= 0)
+                    snuggle_placed.push_back(std::move(item));
+                else
+                    overflow.push_back(std::move(item));
+            }
+            // Snuggle-placed items become fixed obstacles for the overflow arranger
+            ArrangePolygons combined_fixed = m_unselected;
+            for (auto& placed : snuggle_placed)
+                combined_fixed.push_back(placed);
+
+            arrangement::arrange(overflow, combined_fixed, bedpts, params);
+
+            // Recombine
+            m_selected.clear();
+            for (auto& item : snuggle_placed)
+                m_selected.push_back(std::move(item));
+            for (auto& item : overflow)
+                m_selected.push_back(std::move(item));
+        }
     } else {
         arrangement::arrange(m_selected, m_unselected, bedpts, params);
     }

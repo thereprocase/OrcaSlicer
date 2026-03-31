@@ -63,6 +63,36 @@ void snuggle_arrange(
         << bed_width_mm << " x " << bed_height_mm << " mm"
         << " origin=(" << bed_origin_x_mm << "," << bed_origin_y_mm << ") mm";
 
+    // ── Pre-flight: can parts even theoretically fit? ────────────────
+    // Quick check: if the single largest part exceeds the bed in either
+    // dimension, it can never fit. Mark it UNARRANGED immediately.
+    // Also check if total footprint area exceeds bed area (rough heuristic).
+    {
+        float bed_area = bed_width_mm * bed_height_mm;
+        float total_footprint = 0;
+        for (size_t i = 0; i < items.size(); ++i) {
+            // Estimate part footprint from the hull polygon bounding box
+            auto bb = get_extents(items[i].poly);
+            float pw = snuggle_xform::scaled_to_mm(bb.max.x() - bb.min.x());
+            float ph = snuggle_xform::scaled_to_mm(bb.max.y() - bb.min.y());
+            total_footprint += pw * ph;
+
+            if (pw > bed_width_mm || ph > bed_height_mm) {
+                BOOST_LOG_TRIVIAL(warning) << "[SnuggleArrange] Part '" << items[i].name
+                    << "' (" << pw << "x" << ph << " mm) exceeds bed dimensions. "
+                    << "Marking UNARRANGED.";
+                items[i].bed_idx = UNARRANGED;
+            }
+        }
+
+        // If total footprint > 90% of bed area, warn (may not fit with gaps)
+        if (total_footprint > bed_area * 0.9f) {
+            BOOST_LOG_TRIVIAL(warning) << "[SnuggleArrange] Total part footprint ("
+                << total_footprint << " mm^2) approaches bed area ("
+                << bed_area << " mm^2). Some parts may not fit.";
+        }
+    }
+
     // ── Step 2: Voxelize parts ───────────────────────────────────────
     BOOST_LOG_TRIVIAL(info) << "[SnuggleArrange] Voxelizing " << items.size() << " parts...";
 
