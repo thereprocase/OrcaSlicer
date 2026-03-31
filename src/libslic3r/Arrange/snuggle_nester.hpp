@@ -550,6 +550,12 @@ private:
         rot_cache_built_ = true;
     }
 
+    // Safe clamp that handles min > max (returns midpoint instead of UB)
+    static float safe_clamp(float val, float lo, float hi) {
+        if (lo > hi) { float mid = (lo + hi) * 0.5f; return mid; }
+        return std::clamp(val, lo, hi);
+    }
+
     // Snap rotation to step increment relative to part's initial_zrot.
     // If step is 0 or lock_rotation, returns initial_zrot unchanged.
     // Otherwise quantizes (angle - initial) to nearest step, adds back initial.
@@ -620,8 +626,8 @@ private:
             p.zrot = cfg_.lock_rotation ? parts[idx].initial_zrot : 0.0f;
 
             // Clamp to bed (respect bed margin)
-            p.x = std::clamp(p.x, cfg_.bed_margin_mm, cfg_.bed_width_mm - cfg_.bed_margin_mm);
-            p.y = std::clamp(p.y, cfg_.bed_margin_mm, cfg_.bed_height_mm - cfg_.bed_margin_mm);
+            p.x = safe_clamp(p.x, cfg_.bed_margin_mm, cfg_.bed_width_mm - cfg_.bed_margin_mm);
+            p.y = safe_clamp(p.y, cfg_.bed_margin_mm, cfg_.bed_height_mm - cfg_.bed_margin_mm);
 
             float part_size = std::sqrt(parts[idx].hull_area_mm2) * 0.5f;
             radius += part_size + cfg_.min_gap_mm;
@@ -642,7 +648,7 @@ private:
             p.zrot = cfg_.lock_rotation ? parts[i].initial_zrot : 0.0f;
 
             // Clamp to bed (respect bed margin)
-            p.x = std::clamp(p.x, cfg_.bed_margin_mm, cfg_.bed_width_mm - cfg_.bed_margin_mm);
+            p.x = safe_clamp(p.x, cfg_.bed_margin_mm, cfg_.bed_width_mm - cfg_.bed_margin_mm);
 
             cursor_x += part_width + cfg_.min_gap_mm;
             // Wrap to next row if needed
@@ -673,8 +679,8 @@ private:
             p.x = ((int)(idx % cols) + 0.5f) * cell_w;
             p.y = ((int)(idx / cols) + 0.5f) * cell_h + cfg_.min_gap_mm;
             p.zrot = cfg_.lock_rotation ? parts[pi].initial_zrot : 0.0f;
-            p.x = std::clamp(p.x, cfg_.bed_margin_mm, cfg_.bed_width_mm - cfg_.bed_margin_mm);
-            p.y = std::clamp(p.y, cfg_.bed_margin_mm, cfg_.bed_height_mm - cfg_.bed_margin_mm);
+            p.x = safe_clamp(p.x, cfg_.bed_margin_mm, cfg_.bed_width_mm - cfg_.bed_margin_mm);
+            p.y = safe_clamp(p.y, cfg_.bed_margin_mm, cfg_.bed_height_mm - cfg_.bed_margin_mm);
         }
     }
 
@@ -798,8 +804,8 @@ private:
             }
 
             // Clamp to bed (respect bed margin)
-            p.x = std::clamp(p.x, cfg_.bed_margin_mm, cfg_.bed_width_mm - cfg_.bed_margin_mm);
-            p.y = std::clamp(p.y, cfg_.bed_margin_mm, cfg_.bed_height_mm - cfg_.bed_margin_mm);
+            p.x = safe_clamp(p.x, cfg_.bed_margin_mm, cfg_.bed_width_mm - cfg_.bed_margin_mm);
+            p.y = safe_clamp(p.y, cfg_.bed_margin_mm, cfg_.bed_height_mm - cfg_.bed_margin_mm);
 
             // Snap rotation to step increment relative to initial position
             p.zrot = snap_rotation(p.zrot, parts[i].initial_zrot);
