@@ -866,6 +866,10 @@ arrangement::ArrangeParams init_arrange_params(Plater *p)
     params.snuggle_padding_mm                  = settings.snuggle_padding_mm;
     params.snuggle_quality                     = settings.snuggle_quality;
     params.snuggle_compact                     = settings.snuggle_compact;
+    params.snuggle_max_parts                   = settings.snuggle_max_parts;
+    params.snuggle_timeout_s                   = settings.snuggle_timeout_s;
+    params.snuggle_rotation_step               = settings.snuggle_rotation_step;
+    params.snuggle_multi_plate                 = settings.snuggle_multi_plate;
 
     int state = p->get_prepare_state();
     if (state == Job::JobPrepareState::PREPARE_STATE_MENU) {

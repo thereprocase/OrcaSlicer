@@ -57,6 +57,8 @@ struct NesterConfig {
 
     // Rotation control
     bool   lock_rotation     = false;  // true = XY only, preserve user's Z rotation
+    float  rotation_step_rad = 0.0f;   // 0 = continuous, else snap to this increment
+                                       // initial_zrot is always treated as the "home" position
 
     // Fitness weights
     float  w_compactness     = 1.0f;
@@ -520,6 +522,22 @@ private:
         rot_cache_built_ = true;
     }
 
+    // Snap rotation to step increment relative to part's initial_zrot.
+    // If step is 0 or lock_rotation, returns initial_zrot unchanged.
+    // Otherwise quantizes (angle - initial) to nearest step, adds back initial.
+    float snap_rotation(float angle_rad, float initial_zrot) const {
+        if (cfg_.lock_rotation) return initial_zrot;
+        if (cfg_.rotation_step_rad <= 0.001f) return angle_rad; // continuous
+        float delta = angle_rad - initial_zrot;
+        // Normalize delta to [0, 2pi)
+        constexpr float TWO_PI = 2.0f * 3.14159265f;
+        while (delta < 0) delta += TWO_PI;
+        while (delta >= TWO_PI) delta -= TWO_PI;
+        // Snap to nearest step
+        float steps = std::round(delta / cfg_.rotation_step_rad);
+        return initial_zrot + steps * cfg_.rotation_step_rad;
+    }
+
     const VoxelGrid& cached_rotated(size_t part_idx, float angle_rad) const {
         int bin = (int)std::floor(angle_rad * ROT_CACHE_BINS / (2.0f * 3.14159265f));
         bin = ((bin % ROT_CACHE_BINS) + ROT_CACHE_BINS) % ROT_CACHE_BINS;
@@ -745,8 +763,8 @@ private:
             p.x = std::clamp(p.x, cfg_.bed_margin_mm, cfg_.bed_width_mm - cfg_.bed_margin_mm);
             p.y = std::clamp(p.y, cfg_.bed_margin_mm, cfg_.bed_height_mm - cfg_.bed_margin_mm);
 
-            while (p.zrot < 0) p.zrot += 2.0f * 3.14159265f;
-            while (p.zrot > 2.0f * 3.14159265f) p.zrot -= 2.0f * 3.14159265f;
+            // Snap rotation to step increment relative to initial position
+            p.zrot = snap_rotation(p.zrot, parts[i].initial_zrot);
         }
     }
 

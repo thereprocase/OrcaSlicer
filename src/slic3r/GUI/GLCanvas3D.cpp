@@ -1158,6 +1158,22 @@ void GLCanvas3D::load_arrange_settings()
     if (!snuggle_compact_str.empty())
         m_arrange_settings_fff.snuggle_compact = (snuggle_compact_str == "1" || snuggle_compact_str == "true");
 
+    std::string snuggle_max_parts_str = wxGetApp().app_config->get("arrange", "snuggle_max_parts");
+    if (!snuggle_max_parts_str.empty())
+        try { m_arrange_settings_fff.snuggle_max_parts = std::stoi(snuggle_max_parts_str); } catch (...) {}
+
+    std::string snuggle_timeout_str = wxGetApp().app_config->get("arrange", "snuggle_timeout_s");
+    if (!snuggle_timeout_str.empty())
+        try { m_arrange_settings_fff.snuggle_timeout_s = std::stof(snuggle_timeout_str); } catch (...) {}
+
+    std::string snuggle_rot_step_str = wxGetApp().app_config->get("arrange", "snuggle_rotation_step");
+    if (!snuggle_rot_step_str.empty())
+        try { m_arrange_settings_fff.snuggle_rotation_step = std::stoi(snuggle_rot_step_str); } catch (...) {}
+
+    std::string snuggle_multi_plate_str = wxGetApp().app_config->get("arrange", "snuggle_multi_plate");
+    if (!snuggle_multi_plate_str.empty())
+        m_arrange_settings_fff.snuggle_multi_plate = (snuggle_multi_plate_str == "1" || snuggle_multi_plate_str == "true");
+
     //BBS: add specific arrange settings
     m_arrange_settings_fff_seq_print.is_seq_print = true;
 }
@@ -5916,26 +5932,9 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     }
 
     {
-        if (!settings_out.use_snuggle) {
-            imgui->disabled_begin(true);
-        }
-
-        if (imgui->bbl_checkbox(_L("Lock rotation"), settings.snuggle_lock_rotation)) {
-            settings_out.snuggle_lock_rotation = settings.snuggle_lock_rotation;
-            appcfg->set("arrange", "snuggle_lock_rotation", settings_out.snuggle_lock_rotation ? "1" : "0");
-            settings_changed = true;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", _u8L("Preserve each part's current Z-rotation during arrangement.\n"
-                                          "When unchecked, Snuggle may rotate parts for tighter packing.\n"
-                                          "Recommended: ON for parts with specific orientation requirements.").c_str());
-
-        if (!settings_out.use_snuggle) { imgui->disabled_end(); }
-    }
-
-    {
         if (!settings_out.use_snuggle) { imgui->disabled_begin(true); }
 
+        // Part gap slider
         ImGui::AlignTextToFramePadding();
         imgui->text(_L("Part gap"));
         ImGui::SameLine(1.2 * cursor_slider_left);
@@ -5951,20 +5950,6 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
             settings_changed = true;
         }
 
-        ImGui::AlignTextToFramePadding();
-        imgui->text(_L("Quality"));
-        ImGui::SameLine(1.2 * cursor_slider_left);
-        ImGui::PushItemWidth(window_width - slider_icon_width);
-        float quality_f = (float)settings.snuggle_quality;
-        if (imgui->bbl_slider_float_style("##SnuggleQuality", &quality_f, 1.0f, 10.0f, "%.0f")) {
-            settings.snuggle_quality = (int)quality_f;
-            settings_out.snuggle_quality = settings.snuggle_quality;
-            appcfg->set("arrange", "snuggle_quality", std::to_string(settings_out.snuggle_quality));
-            settings_changed = true;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", _u8L("Higher = better packing, slower").c_str());
-
         if (imgui->bbl_checkbox(_L("Compact after arrange"), settings.snuggle_compact)) {
             settings_out.snuggle_compact = settings.snuggle_compact;
             appcfg->set("arrange", "snuggle_compact", settings_out.snuggle_compact ? "1" : "0");
@@ -5972,6 +5957,93 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", _u8L("Jiggle parts toward center after arrangement to close gaps.").c_str());
+
+        // Rotation step dropdown
+        ImGui::AlignTextToFramePadding();
+        imgui->text(_L("Rotation"));
+        ImGui::SameLine(1.2 * cursor_slider_left);
+        const char* rot_labels[] = {"Locked", "90\xC2\xB0", "45\xC2\xB0", "15\xC2\xB0", "5\xC2\xB0", "1\xC2\xB0"};
+        int rot_values[] = {0, 90, 45, 15, 5, 1};
+        int rot_idx = 0;
+        for (int ri = 0; ri < 6; ri++)
+            if (settings.snuggle_rotation_step == rot_values[ri]) { rot_idx = ri; break; }
+        ImGui::PushItemWidth(window_width);
+        if (ImGui::Combo("##SnuggleRotStep", &rot_idx, rot_labels, 6)) {
+            settings.snuggle_rotation_step = rot_values[rot_idx];
+            settings_out.snuggle_rotation_step = settings.snuggle_rotation_step;
+            appcfg->set("arrange", "snuggle_rotation_step", std::to_string(settings_out.snuggle_rotation_step));
+            // Lock rotation checkbox follows: step 0 = locked
+            settings_out.snuggle_lock_rotation = (settings_out.snuggle_rotation_step == 0);
+            appcfg->set("arrange", "snuggle_lock_rotation", settings_out.snuggle_lock_rotation ? "1" : "0");
+            settings_changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", _u8L("Rotation snap increment relative to each part's starting orientation.\n"
+                                          "Locked = parts keep their current rotation.\n"
+                                          "90\xC2\xB0 = try 0, 90, 180, 270 from starting position.").c_str());
+
+        // Quality with text input
+        ImGui::AlignTextToFramePadding();
+        imgui->text(_L("Quality"));
+        ImGui::SameLine(1.2 * cursor_slider_left);
+        ImGui::PushItemWidth(window_width - slider_icon_width);
+        float quality_f = (float)settings.snuggle_quality;
+        bool b_quality = imgui->bbl_slider_float_style("##SnuggleQuality", &quality_f, 1.0f, 10.0f, "%.0f");
+        ImGui::SameLine(window_width - slider_icon_width + 1.3 * cursor_slider_left);
+        ImGui::PushItemWidth(1.5 * slider_icon_width);
+        int quality_i = settings.snuggle_quality;
+        bool b_quality_input = ImGui::InputInt("##quality_input", &quality_i, 0, 0);
+        if (b_quality || b_quality_input) {
+            settings.snuggle_quality = b_quality ? (int)quality_f : std::clamp(quality_i, 1, 10);
+            settings_out.snuggle_quality = settings.snuggle_quality;
+            appcfg->set("arrange", "snuggle_quality", std::to_string(settings_out.snuggle_quality));
+            settings_changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", _u8L("Population = quality \xC3\x97 64 candidates.\n"
+                                          "Generations = 20 + quality \xC3\x97 10.\n"
+                                          "Higher = better packing, slower.").c_str());
+
+        // ── Collapsible debug menu ────────────────────────────
+        if (ImGui::TreeNode(_u8L("Debug / Advanced").c_str())) {
+            ImGui::AlignTextToFramePadding();
+            imgui->text(_L("Timeout (s)"));
+            ImGui::SameLine(1.2 * cursor_slider_left);
+            ImGui::PushItemWidth(window_width);
+            if (ImGui::InputFloat("##SnuggleTimeout", &settings.snuggle_timeout_s, 5.0f, 10.0f, "%.0f")) {
+                settings.snuggle_timeout_s = std::clamp(settings.snuggle_timeout_s, 5.0f, 300.0f);
+                settings_out.snuggle_timeout_s = settings.snuggle_timeout_s;
+                appcfg->set("arrange", "snuggle_timeout_s", float_to_string_decimal_point(settings_out.snuggle_timeout_s));
+                settings_changed = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", _u8L("Maximum seconds for the genetic nester per plate.").c_str());
+
+            ImGui::AlignTextToFramePadding();
+            imgui->text(_L("Max parts"));
+            ImGui::SameLine(1.2 * cursor_slider_left);
+            ImGui::PushItemWidth(window_width);
+            if (ImGui::InputInt("##SnuggleMaxParts", &settings.snuggle_max_parts, 10, 50)) {
+                settings.snuggle_max_parts = std::clamp(settings.snuggle_max_parts, 2, 500);
+                settings_out.snuggle_max_parts = settings.snuggle_max_parts;
+                appcfg->set("arrange", "snuggle_max_parts", std::to_string(settings_out.snuggle_max_parts));
+                settings_changed = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", _u8L("Maximum parts per plate before overflow to next plate.\n"
+                                              "Higher values use more CPU/GPU time.").c_str());
+
+            if (imgui->bbl_checkbox(_L("Multi-plate overflow"), settings.snuggle_multi_plate)) {
+                settings_out.snuggle_multi_plate = settings.snuggle_multi_plate;
+                appcfg->set("arrange", "snuggle_multi_plate", settings_out.snuggle_multi_plate ? "1" : "0");
+                settings_changed = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", _u8L("When parts don't fit, automatically overflow to additional plates.\n"
+                                              "Each plate is arranged independently.").c_str());
+
+            ImGui::TreePop();
+        }
 
         if (!settings_out.use_snuggle) { imgui->disabled_end(); }
     }
@@ -6015,6 +6087,10 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         settings_out.snuggle_padding_mm = 5.0f;
         settings_out.snuggle_quality = 5;
         settings_out.snuggle_compact = true;
+        settings_out.snuggle_max_parts = 200;
+        settings_out.snuggle_timeout_s = 40.0f;
+        settings_out.snuggle_rotation_step = 0;
+        settings_out.snuggle_multi_plate = true;
 
         appcfg->set("arrange", dist_key, float_to_string_decimal_point(settings_out.distance));
         appcfg->set("arrange", rot_key, settings_out.enable_rotation ? "1" : "0");

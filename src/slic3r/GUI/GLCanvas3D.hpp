@@ -501,6 +501,10 @@ public:
         float snuggle_padding_mm    = 5.0f;
         int   snuggle_quality       = 5;
         bool  snuggle_compact       = true;
+        int   snuggle_max_parts     = 200;
+        float snuggle_timeout_s     = 40.0f;
+        int   snuggle_rotation_step = 0;    // 0=locked, 1,5,15,45,90
+        bool  snuggle_multi_plate   = true;
     };
 
     struct OrientSettings

@@ -46,11 +46,11 @@ void snuggle_arrange(
     }
 
     // ── Too many parts: fall back to standard arranger ────
-    constexpr size_t MAX_SNUGGLE_PARTS = 50;
-    if (items.size() > MAX_SNUGGLE_PARTS) {
+    size_t max_parts = std::max(2, params.snuggle_max_parts);
+    if (items.size() > max_parts) {
         BOOST_LOG_TRIVIAL(warning) << "Snuggle: " << items.size() << " parts exceeds limit ("
-            << MAX_SNUGGLE_PARTS << "). Falling back to standard arranger.";
-        return; // Items stay UNARRANGED, ArrangeJob fallback handles them
+            << max_parts << "). Falling back to standard arranger.";
+        return;
     }
 
     // ── Sequential printing: hard block ───────────────────
@@ -206,14 +206,33 @@ void snuggle_arrange(
     cfg.bed_height_mm   = bed_h;
     cfg.min_gap_mm      = std::max(1.0f, params.snuggle_padding_mm);
 
-    // Quality 1-10 maps to population and generations
+    // Quality 1-10: population = quality * 64, generations = quality * 10 + 20
     int quality = std::clamp(params.snuggle_quality, 1, 10);
-    cfg.population_size = 64 + quality * 64;    // 128 to 704
-    cfg.max_generations = 20 + quality * 10;    // 30 to 120
-    cfg.timeout_seconds = 5.0 + quality * 5.0;  // 10s to 55s
+    cfg.population_size = quality * 64;        // 64 to 640
+    cfg.max_generations = 20 + quality * 10;   // 30 to 120
+    cfg.timeout_seconds = std::max(5.0, (double)params.snuggle_timeout_s);
 
-    cfg.lock_rotation   = params.snuggle_lock_rotation;
+    // Rotation step: 0=locked, else degrees per snap increment
+    // The initial_zrot on each part is the user's pre-rotation (their starting position)
+    if (params.snuggle_rotation_step <= 0) {
+        cfg.lock_rotation = true;
+    } else {
+        cfg.lock_rotation = false;
+        // Quantize allowed rotations to the step size
+        // The nester's rotation_step_rad limits what angles the GA explores
+        cfg.rotation_step_rad = (float)params.snuggle_rotation_step * (3.14159265f / 180.0f);
+    }
+    // Lock rotation override from the checkbox takes priority
+    if (params.snuggle_lock_rotation)
+        cfg.lock_rotation = true;
+
     cfg.compact         = params.snuggle_compact;
+
+    BOOST_LOG_TRIVIAL(info) << "Snuggle config: quality=" << quality
+        << " pop=" << cfg.population_size << " gens=" << cfg.max_generations
+        << " timeout=" << cfg.timeout_seconds << "s"
+        << " rot_step=" << params.snuggle_rotation_step << "deg"
+        << " lock_rot=" << cfg.lock_rotation;
 
     // Shrink effective bed by voxel padding (1 voxel per side) + min gap
     cfg.bed_margin_mm   = voxel_size + cfg.min_gap_mm;
