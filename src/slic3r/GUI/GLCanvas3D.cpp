@@ -5969,10 +5969,8 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", _u8L("Jiggle parts toward center after arrangement to close gaps.").c_str());
 
-        // Rotation step dropdown
-        ImGui::AlignTextToFramePadding();
+        // Rotation step dropdown (label on its own row, dropdown below)
         imgui->text(_L("Rotation"));
-        ImGui::SameLine(1.2 * cursor_slider_left);
         const char* rot_labels[] = {"Locked", "90\xC2\xB0", "45\xC2\xB0", "15\xC2\xB0", "5\xC2\xB0", "1\xC2\xB0"};
         int rot_values[] = {0, 90, 45, 15, 5, 1};
         // Snap invalid config values to nearest valid option
@@ -5985,7 +5983,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         // Sync the actual value to the snapped option
         settings.snuggle_rotation_step = rot_values[rot_idx];
         settings_out.snuggle_rotation_step = rot_values[rot_idx];
-        ImGui::PushItemWidth(window_width);
+        ImGui::PushItemWidth(window_width + 1.2f * cursor_slider_left);
         if (ImGui::Combo("##SnuggleRotStep", &rot_idx, rot_labels, 6)) {
             settings.snuggle_rotation_step = rot_values[rot_idx];
             settings_out.snuggle_rotation_step = settings.snuggle_rotation_step;
