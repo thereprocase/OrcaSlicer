@@ -1182,6 +1182,10 @@ void GLCanvas3D::load_arrange_settings()
     if (!snuggle_multi_plate_str.empty())
         m_arrange_settings_fff.snuggle_multi_plate = (snuggle_multi_plate_str == "1" || snuggle_multi_plate_str == "true");
 
+    std::string snuggle_use_gpu_str = wxGetApp().app_config->get("arrange", "snuggle_use_gpu");
+    if (!snuggle_use_gpu_str.empty())
+        m_arrange_settings_fff.snuggle_use_gpu = (snuggle_use_gpu_str == "1" || snuggle_use_gpu_str == "true");
+
     // Derive lock_rotation from rotation_step (dropdown is source of truth)
     m_arrange_settings_fff.snuggle_lock_rotation = (m_arrange_settings_fff.snuggle_rotation_step == 0);
 
@@ -6045,6 +6049,16 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
                 settings_changed = true;
             }
 
+            if (imgui->bbl_checkbox(_L("GPU acceleration"), settings.snuggle_use_gpu)) {
+                settings_out.snuggle_use_gpu = settings.snuggle_use_gpu;
+                appcfg->set("arrange", "snuggle_use_gpu", settings_out.snuggle_use_gpu ? "1" : "0");
+                settings_changed = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", _u8L("Use GPU compute shaders for collision detection.\n"
+                                              "Falls back to CPU automatically if GPU is unavailable.\n"
+                                              "Disable for debugging or if GPU causes issues.").c_str());
+
             ImGui::TreePop();
         }
 
@@ -6085,33 +6099,30 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         else
             settings_out.align_to_y_axis = false;
 
-        // Legolas-tuned defaults: pop=64, gen=30, 2mm voxels, 15deg rotation, 5s timeout
+        // Radial nester defaults (Legolas-tuned)
         settings_out.use_snuggle = false;
         settings_out.snuggle_lock_rotation = false;
-        settings_out.snuggle_padding_mm = 1.0f;
-        settings_out.snuggle_population = 64;
-        settings_out.snuggle_generations = 30;
+        settings_out.snuggle_padding_mm = 1.5f;
         settings_out.snuggle_voxel_mm = 2.0f;
         settings_out.snuggle_compact = false;
-        settings_out.snuggle_max_parts = 200;
-        settings_out.snuggle_timeout_s = 5.0f;
+        settings_out.snuggle_max_parts = 50;
+        settings_out.snuggle_timeout_s = 15.0f;
         settings_out.snuggle_rotation_step = 15;
         settings_out.snuggle_multi_plate = true;
+        settings_out.snuggle_use_gpu = true;
 
         appcfg->set("arrange", dist_key, float_to_string_decimal_point(settings_out.distance));
         appcfg->set("arrange", rot_key, settings_out.enable_rotation ? "1" : "0");
         appcfg->set("arrange", align_to_y_axis_key, settings_out.align_to_y_axis ? "1" : "0");
         appcfg->set("arrange", "use_snuggle", "0");
-        appcfg->set("arrange", "snuggle_lock_rotation", "0");
-        appcfg->set("arrange", "snuggle_padding_mm", "1.0");
-        appcfg->set("arrange", "snuggle_population", "64");
-        appcfg->set("arrange", "snuggle_generations", "30");
+        appcfg->set("arrange", "snuggle_padding_mm", "1.5");
         appcfg->set("arrange", "snuggle_voxel_mm", "2.0");
         appcfg->set("arrange", "snuggle_compact", "0");
-        appcfg->set("arrange", "snuggle_max_parts", "200");
-        appcfg->set("arrange", "snuggle_timeout_s", "5.0");
+        appcfg->set("arrange", "snuggle_max_parts", "50");
+        appcfg->set("arrange", "snuggle_timeout_s", "15.0");
         appcfg->set("arrange", "snuggle_rotation_step", "15");
         appcfg->set("arrange", "snuggle_multi_plate", "1");
+        appcfg->set("arrange", "snuggle_use_gpu", "1");
         settings_changed = true;
     }
     ImGui::PopStyleVar(1);

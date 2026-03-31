@@ -249,8 +249,14 @@ void snuggle_arrange(
         if (params.stopcondition && params.stopcondition()) break;
     }
 
-    // Create collision evaluator (tries GPU, falls back to CPU)
-    auto evaluator = snuggle::create_collision_evaluator();
+    // Create collision evaluator — GPU if enabled and available, else CPU
+    std::unique_ptr<snuggle::CollisionEvaluator> evaluator;
+    if (params.snuggle_use_gpu) {
+        evaluator = snuggle::create_collision_evaluator(); // tries GPU, falls back to CPU
+    } else {
+        evaluator = std::make_unique<snuggle::CpuCollisionEvaluator>();
+        BOOST_LOG_TRIVIAL(warning) << "Snuggle: GPU disabled by user, using CPU evaluator";
+    }
     evaluator->upload_grids(parts, rot_cache);
 
     auto result = snuggle::radial_arrange(parts, rot_cache, rcfg,

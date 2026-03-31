@@ -122,18 +122,20 @@ struct ArrangeParams {
 
     bool do_final_align = true;
 
-    // Snuggle: 3D-aware genetic nesting
+    // Snuggle: 3D-aware radial nesting
     bool  use_snuggle            = false;
     bool  snuggle_lock_rotation  = false;
-    float snuggle_padding_mm     = 1.0f;   // min gap (mm)
-    int   snuggle_population     = 64;     // GA candidates per generation
-    int   snuggle_generations    = 30;     // GA evolution cycles
+    float snuggle_padding_mm     = 1.5f;   // min gap (mm) — 1.5 for FDM tolerance
     float snuggle_voxel_mm       = 2.0f;   // voxel resolution (mm)
-    bool  snuggle_compact        = false;  // post-GA jiggle (off — GA handles packing)
-    int   snuggle_max_parts      = 200;
-    float snuggle_timeout_s      = 5.0f;   // seconds per plate
+    bool  snuggle_compact        = false;  // jiggle toward center after arrange
+    int   snuggle_max_parts      = 50;     // radial nester designed for 5-50 parts
+    float snuggle_timeout_s      = 15.0f;  // seconds per plate
     int   snuggle_rotation_step  = 15;     // 0=locked, 1/5/15/45/90 deg snaps
     bool  snuggle_multi_plate    = true;
+    bool  snuggle_use_gpu        = true;   // try GPU collision, fall back to CPU
+    // Legacy GA fields (unused by radial nester, kept for config compat)
+    int   snuggle_population     = 64;
+    int   snuggle_generations    = 30;
 
     //BBS: add specific arrange params
     bool  allow_multi_materials_on_same_plate = true;
