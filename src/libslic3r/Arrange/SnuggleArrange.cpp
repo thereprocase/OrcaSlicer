@@ -1,12 +1,12 @@
 // SnuggleArrange.cpp — Snuggle 3D-aware arrangement for OrcaSlicer
 //
-// Loads 3D meshes from the Model, voxelizes them, runs the genetic nester,
-// and writes results back to ArrangePolygons for the standard finalize path.
+// Loads 3D meshes from the Model, voxelizes them, runs the radial
+// expansion nester, writes results back to ArrangePolygons.
 
 #include "SnuggleArrange.hpp"
 #include "polite_voxelizer.hpp"
-#include "gpu_collision.hpp"
 #include "snuggle_nester.hpp"
+#include "snuggle_radial.hpp"
 
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/BoundingBox.hpp"
@@ -216,96 +216,70 @@ void snuggle_arrange(
     cfg.bed_height_mm   = bed_h;
     cfg.min_gap_mm      = std::max(1.0f, params.snuggle_padding_mm);
 
-    // Direct numeric controls — user sets population, generations, timeout
-    cfg.population_size = std::clamp(params.snuggle_population, 16, 1024);
-    cfg.max_generations = std::clamp(params.snuggle_generations, 10, 500);
-    cfg.timeout_seconds = std::max(2.0, (double)params.snuggle_timeout_s);
+    // ── Configure radial expansion nester ───────────────────
+    snuggle::RadialConfig rcfg;
+    rcfg.bed_width_mm  = bed_w;
+    rcfg.bed_height_mm = bed_h;
+    rcfg.min_gap_mm    = std::max(1.0f, params.snuggle_padding_mm);
+    rcfg.bed_margin_mm = rcfg.min_gap_mm;
+    rcfg.step_mm       = base_voxel_size;
+    rcfg.timeout_s     = std::max(2.0, (double)params.snuggle_timeout_s);
 
-    // Rotation step: 0=locked, else degrees per snap increment
-    // The initial_zrot on each part is the user's pre-rotation (their starting position)
-    if (params.snuggle_rotation_step <= 0) {
-        cfg.lock_rotation = true;
+    if (params.snuggle_rotation_step <= 0 || params.snuggle_lock_rotation) {
+        rcfg.lock_rotation = true;
+        rcfg.n_rotations = 1;
     } else {
-        cfg.lock_rotation = false;
-        // Quantize allowed rotations to the step size
-        // The nester's rotation_step_rad limits what angles the GA explores
-        cfg.rotation_step_rad = (float)params.snuggle_rotation_step * (3.14159265f / 180.0f);
-    }
-    // Lock rotation override from the checkbox takes priority
-    if (params.snuggle_lock_rotation)
-        cfg.lock_rotation = true;
-
-    cfg.compact         = params.snuggle_compact;
-
-    BOOST_LOG_TRIVIAL(info) << "Snuggle config:"
-        << " pop=" << cfg.population_size << " gens=" << cfg.max_generations
-        << " timeout=" << cfg.timeout_seconds << "s"
-        << " voxel=" << voxel_size << "mm"
-        << " rot_step=" << params.snuggle_rotation_step << "deg"
-        << " lock_rot=" << cfg.lock_rotation;
-
-    // Margin = clearance from grid boundary to bed edge.
-    // The rotated grid already includes 1-voxel padding beyond geometry,
-    // so the margin only needs the gap clearance. Using max_voxel + gap
-    // double-counted the padding and wasted bed space (8mm total with 4mm voxels),
-    // making tight layouts infeasible with adaptive per-part voxel sizes.
-    cfg.bed_margin_mm   = cfg.min_gap_mm;
-
-    // Wire progress/stop to Orca's callbacks
-    if (params.stopcondition) {
-        // Check periodically but don't make it the inner loop
-        cfg.yield_every_gens = 1;
+        rcfg.lock_rotation = false;
+        rcfg.n_rotations = std::max(1, 360 / params.snuggle_rotation_step);
     }
 
-    auto evaluator = snuggle::create_collision_evaluator();
-    std::string backend_name = "CPU";
+    BOOST_LOG_TRIVIAL(warning) << "Snuggle radial: " << parts.size() << " parts"
+        << ", " << rcfg.n_directions << " dirs x " << rcfg.n_rotations << " rots"
+        << ", step=" << rcfg.step_mm << "mm, margin=" << rcfg.bed_margin_mm << "mm"
+        << ", lock_rot=" << rcfg.lock_rotation;
 
-#ifdef SLIC3R_GUI
-    if (auto* gpu = dynamic_cast<snuggle::GpuCollisionEvaluator*>(evaluator.get())) {
-        if (gpu->is_available())
-            backend_name = "GPU";
-    }
-#endif
-
-    BOOST_LOG_TRIVIAL(warning) << "Snuggle: using " << backend_name << " collision backend";
-
-    snuggle::SnuggleNester nester(cfg, evaluator.get());
-
-    auto result = nester.run(parts, [&](size_t gen, size_t max_gen,
-                                        const snuggle::Individual& best) -> bool {
-        // Progress string includes backend, gen count, and collision status
-        if (params.progressind) {
-            unsigned progress = (unsigned)(gen * 100 / std::max(max_gen, (size_t)1));
-            std::string status = " (Snuggle " + backend_name
-                + " gen " + std::to_string(gen) + "/" + std::to_string(max_gen)
-                + (best.is_feasible() ? " OK" : " " + std::to_string(best.collision_count) + " collisions")
-                + ")";
-            params.progressind(progress, status);
+    // Build rotation cache for radial nester
+    std::vector<std::vector<snuggle::VoxelGrid>> rot_cache(parts.size());
+    for (size_t i = 0; i < parts.size(); i++) {
+        if (rcfg.lock_rotation) {
+            snuggle::VoxelGrid single = parts[i].grid.rotated_copy(parts[i].initial_zrot);
+            rot_cache[i].resize(snuggle::ROT_CACHE_BINS, single);
+        } else {
+            rot_cache[i].resize(snuggle::ROT_CACHE_BINS);
+            for (int bin = 0; bin < snuggle::ROT_CACHE_BINS; bin++) {
+                float angle = (float)bin * snuggle::TWO_PI_F / snuggle::ROT_CACHE_BINS;
+                rot_cache[i][bin] = parts[i].grid.rotated_copy(angle);
+            }
         }
-        // Check stop condition
-        if (params.stopcondition && params.stopcondition())
-            return false;
-        return true;
-    });
+        if (params.stopcondition && params.stopcondition()) break;
+    }
 
-    BOOST_LOG_TRIVIAL(warning) << "Snuggle [" << backend_name << "]: "
-        << parts.size() << " parts, "
-        << result.time_ms << "ms, "
-        << result.generations_run << " gens, "
-        << "feasible=" << result.feasible
-        << ", collisions=" << result.collisions
-        << (result.timed_out ? ", TIMED OUT" : "");
+    auto result = snuggle::radial_arrange(parts, rot_cache, rcfg,
+        [&](int placed, int total, const char* name) -> bool {
+            if (params.progressind) {
+                unsigned pct = total > 0 ? (placed * 100 / total) : 0;
+                std::string status = " (Placing " + std::to_string(placed)
+                    + "/" + std::to_string(total) + " " + name + ")";
+                params.progressind(pct, status);
+            }
+            return !(params.stopcondition && params.stopcondition());
+        });
+
+    BOOST_LOG_TRIVIAL(warning) << "Snuggle radial: "
+        << result.placed_count << "/" << result.total_count << " placed in "
+        << (int)result.time_ms << "ms"
+        << (result.timed_out ? " (TIMED OUT)" : "");
 
     // ── Write results back to ArrangePolygons ──────────────
-    // The nester resolved each part's instance origin position on the bed.
-    // If the result is feasible, place everything. If not, greedily accept
-    // parts that fit and send the rest off-plate (bed_idx = -1).
+    // Radial nester already validated each placement. Parts marked
+    // placed=true are collision-free and within bed bounds.
     int placed = 0, rejected = 0;
 
-    if (result.feasible) {
-        // All fit — place everything
-        for (size_t i = 0; i < items.size() && i < result.placements.size(); i++) {
-            const auto& pl = result.placements[i];
+    for (size_t i = 0; i < items.size() && i < result.placements.size(); i++) {
+        if (items[i].bed_idx == -1) { rejected++; continue; }
+
+        const auto& pl = result.placements[i];
+        if (pl.placed) {
             items[i].translation = Vec2crd(
                 scaled(pl.origin_bed_x + bed_origin_x),
                 scaled(pl.origin_bed_y + bed_origin_y)
@@ -313,67 +287,14 @@ void snuggle_arrange(
             items[i].rotation = (double)pl.zrot;
             items[i].bed_idx = 0;
             placed++;
+
+            BOOST_LOG_TRIVIAL(warning) << "Snuggle: [" << i << "] " << items[i].name
+                << " origin_bed=(" << pl.origin_bed_x << "," << pl.origin_bed_y << ")"
+                << " rot=" << (int)(pl.zrot * 180.0f / snuggle::PI_F) << "deg";
+        } else {
+            items[i].bed_idx = -1;
+            rejected++;
         }
-    } else {
-        // Infeasible — greedy accept: place each part if it doesn't collide
-        // with already-accepted parts and stays within bed bounds.
-        float margin = cfg.bed_margin_mm;
-        std::vector<size_t> accepted;
-
-        for (size_t i = 0; i < items.size() && i < result.placements.size(); i++) {
-            // Skip parts with empty grids (failed voxelization, already marked off-plate)
-            if (items[i].bed_idx == -1) { rejected++; continue; }
-
-            const auto& pl = result.placements[i];
-            const auto& grid_i = parts[i].grid;
-            if (grid_i.total_voxels() == 0) { items[i].bed_idx = -1; rejected++; continue; }
-            auto rot_i = grid_i.rotated_copy(pl.zrot);
-
-            // Bounds check
-            float pmin_x = pl.x + rot_i.origin.x;
-            float pmin_y = pl.y + rot_i.origin.y;
-            float pmax_x = pmin_x + rot_i.nx * rot_i.voxel_size;
-            float pmax_y = pmin_y + rot_i.ny * rot_i.voxel_size;
-            bool in_bounds = (pmin_x >= margin && pmin_y >= margin &&
-                              pmax_x <= bed_w - margin && pmax_y <= bed_h - margin);
-
-            // Collision check against accepted parts
-            bool collides = false;
-            if (in_bounds) {
-                snuggle::Vec3f off_i = {pl.x, pl.y, 0.0f};
-                for (size_t j : accepted) {
-                    const auto& pl_j = result.placements[j];
-                    auto rot_j = parts[j].grid.rotated_copy(pl_j.zrot);
-                    snuggle::Vec3f off_j = {pl_j.x, pl_j.y, 0.0f};
-                    if (snuggle::VoxelGrid::collision_count(rot_i, off_i, rot_j, off_j) > 0) {
-                        collides = true;
-                        break;
-                    }
-                }
-            }
-
-            if (in_bounds && !collides) {
-                items[i].translation = Vec2crd(
-                    scaled(pl.origin_bed_x + bed_origin_x),
-                    scaled(pl.origin_bed_y + bed_origin_y)
-                );
-                items[i].rotation = (double)pl.zrot;
-                items[i].bed_idx = 0;
-                accepted.push_back(i);
-                placed++;
-            } else {
-                items[i].bed_idx = -1;  // off-plate
-                rejected++;
-            }
-        }
-    }
-
-    for (size_t i = 0; i < items.size() && i < result.placements.size(); i++) {
-        if (items[i].bed_idx < 0) continue;
-        const auto& pl = result.placements[i];
-        BOOST_LOG_TRIVIAL(warning) << "Snuggle: [" << i << "] " << items[i].name
-            << " origin_bed=(" << pl.origin_bed_x << "," << pl.origin_bed_y << ")"
-            << " rot=" << (int)(pl.zrot * 180.0 / 3.14159265) << "deg";
     }
 
     if (rejected > 0)

@@ -79,6 +79,8 @@ set(lisbslic3r_sources
     Arrange/gpu_collision.hpp
     Arrange/polite_voxelizer.hpp
     Arrange/snuggle_nester.hpp
+    Arrange/snuggle_radial.hpp
+    Arrange/snuggle_constants.hpp
     BlacklistedLibraryCheck.cpp
     BlacklistedLibraryCheck.hpp
     BoundingBox.cpp
