@@ -1148,7 +1148,7 @@ void GLCanvas3D::load_arrange_settings()
 
     std::string snuggle_padding_str = wxGetApp().app_config->get("arrange", "snuggle_padding_mm");
     if (!snuggle_padding_str.empty())
-        try { m_arrange_settings_fff.snuggle_padding_mm = std::stof(snuggle_padding_str); } catch (...) {}
+        try { m_arrange_settings_fff.snuggle_padding_mm = std::clamp(std::stof(snuggle_padding_str), 0.0f, 20.0f); } catch (...) {}
 
     std::string snuggle_quality_str = wxGetApp().app_config->get("arrange", "snuggle_quality");
     if (!snuggle_quality_str.empty())
@@ -1160,11 +1160,11 @@ void GLCanvas3D::load_arrange_settings()
 
     std::string snuggle_max_parts_str = wxGetApp().app_config->get("arrange", "snuggle_max_parts");
     if (!snuggle_max_parts_str.empty())
-        try { m_arrange_settings_fff.snuggle_max_parts = std::stoi(snuggle_max_parts_str); } catch (...) {}
+        try { m_arrange_settings_fff.snuggle_max_parts = std::clamp(std::stoi(snuggle_max_parts_str), 2, 500); } catch (...) {}
 
     std::string snuggle_timeout_str = wxGetApp().app_config->get("arrange", "snuggle_timeout_s");
     if (!snuggle_timeout_str.empty())
-        try { m_arrange_settings_fff.snuggle_timeout_s = std::stof(snuggle_timeout_str); } catch (...) {}
+        try { m_arrange_settings_fff.snuggle_timeout_s = std::clamp(std::stof(snuggle_timeout_str), 5.0f, 300.0f); } catch (...) {}
 
     std::string snuggle_rot_step_str = wxGetApp().app_config->get("arrange", "snuggle_rotation_step");
     if (!snuggle_rot_step_str.empty())
