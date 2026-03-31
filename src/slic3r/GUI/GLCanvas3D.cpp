@@ -1168,7 +1168,7 @@ void GLCanvas3D::load_arrange_settings()
 
     std::string snuggle_rot_step_str = wxGetApp().app_config->get("arrange", "snuggle_rotation_step");
     if (!snuggle_rot_step_str.empty())
-        try { m_arrange_settings_fff.snuggle_rotation_step = std::stoi(snuggle_rot_step_str); } catch (...) {}
+        try { m_arrange_settings_fff.snuggle_rotation_step = std::clamp(std::stoi(snuggle_rot_step_str), 0, 90); } catch (...) {}
 
     std::string snuggle_multi_plate_str = wxGetApp().app_config->get("arrange", "snuggle_multi_plate");
     if (!snuggle_multi_plate_str.empty())
