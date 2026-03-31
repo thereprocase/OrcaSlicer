@@ -534,12 +534,33 @@ private:
                 polite_yield();
             }
         } else {
-            // Build all 360 bins
+            // Build all 360 bins with memory budget guard.
+            // Track cumulative bytes; skip parts that would exceed budget.
+            size_t total_cache_bytes = 0;
+            constexpr size_t MAX_CACHE_MB = 512;
+            constexpr size_t MAX_CACHE_BYTES = MAX_CACHE_MB * 1024 * 1024;
+
             for (size_t i = 0; i < n; i++) {
-                rot_cache_[i].resize(ROT_CACHE_BINS);
-                for (int bin = 0; bin < ROT_CACHE_BINS; bin++) {
-                    float angle = (float)bin * (TWO_PI_F / ROT_CACHE_BINS);
-                    rot_cache_[i][bin] = parts[i].grid.rotated_copy(angle);
+                // Estimate memory for this part's 360 rotations
+                size_t per_grid_bytes = parts[i].grid.memory_bytes();
+                // Rotated copies are larger (diagonal expansion ~1.4x area)
+                size_t est_per_rot = (size_t)(per_grid_bytes * 1.5);
+                size_t est_total = est_per_rot * ROT_CACHE_BINS;
+
+                if (total_cache_bytes + est_total > MAX_CACHE_BYTES) {
+                    // This part would blow the budget. Use a single copy
+                    // at initial rotation, replicated to all bins.
+                    VoxelGrid single = parts[i].grid.rotated_copy(parts[i].initial_zrot);
+                    rot_cache_[i].resize(ROT_CACHE_BINS, single);
+                    total_cache_bytes += single.memory_bytes() * ROT_CACHE_BINS;
+                    // Note: rotation is effectively locked for this part
+                } else {
+                    rot_cache_[i].resize(ROT_CACHE_BINS);
+                    for (int bin = 0; bin < ROT_CACHE_BINS; bin++) {
+                        float angle = (float)bin * (TWO_PI_F / ROT_CACHE_BINS);
+                        rot_cache_[i][bin] = parts[i].grid.rotated_copy(angle);
+                    }
+                    total_cache_bytes += est_per_rot * ROT_CACHE_BINS;
                 }
                 polite_yield();
             }
@@ -570,8 +591,12 @@ private:
     }
 
     const VoxelGrid& cached_rotated(size_t part_idx, float angle_rad) const {
+        static const VoxelGrid empty_grid;
+        if (part_idx >= rot_cache_.size() || rot_cache_[part_idx].empty())
+            return empty_grid;
         int bin = (int)std::floor(angle_rad * ROT_CACHE_BINS / TWO_PI_F);
         bin = ((bin % ROT_CACHE_BINS) + ROT_CACHE_BINS) % ROT_CACHE_BINS;
+        if (bin >= (int)rot_cache_[part_idx].size()) bin = 0;
         return rot_cache_[part_idx][bin];
     }
 

@@ -95,8 +95,15 @@ void snuggle_arrange(
     // doesn't matter much since we iterate the grid, not the mesh.
     // But high-poly meshes (>10K tris) make the SAT test expensive.
     // Decimate to ~5K tris max — sufficient for 2mm voxel accuracy.
-    float voxel_size = std::clamp(params.snuggle_voxel_mm, 0.5f, 5.0f);
+    float base_voxel_size = std::clamp(params.snuggle_voxel_mm, 0.5f, 5.0f);
     constexpr size_t MAX_TRIS_FOR_VOXEL = 5000;
+    // Adaptive voxel sizing: if a part's grid would exceed safe dimensions
+    // at the user's voxel size, coarsen that part until it fits.
+    // MAX_GRID_DIM is 512 per axis. Rotation expands by ~sqrt(2), so cap
+    // at 350 to leave room for rotated_copy.
+    constexpr size_t SAFE_GRID_DIM = 350;
+    // Total rotation cache budget: 512MB. Skip cache for parts that don't fit.
+    constexpr size_t MAX_CACHE_BYTES = 512ULL * 1024 * 1024;
 
     // Walk the model to match items to instances. Build a flat list of
     // (object, instance) pairs in the same order prepare_all() enumerates,
@@ -181,10 +188,30 @@ void snuggle_arrange(
             indices[ti * 3 + 2] = its.indices[ti](2);
         }
 
+        // Adaptive voxel size: compute mesh AABB, coarsen if grid too large
+        float part_voxel = base_voxel_size;
+        {
+            float mesh_max_dim = 0;
+            for (size_t vi = 0; vi < its.vertices.size(); vi++) {
+                mesh_max_dim = std::max(mesh_max_dim, std::abs(its.vertices[vi].x()));
+                mesh_max_dim = std::max(mesh_max_dim, std::abs(its.vertices[vi].y()));
+                mesh_max_dim = std::max(mesh_max_dim, std::abs(its.vertices[vi].z()));
+            }
+            float extent = mesh_max_dim * 2.0f + part_voxel * 4.0f; // diameter + padding
+            while (extent / part_voxel > SAFE_GRID_DIM && part_voxel < 10.0f) {
+                part_voxel *= 1.5f;
+            }
+            if (part_voxel > base_voxel_size) {
+                BOOST_LOG_TRIVIAL(warning) << "Snuggle: coarsened " << pi.name
+                    << " voxel from " << base_voxel_size << "mm to " << part_voxel
+                    << "mm (mesh too large for " << SAFE_GRID_DIM << " grid)";
+            }
+        }
+
         auto err = snuggle::voxelize_indexed_mesh(
             verts.data(), its.vertices.size(),
             indices.data(), its.indices.size(),
-            voxel_size, pi.grid);
+            part_voxel, pi.grid);
 
         if (err != snuggle::VoxError::OK || pi.grid.count_solid() == 0) {
             BOOST_LOG_TRIVIAL(warning) << "Snuggle: voxelization failed for '"
