@@ -249,7 +249,12 @@ void snuggle_arrange(
         if (params.stopcondition && params.stopcondition()) break;
     }
 
+    // Create collision evaluator (tries GPU, falls back to CPU)
+    auto evaluator = snuggle::create_collision_evaluator();
+    evaluator->upload_grids(parts, rot_cache);
+
     auto result = snuggle::radial_arrange(parts, rot_cache, rcfg,
+        evaluator.get(),
         [&](int placed, int total, const char* name) -> bool {
             if (params.progressind) {
                 unsigned pct = total > 0 ? (placed * 100 / total) : 0;

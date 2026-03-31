@@ -12,6 +12,7 @@
 
 #include "polite_voxelizer.hpp"
 #include "snuggle_constants.hpp"
+#include "gpu_collision.hpp"
 #include <vector>
 #include <algorithm>
 #include <numeric>
@@ -58,6 +59,7 @@ inline RadialResult radial_arrange(
     const std::vector<PartInfo>& parts,
     const std::vector<std::vector<VoxelGrid>>& rot_cache,
     const RadialConfig& cfg,
+    CollisionEvaluator* evaluator = nullptr,
     RadialProgressFn progress = nullptr)
 {
     auto t_start = std::chrono::steady_clock::now();
@@ -197,33 +199,82 @@ inline RadialResult radial_arrange(
         // Collect all valid placements at the first distance that works,
         // then pick the one that best fills the ring (maximizes minimum
         // distance to already-placed parts).
+        //
+        // When an evaluator is provided, batch all candidates per ring
+        // for GPU dispatch. Otherwise, use inline collision checks (CPU).
         struct Candidate {
             float x, y, rot, dist;
         };
 
         std::vector<Candidate> ring_candidates;
 
+        // Build placed part info for evaluator batching
+        std::vector<size_t> eval_placed_parts;
+        std::vector<RadialCandidate> eval_placed_pos;
+        if (evaluator) {
+            for (size_t pi : placed_indices) {
+                eval_placed_parts.push_back(pi);
+                eval_placed_pos.push_back({
+                    result.placements[pi].x,
+                    result.placements[pi].y,
+                    result.placements[pi].zrot
+                });
+            }
+        }
+
         for (float dist = 0; dist <= max_slide; dist += cfg.step_mm) {
             ring_candidates.clear();
 
-            for (const auto& [dx, dy] : directions) {
-                float px = bed_cx + dx * dist;
-                float py = bed_cy + dy * dist;
+            if (evaluator) {
+                // Batch path: collect all candidates at this distance, evaluate together
+                std::vector<RadialCandidate> batch;
+                for (const auto& [dx, dy] : directions) {
+                    float px = bed_cx + dx * dist;
+                    float py = bed_cy + dy * dist;
+                    for (float rot : part_rots) {
+                        batch.push_back({px, py, rot});
+                    }
+                }
 
-                for (float rot : part_rots) {
-                    if (is_valid(idx, px, py, rot, placed_indices, result.placements)) {
-                        ring_candidates.push_back({px, py, rot, dist});
-                        break; // best rotation at this direction, move to next direction
+                std::vector<RadialCollisionResult> batch_results;
+                evaluator->evaluate_radial(eval_placed_parts, eval_placed_pos,
+                                           idx, batch, cfg.min_gap_mm,
+                                           cfg.bed_width_mm, cfg.bed_height_mm,
+                                           cfg.bed_margin_mm, batch_results);
+
+                // Scan results: for each direction, take the first valid rotation
+                size_t bi = 0;
+                for (int d = 0; d < cfg.n_directions; d++) {
+                    for (size_t ri = 0; ri < part_rots.size(); ri++, bi++) {
+                        if (bi < batch_results.size() && !batch_results[bi].collides) {
+                            ring_candidates.push_back({batch[bi].x, batch[bi].y,
+                                                       batch[bi].zrot, dist});
+                            // Skip remaining rotations for this direction
+                            bi += part_rots.size() - ri - 1;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                // Inline CPU path (no evaluator)
+                for (const auto& [dx, dy] : directions) {
+                    float px = bed_cx + dx * dist;
+                    float py = bed_cy + dy * dist;
+
+                    for (float rot : part_rots) {
+                        if (is_valid(idx, px, py, rot, placed_indices, result.placements)) {
+                            ring_candidates.push_back({px, py, rot, dist});
+                            break;
+                        }
                     }
                 }
             }
 
-            if (!ring_candidates.empty()) break; // found valid positions at this distance
+            if (!ring_candidates.empty()) break;
         }
 
         if (!ring_candidates.empty()) {
             // Pick the candidate that maximizes minimum distance to placed parts.
-            // This fills rings evenly instead of biasing toward direction 0.
             size_t best_idx = 0;
             float best_min_dist = -1.0f;
 

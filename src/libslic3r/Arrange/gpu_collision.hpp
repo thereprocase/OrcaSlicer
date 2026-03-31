@@ -21,6 +21,15 @@ namespace snuggle {
 struct PartInfo;
 struct Individual;
 
+// Radial nester types — used by evaluate_radial()
+struct RadialCandidate {
+    float x, y, zrot;
+};
+
+struct RadialCollisionResult {
+    bool collides;
+};
+
 // Abstract interface -- nester calls this, doesn't know if CPU or GPU
 class CollisionEvaluator {
 public:
@@ -33,15 +42,26 @@ public:
         const std::vector<PartInfo>& parts,
         const std::vector<std::vector<VoxelGrid>>& rot_cache) = 0;
 
-    // Evaluate collision_count and oob_count for every individual in the batch.
-    // Must write ind.collision_count and ind.oob_count for each individual.
-    // Must NOT write ind.fitness (caller handles that).
+    // GA path: evaluate collision_count and oob_count for every individual.
     virtual void evaluate_batch(
         std::vector<Individual>& pop,
         const std::vector<PartInfo>& parts,
         float bed_width_mm,
         float bed_height_mm,
         float bed_margin_mm = 0.0f) = 0;
+
+    // Radial path: test one part at multiple candidate positions against
+    // already-placed parts. Gap enforcement uses 9-probe pattern.
+    virtual void evaluate_radial(
+        const std::vector<size_t>&            placed_parts,
+        const std::vector<RadialCandidate>&   placed_positions,
+        size_t                                candidate_part,
+        const std::vector<RadialCandidate>&   candidates,
+        float                                 gap_mm,
+        float                                 bed_w,
+        float                                 bed_h,
+        float                                 bed_margin,
+        std::vector<RadialCollisionResult>&   results) = 0;
 };
 
 // CPU fallback -- extracts the collision/bounds logic from SnuggleNester::evaluate()
@@ -53,6 +73,13 @@ public:
                         const std::vector<PartInfo>& parts,
                         float bed_w, float bed_h,
                         float bed_margin = 0.0f) override;
+    void evaluate_radial(
+        const std::vector<size_t>&            placed_parts,
+        const std::vector<RadialCandidate>&   placed_positions,
+        size_t                                candidate_part,
+        const std::vector<RadialCandidate>&   candidates,
+        float gap_mm, float bed_w, float bed_h, float bed_margin,
+        std::vector<RadialCollisionResult>&   results) override;
 private:
     const std::vector<std::vector<VoxelGrid>>* rot_cache_ = nullptr;
     static constexpr int ROT_CACHE_BINS = 360;
@@ -76,15 +103,30 @@ public:
                         const std::vector<PartInfo>& parts,
                         float bed_w, float bed_h,
                         float bed_margin = 0.0f) override;
+    void evaluate_radial(
+        const std::vector<size_t>&            placed_parts,
+        const std::vector<RadialCandidate>&   placed_positions,
+        size_t                                candidate_part,
+        const std::vector<RadialCandidate>&   candidates,
+        float gap_mm, float bed_w, float bed_h, float bed_margin,
+        std::vector<RadialCollisionResult>&   results) override;
 
 private:
     std::atomic<bool> available_{false};
-    // GL handles
+    // GL handles — GA shader
     unsigned int program_ = 0;
     unsigned int voxel_ssbo_ = 0;
     unsigned int meta_ssbo_ = 0;
     unsigned int placement_ssbo_ = 0;
     unsigned int results_ssbo_ = 0;
+    // GL handles — radial shader (shares voxel_ssbo_ and meta_ssbo_)
+    unsigned int radial_program_ = 0;
+    unsigned int radial_candidates_ssbo_ = 0;
+    unsigned int radial_placed_ssbo_ = 0;
+    unsigned int radial_results_ssbo_ = 0;
+
+    // CPU fallback for evaluate_radial when shader isn't ready
+    const std::vector<std::vector<VoxelGrid>>* rot_cache_ptr_ = nullptr;
     // Context (platform-specific, stored as opaque pointers)
     void* gl_context_ = nullptr;
     void* gl_dc_ = nullptr;

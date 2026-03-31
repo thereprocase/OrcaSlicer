@@ -85,6 +85,56 @@ void CpuCollisionEvaluator::evaluate_batch(
     }
 }
 
+void CpuCollisionEvaluator::evaluate_radial(
+    const std::vector<size_t>&            placed_parts,
+    const std::vector<RadialCandidate>&   placed_positions,
+    size_t                                candidate_part,
+    const std::vector<RadialCandidate>&   candidates,
+    float                                 gap_mm,
+    float                                 bed_w,
+    float                                 bed_h,
+    float                                 bed_margin,
+    std::vector<RadialCollisionResult>&   results)
+{
+    if (!rot_cache_) return;
+    results.resize(candidates.size());
+
+    for (size_t ci = 0; ci < candidates.size(); ci++) {
+        const auto& cand = candidates[ci];
+        const VoxelGrid& grid_c = get_rotated(candidate_part, cand.zrot);
+        results[ci].collides = false;
+
+        // Bed bounds check
+        float pmin_x = cand.x + grid_c.origin.x;
+        float pmin_y = cand.y + grid_c.origin.y;
+        float pmax_x = pmin_x + grid_c.nx * grid_c.voxel_size;
+        float pmax_y = pmin_y + grid_c.ny * grid_c.voxel_size;
+
+        if (pmin_x < bed_margin || pmin_y < bed_margin ||
+            pmax_x > bed_w - bed_margin || pmax_y > bed_h - bed_margin) {
+            results[ci].collides = true;
+            continue;
+        }
+
+        // 9-probe gap-inflated collision check against all placed parts
+        for (size_t pi = 0; pi < placed_parts.size() && !results[ci].collides; pi++) {
+            const VoxelGrid& grid_p = get_rotated(placed_parts[pi], placed_positions[pi].zrot);
+            Vec3f off_p = {placed_positions[pi].x, placed_positions[pi].y, 0.0f};
+
+            for (float dx : {0.0f, gap_mm, -gap_mm}) {
+                if (results[ci].collides) break;
+                for (float dy : {0.0f, gap_mm, -gap_mm}) {
+                    Vec3f off_c = {cand.x + dx, cand.y + dy, 0.0f};
+                    if (VoxelGrid::collision_count(grid_c, off_c, grid_p, off_p) > 0) {
+                        results[ci].collides = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // =====================================================================
 // GpuCollisionEvaluator (only when SLIC3R_GUI is defined)
 // =====================================================================
@@ -378,6 +428,7 @@ void GpuCollisionEvaluator::upload_grids(
     const std::vector<PartInfo>& parts,
     const std::vector<std::vector<VoxelGrid>>& rot_cache)
 {
+    rot_cache_ptr_ = &rot_cache;  // keep pointer for CPU fallback in evaluate_radial
     if (!available_) return;
 
     n_parts_ = parts.size();
@@ -567,6 +618,32 @@ void GpuCollisionEvaluator::evaluate_batch(
     }
 }
 
+void GpuCollisionEvaluator::evaluate_radial(
+    const std::vector<size_t>&            placed_parts,
+    const std::vector<RadialCandidate>&   placed_positions,
+    size_t                                candidate_part,
+    const std::vector<RadialCandidate>&   candidates,
+    float                                 gap_mm,
+    float                                 bed_w,
+    float                                 bed_h,
+    float                                 bed_margin,
+    std::vector<RadialCollisionResult>&   results)
+{
+    // TODO: GPU compute shader dispatch for radial candidates.
+    // For now, delegate to CPU evaluation using the stored rot_cache pointer.
+    if (!rot_cache_ptr_) {
+        results.resize(candidates.size());
+        for (auto& r : results) r.collides = true;
+        return;
+    }
+
+    CpuCollisionEvaluator cpu_fallback;
+    std::vector<PartInfo> dummy;
+    cpu_fallback.upload_grids(dummy, *rot_cache_ptr_);
+    cpu_fallback.evaluate_radial(placed_parts, placed_positions, candidate_part,
+                                 candidates, gap_mm, bed_w, bed_h, bed_margin, results);
+}
+
 void GpuCollisionEvaluator::cleanup()
 {
     // Delete GL objects if context is still current
@@ -577,10 +654,14 @@ void GpuCollisionEvaluator::cleanup()
         wglMakeCurrent(hdc, ctx);
 #endif
         if (program_) { glDeleteProgram(program_); program_ = 0; }
+        if (radial_program_) { glDeleteProgram(radial_program_); radial_program_ = 0; }
         if (voxel_ssbo_) { glDeleteBuffers(1, &voxel_ssbo_); voxel_ssbo_ = 0; }
         if (meta_ssbo_) { glDeleteBuffers(1, &meta_ssbo_); meta_ssbo_ = 0; }
         if (placement_ssbo_) { glDeleteBuffers(1, &placement_ssbo_); placement_ssbo_ = 0; }
         if (results_ssbo_) { glDeleteBuffers(1, &results_ssbo_); results_ssbo_ = 0; }
+        if (radial_candidates_ssbo_) { glDeleteBuffers(1, &radial_candidates_ssbo_); radial_candidates_ssbo_ = 0; }
+        if (radial_placed_ssbo_) { glDeleteBuffers(1, &radial_placed_ssbo_); radial_placed_ssbo_ = 0; }
+        if (radial_results_ssbo_) { glDeleteBuffers(1, &radial_results_ssbo_); radial_results_ssbo_ = 0; }
 
 #ifdef _WIN32
         wglMakeCurrent(NULL, NULL);
