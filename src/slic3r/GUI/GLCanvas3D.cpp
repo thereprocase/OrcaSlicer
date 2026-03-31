@@ -5938,7 +5938,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     // When Snuggle is on, explain that it manages rotation differently
     if (settings_out.use_snuggle) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
-        imgui->text(_L("Snuggle controls rotation \u2014 see Lock Rotation below"));
+        imgui->text(_L("Snuggle controls rotation \u2014 see Rotation dropdown below"));
         ImGui::PopStyleColor();
     }
 
@@ -5990,9 +5990,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
             settings.snuggle_rotation_step = rot_values[rot_idx];
             settings_out.snuggle_rotation_step = settings.snuggle_rotation_step;
             appcfg->set("arrange", "snuggle_rotation_step", std::to_string(settings_out.snuggle_rotation_step));
-            // Lock rotation checkbox follows: step 0 = locked
             settings_out.snuggle_lock_rotation = (settings_out.snuggle_rotation_step == 0);
-            appcfg->set("arrange", "snuggle_lock_rotation", settings_out.snuggle_lock_rotation ? "1" : "0");
             settings_changed = true;
         }
         if (ImGui::IsItemHovered())
@@ -6002,7 +6000,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
 
         // Resolution
         ImGui::AlignTextToFramePadding();
-        imgui->text(_L("Resolution"));
+        imgui->text(_L("Voxel size"));
         ImGui::SameLine(1.2 * cursor_slider_left);
         ImGui::PushItemWidth(window_width - slider_icon_width);
         bool b_voxel = imgui->bbl_slider_float_style("##SnuggleVoxel", &settings.snuggle_voxel_mm, 0.5f, 5.0f, "%3.1f mm");
@@ -6019,36 +6017,8 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
             ImGui::SetTooltip("%s", _u8L("Voxel size in mm. Lower = more precise but slower.\n"
                                           "2.0 mm is a good default. 0.5 mm for tight packing.").c_str());
 
-        // ── Collapsible effort / debug menu ───────────────────
-        if (ImGui::TreeNode(_u8L("Effort / Advanced").c_str())) {
-            ImGui::AlignTextToFramePadding();
-            imgui->text(_L("Population"));
-            ImGui::SameLine(1.2 * cursor_slider_left);
-            ImGui::PushItemWidth(window_width);
-            if (ImGui::InputInt("##SnugglePop", &settings.snuggle_population, 16, 64)) {
-                settings.snuggle_population = std::clamp(settings.snuggle_population, 16, 1024);
-                settings_out.snuggle_population = settings.snuggle_population;
-                appcfg->set("arrange", "snuggle_population", std::to_string(settings_out.snuggle_population));
-                settings_changed = true;
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", _u8L("Number of candidate arrangements per generation.\n"
-                                              "64 is fast. 256+ for better quality.").c_str());
-
-            ImGui::AlignTextToFramePadding();
-            imgui->text(_L("Generations"));
-            ImGui::SameLine(1.2 * cursor_slider_left);
-            ImGui::PushItemWidth(window_width);
-            if (ImGui::InputInt("##SnuggleGen", &settings.snuggle_generations, 10, 30)) {
-                settings.snuggle_generations = std::clamp(settings.snuggle_generations, 10, 500);
-                settings_out.snuggle_generations = settings.snuggle_generations;
-                appcfg->set("arrange", "snuggle_generations", std::to_string(settings_out.snuggle_generations));
-                settings_changed = true;
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", _u8L("Evolution cycles. More = better convergence.\n"
-                                              "30 is fast. 100+ for complex arrangements.").c_str());
-
+        // ── Collapsible advanced menu ──────────────────────────
+        if (ImGui::TreeNode(_u8L("Advanced").c_str())) {
             ImGui::AlignTextToFramePadding();
             imgui->text(_L("Timeout (s)"));
             ImGui::SameLine(1.2 * cursor_slider_left);
@@ -6077,15 +6047,6 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
                 settings_changed = true;
             }
 
-            if (imgui->bbl_checkbox(_L("Post-GA compaction"), settings.snuggle_compact)) {
-                settings_out.snuggle_compact = settings.snuggle_compact;
-                appcfg->set("arrange", "snuggle_compact", settings_out.snuggle_compact ? "1" : "0");
-                settings_changed = true;
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", _u8L("Jiggle parts toward center after GA. Usually not needed —\n"
-                                              "the GA's fitness function already optimizes for tight clusters.").c_str());
-
             ImGui::TreePop();
         }
 
@@ -6100,7 +6061,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
             ImGui::PopStyleColor();
         } else {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
-            imgui->text(_L("Genetic 3D nester \u2014 voxel collision detection"));
+            imgui->text(_L("Radial 3D nester \u2014 voxel collision detection"));
             ImGui::PopStyleColor();
         }
     }

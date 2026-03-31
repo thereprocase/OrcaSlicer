@@ -93,6 +93,9 @@ inline RadialResult radial_arrange(
         return rot_cache[part_idx][bin];
     };
 
+    // Gap in voxel units — inflate collision offsets to enforce min_gap_mm
+    float gap_voxels = cfg.min_gap_mm / cfg.step_mm;
+
     // Helper: check if a placement is valid (no collision, within bed)
     auto is_valid = [&](size_t part_idx, float px, float py, float rot,
                         const std::vector<size_t>& placed_indices,
@@ -100,7 +103,8 @@ inline RadialResult radial_arrange(
         const VoxelGrid& grid = get_rot(part_idx, rot);
         if (grid.nx == 0) return false;
 
-        // Bed bounds check
+        // Bed bounds check (includes gap as margin from bed edges)
+        float gap = cfg.min_gap_mm;
         float pmin_x = px + grid.origin.x;
         float pmin_y = py + grid.origin.y;
         float pmax_x = pmin_x + grid.nx * grid.voxel_size;
@@ -111,14 +115,23 @@ inline RadialResult radial_arrange(
             pmax_y > cfg.bed_height_mm - margin)
             return false;
 
-        // Collision check against all placed parts
+        // Collision check with gap enforcement.
+        // Test at +/- gap offsets in X and Y — if any overlap, parts are too close.
         Vec3f off_i = {px, py, 0.0f};
         for (size_t j : placed_indices) {
             const auto& pj = placements[j];
             const VoxelGrid& grid_j = get_rot(j, pj.zrot);
             Vec3f off_j = {pj.x, pj.y, 0.0f};
-            if (VoxelGrid::collision_count(grid, off_i, grid_j, off_j) > 0)
-                return false;
+
+            // Check collision with gap inflation: shift the candidate part
+            // by +/- gap in each axis to detect if parts are within gap distance
+            for (float dx : {0.0f, gap, -gap}) {
+                for (float dy : {0.0f, gap, -gap}) {
+                    Vec3f off_shifted = {px + dx, py + dy, 0.0f};
+                    if (VoxelGrid::collision_count(grid, off_shifted, grid_j, off_j) > 0)
+                        return false;
+                }
+            }
         }
         return true;
     };
@@ -181,31 +194,55 @@ inline RadialResult radial_arrange(
 
         // Expand outward from center in concentric rings.
         // At each distance, try ALL directions and ALL rotations.
-        // First valid distance wins — guarantees tightest packing.
+        // Collect all valid placements at the first distance that works,
+        // then pick the one that best fills the ring (maximizes minimum
+        // distance to already-placed parts).
         struct Candidate {
             float x, y, rot, dist;
         };
-        Candidate best = {0, 0, 0, max_slide + 1};
-        bool found = false;
 
-        for (float dist = 0; dist <= max_slide && !found; dist += cfg.step_mm) {
+        std::vector<Candidate> ring_candidates;
+
+        for (float dist = 0; dist <= max_slide; dist += cfg.step_mm) {
+            ring_candidates.clear();
+
             for (const auto& [dx, dy] : directions) {
                 float px = bed_cx + dx * dist;
                 float py = bed_cy + dy * dist;
 
                 for (float rot : part_rots) {
                     if (is_valid(idx, px, py, rot, placed_indices, result.placements)) {
-                        best = {px, py, rot, dist};
-                        found = true;
-                        goto ring_done; // first valid at this distance is good enough
+                        ring_candidates.push_back({px, py, rot, dist});
+                        break; // best rotation at this direction, move to next direction
                     }
                 }
             }
-        }
-        ring_done:;
 
-        if (found) {
-            result.placements[idx] = {best.x, best.y, best.rot, 0, 0, true};
+            if (!ring_candidates.empty()) break; // found valid positions at this distance
+        }
+
+        if (!ring_candidates.empty()) {
+            // Pick the candidate that maximizes minimum distance to placed parts.
+            // This fills rings evenly instead of biasing toward direction 0.
+            size_t best_idx = 0;
+            float best_min_dist = -1.0f;
+
+            for (size_t ci = 0; ci < ring_candidates.size(); ci++) {
+                float min_d = max_slide;
+                for (size_t pi : placed_indices) {
+                    float ddx = ring_candidates[ci].x - result.placements[pi].x;
+                    float ddy = ring_candidates[ci].y - result.placements[pi].y;
+                    float d = std::sqrt(ddx * ddx + ddy * ddy);
+                    min_d = std::min(min_d, d);
+                }
+                if (min_d > best_min_dist) {
+                    best_min_dist = min_d;
+                    best_idx = ci;
+                }
+            }
+
+            auto& c = ring_candidates[best_idx];
+            result.placements[idx] = {c.x, c.y, c.rot, 0, 0, true};
             placed_indices.push_back(idx);
         }
         // else: part doesn't fit, stays unplaced
