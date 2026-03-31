@@ -6,6 +6,7 @@
 #include "SnuggleArrange.hpp"
 #include "polite_voxelizer.hpp"
 #include "snuggle_nester.hpp"
+#include "gpu_collision.hpp"
 
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/BoundingBox.hpp"
@@ -117,14 +118,30 @@ void snuggle_arrange(
         cfg.yield_every_gens = 1;
     }
 
-    snuggle::SnuggleNester nester(cfg);
+    auto evaluator = snuggle::create_collision_evaluator();
+    std::string backend_name = "CPU";
+
+#ifdef SLIC3R_GUI
+    if (auto* gpu = dynamic_cast<snuggle::GpuCollisionEvaluator*>(evaluator.get())) {
+        if (gpu->is_available())
+            backend_name = "GPU";
+    }
+#endif
+
+    BOOST_LOG_TRIVIAL(info) << "Snuggle: using " << backend_name << " collision backend";
+
+    snuggle::SnuggleNester nester(cfg, evaluator.get());
 
     auto result = nester.run(parts, [&](size_t gen, size_t max_gen,
                                         const snuggle::Individual& best) -> bool {
-        // Report progress
+        // Progress string includes backend, gen count, and collision status
         if (params.progressind) {
             unsigned progress = (unsigned)(gen * items.size() / max_gen);
-            params.progressind(progress, " (Snuggle gen " + std::to_string(gen) + ")");
+            std::string status = " (Snuggle " + backend_name
+                + " gen " + std::to_string(gen) + "/" + std::to_string(max_gen)
+                + (best.is_feasible() ? " OK" : " " + std::to_string(best.collision_count) + " collisions")
+                + ")";
+            params.progressind(progress, status);
         }
         // Check stop condition
         if (params.stopcondition && params.stopcondition())
@@ -132,8 +149,13 @@ void snuggle_arrange(
         return true;
     });
 
-    BOOST_LOG_TRIVIAL(info) << "Snuggle: finished in " << result.time_ms << "ms, "
-        << "feasible=" << result.feasible << ", collisions=" << result.collisions;
+    BOOST_LOG_TRIVIAL(info) << "Snuggle [" << backend_name << "]: "
+        << parts.size() << " parts, "
+        << result.time_ms << "ms, "
+        << result.generations_run << " gens, "
+        << "feasible=" << result.feasible
+        << ", collisions=" << result.collisions
+        << (result.timed_out ? ", TIMED OUT" : "");
 
     // ── Write results back to ArrangePolygons ──────────────
     for (size_t i = 0; i < items.size() && i < result.placements.size(); i++) {

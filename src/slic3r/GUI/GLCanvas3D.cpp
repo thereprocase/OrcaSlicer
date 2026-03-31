@@ -5908,7 +5908,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     }
 
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
-    imgui->text(_L("Genetic algorithm \u2014 slower but better 3D interlocking"));
+    imgui->text(_L("Genetic 3D nester \u2014 GPU-accelerated when available"));
     ImGui::PopStyleColor();
 
     ImGui::Separator();
