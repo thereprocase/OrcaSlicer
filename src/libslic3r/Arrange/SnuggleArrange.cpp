@@ -34,14 +34,19 @@ void snuggle_arrange(
     float bed_origin_x = unscale_(bed_bb.min.x());
     float bed_origin_y = unscale_(bed_bb.min.y());
 
-    // ── Single-part: center instantly, no GA ──────────────
+    // ── Single-part: center on bed accounting for polygon offset ──
     if (items.size() == 1) {
         BOOST_LOG_TRIVIAL(info) << "Snuggle: single part — centering on bed";
-        float cx = bed_origin_x + bed_w * 0.5f;
-        float cy = bed_origin_y + bed_h * 0.5f;
-        items[0].translation = Vec2crd(scaled(cx), scaled(cy));
-        // Preserve user's Z rotation — don't zero it
-        // items[0].rotation is already set from get_arrange_polygon
+        // The polygon is centered at instance origin. Compute the polygon's
+        // own centroid so the VISIBLE geometry lands at bed center.
+        auto poly_bb = get_extents(items[0].poly);
+        float poly_cx = unscale_(poly_bb.min.x() + poly_bb.max.x()) * 0.5f;
+        float poly_cy = unscale_(poly_bb.min.y() + poly_bb.max.y()) * 0.5f;
+        float bed_cx = bed_origin_x + bed_w * 0.5f;
+        float bed_cy = bed_origin_y + bed_h * 0.5f;
+        // Place instance origin so that geometry centroid lands at bed center
+        items[0].translation = Vec2crd(scaled(bed_cx - poly_cx), scaled(bed_cy - poly_cy));
+        // Preserve user's Z rotation
         items[0].bed_idx = 0;
         return;
     }
@@ -51,6 +56,8 @@ void snuggle_arrange(
     if (items.size() > max_parts) {
         BOOST_LOG_TRIVIAL(warning) << "Snuggle: " << items.size() << " parts exceeds limit ("
             << max_parts << "). Falling back to standard arranger.";
+        // Mark all UNARRANGED so ArrangeJob overflow fallback triggers
+        for (auto& item : items) item.bed_idx = -1;
         return;
     }
 
@@ -58,6 +65,7 @@ void snuggle_arrange(
     if (params.is_seq_print) {
         BOOST_LOG_TRIVIAL(warning) << "Snuggle: sequential printing active — "
             "cannot verify toolhead clearance. Falling back to standard arranger.";
+        for (auto& item : items) item.bed_idx = -1;
         return;
     }
 
@@ -262,7 +270,7 @@ void snuggle_arrange(
                                         const snuggle::Individual& best) -> bool {
         // Progress string includes backend, gen count, and collision status
         if (params.progressind) {
-            unsigned progress = (unsigned)(gen * items.size() / max_gen);
+            unsigned progress = (unsigned)(gen * 100 / std::max(max_gen, (size_t)1));
             std::string status = " (Snuggle " + backend_name
                 + " gen " + std::to_string(gen) + "/" + std::to_string(max_gen)
                 + (best.is_feasible() ? " OK" : " " + std::to_string(best.collision_count) + " collisions")

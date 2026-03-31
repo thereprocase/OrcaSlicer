@@ -304,6 +304,11 @@ public:
         // 2 seconds or 20 sweeps, whichever comes first.
         if (cfg_.compact) {
             compact_toward_center(result, parts);
+            // Re-snap rotations after compaction (micro-rotations may violate step constraint)
+            if (cfg_.rotation_step_rad > 0.001f) {
+                for (size_t i = 0; i < result.placements.size() && i < parts.size(); i++)
+                    result.placements[i].zrot = snap_rotation(result.placements[i].zrot, parts[i].initial_zrot);
+            }
         }
 
         // Resolve where each part's instance origin ends up on the bed.
@@ -511,13 +516,26 @@ private:
         if (rot_cache_built_) return;
         size_t n = parts.size();
         rot_cache_.resize(n);
-        for (size_t i = 0; i < n; i++) {
-            rot_cache_[i].resize(ROT_CACHE_BINS);
-            for (int bin = 0; bin < ROT_CACHE_BINS; bin++) {
-                float angle = (float)bin * (2.0f * 3.14159265f / ROT_CACHE_BINS);
-                rot_cache_[i][bin] = parts[i].grid.rotated_copy(angle);
+
+        if (cfg_.lock_rotation) {
+            // Only build the single needed angle per part (saves 359x memory)
+            for (size_t i = 0; i < n; i++) {
+                rot_cache_[i].resize(ROT_CACHE_BINS);
+                int bin = (int)std::floor(parts[i].initial_zrot * ROT_CACHE_BINS / (2.0f * 3.14159265f));
+                bin = ((bin % ROT_CACHE_BINS) + ROT_CACHE_BINS) % ROT_CACHE_BINS;
+                rot_cache_[i][bin] = parts[i].grid.rotated_copy(parts[i].initial_zrot);
+                polite_yield();
             }
-            polite_yield();
+        } else {
+            // Build all 360 bins
+            for (size_t i = 0; i < n; i++) {
+                rot_cache_[i].resize(ROT_CACHE_BINS);
+                for (int bin = 0; bin < ROT_CACHE_BINS; bin++) {
+                    float angle = (float)bin * (2.0f * 3.14159265f / ROT_CACHE_BINS);
+                    rot_cache_[i][bin] = parts[i].grid.rotated_copy(angle);
+                }
+                polite_yield();
+            }
         }
         rot_cache_built_ = true;
     }
@@ -558,8 +576,11 @@ private:
             auto &p = ind.placements[i];
             float part_margin = parts[i].grid.nx * parts[i].grid.voxel_size * 0.5f;
             float lo = std::max(part_margin, cfg_.bed_margin_mm);
-            p.x = randf(lo, cfg_.bed_width_mm - lo);
-            p.y = randf(lo, cfg_.bed_height_mm - lo);
+            // Ensure lo < hi to avoid UB in uniform_real_distribution
+            float hi_x = std::max(lo + 0.1f, cfg_.bed_width_mm - lo);
+            float hi_y = std::max(lo + 0.1f, cfg_.bed_height_mm - lo);
+            p.x = randf(lo, hi_x);
+            p.y = randf(lo, hi_y);
             p.zrot = cfg_.lock_rotation
                 ? parts[i].initial_zrot
                 : randf(0.0f, 2.0f * 3.14159265f);
