@@ -565,11 +565,43 @@ void ArrangeJob::process(Ctl &ctl)
             <<", bbox:"<<get_extents(item.poly).min.transpose()<<","<<get_extents(item.poly).max.transpose();
     }
 
-    // Snuggle: 3D-aware genetic nesting (proof-of-concept)
+    // Snuggle: 3D-aware genetic nesting
     if (params.use_snuggle) {
-        BOOST_LOG_TRIVIAL(info) << "Using Snuggle 3D-aware arrangement";
+        BOOST_LOG_TRIVIAL(info) << "Snuggle: arranging " << m_selected.size() << " items";
         arrangement::snuggle_arrange(m_selected, m_unselected, bedpts, params,
                                      m_plater->model());
+
+        // Overflow fallback: if Snuggle left items unarranged, pass them
+        // to the default arranger with Snuggle-placed items as fixed obstacles.
+        bool has_unarranged = false;
+        for (const auto& item : m_selected)
+            if (item.bed_idx < 0) { has_unarranged = true; break; }
+
+        if (has_unarranged) {
+            ArrangePolygons snuggle_placed, overflow;
+            for (auto& item : m_selected) {
+                if (item.bed_idx >= 0)
+                    snuggle_placed.push_back(std::move(item));
+                else
+                    overflow.push_back(std::move(item));
+            }
+
+            BOOST_LOG_TRIVIAL(info) << "Snuggle overflow: "
+                << snuggle_placed.size() << " placed (locked), "
+                << overflow.size() << " overflow -> default arranger";
+
+            ArrangePolygons combined_fixed = m_unselected;
+            for (const auto& placed : snuggle_placed)
+                combined_fixed.push_back(placed);
+
+            arrangement::arrange(overflow, combined_fixed, bedpts, params);
+
+            m_selected.clear();
+            for (auto& item : snuggle_placed)
+                m_selected.push_back(std::move(item));
+            for (auto& item : overflow)
+                m_selected.push_back(std::move(item));
+        }
     } else {
         arrangement::arrange(m_selected, m_unselected, bedpts, params);
     }
@@ -598,9 +630,24 @@ void ArrangeJob::process(Ctl &ctl)
     }
 
     // finalize just here.
-    ctl.update_status(100,
-        ctl.was_canceled() ? _u8L("Arranging canceled.") :
-        we_have_unpackable_items ? _u8L("Arranging is done but there are unpacked items. Reduce spacing and try again.") : _u8L("Arranging done."));
+    std::string finish_msg;
+    if (ctl.was_canceled()) {
+        finish_msg = _u8L("Arranging canceled.");
+    } else if (params.use_snuggle) {
+        // Count placed vs total for Snuggle-specific message
+        int placed = 0;
+        for (const auto &item : m_selected)
+            if (item.bed_idx >= 0) placed++;
+        if (we_have_unpackable_items)
+            finish_msg = GUI::format(_L("Snuggle placed %1% of %2% parts. Some couldn't fit."), placed, (int)m_selected.size());
+        else
+            finish_msg = GUI::format(_L("Snuggle complete \u2014 %1% parts arranged."), placed);
+    } else if (we_have_unpackable_items) {
+        finish_msg = _u8L("Arranging is done but there are unpacked items. Reduce spacing and try again.");
+    } else {
+        finish_msg = _u8L("Arranging done.");
+    }
+    ctl.update_status(100, finish_msg);
 }
 
 ArrangeJob::ArrangeJob() : m_plater{wxGetApp().plater()} { }

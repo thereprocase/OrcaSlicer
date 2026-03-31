@@ -5892,22 +5892,32 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         if (settings_out.enable_rotation == true) { imgui->disabled_end(); }
     }
 
-    // Snuggle (experimental) section
+    // ── Snuggle section ─────────────────────────────────────
     ImGui::Separator();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.00f, 0.59f, 0.53f, 1.00f));
-    imgui->text(_L("Snuggle (experimental)"));
+    imgui->text(_L("Snuggle 3D Arrangement"));
     ImGui::PopStyleColor();
 
-    if (imgui->bbl_checkbox(_L("Use Snuggle 3D nester"), settings.use_snuggle)) {
+    if (imgui->bbl_checkbox(_L("Enable Snuggle"), settings.use_snuggle)) {
         settings_out.use_snuggle = settings.use_snuggle;
         appcfg->set("arrange", "use_snuggle", settings_out.use_snuggle ? "1" : "0");
         settings_changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", _u8L("Pack parts using their full 3D shapes instead of flat outlines.\n"
+                                      "Produces tighter blob-shaped clusters.\n"
+                                      "Best with 2-30 parts. Takes a few seconds.").c_str());
+
+    // When Snuggle is on, grey out standard rotation (Snuggle has its own control)
+    if (settings_out.use_snuggle) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+        imgui->text(_L("(Standard rotation disabled \u2014 use Lock Rotation below)"));
+        ImGui::PopStyleColor();
     }
 
     {
         if (!settings_out.use_snuggle) {
             imgui->disabled_begin(true);
-            settings.snuggle_lock_rotation = false;
         }
 
         if (imgui->bbl_checkbox(_L("Lock rotation"), settings.snuggle_lock_rotation)) {
@@ -5915,6 +5925,10 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
             appcfg->set("arrange", "snuggle_lock_rotation", settings_out.snuggle_lock_rotation ? "1" : "0");
             settings_changed = true;
         }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", _u8L("Preserve each part's current Z-rotation during arrangement.\n"
+                                          "When unchecked, Snuggle may rotate parts for tighter packing.\n"
+                                          "Recommended: ON for parts with specific orientation requirements.").c_str());
 
         if (!settings_out.use_snuggle) { imgui->disabled_end(); }
     }
@@ -5962,9 +5976,14 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         if (!settings_out.use_snuggle) { imgui->disabled_end(); }
     }
 
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
-    imgui->text(_L("Genetic 3D nester \u2014 GPU-accelerated when available"));
-    ImGui::PopStyleColor();
+    if (settings_out.use_snuggle) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+        if (seq_print)
+            imgui->text(_L("\u26A0 Sequential printing: Snuggle will use standard arrange"));
+        else
+            imgui->text(_L("Genetic 3D nester \u2014 voxel collision detection"));
+        ImGui::PopStyleColor();
+    }
 
     ImGui::Separator();
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(15.0f, 10.0f));
