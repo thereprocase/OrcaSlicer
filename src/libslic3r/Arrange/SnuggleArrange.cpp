@@ -102,10 +102,12 @@ void snuggle_arrange(
         TriangleMesh mesh = obj->raw_mesh();
         mesh.transform(t.get_matrix());
 
-        // Clip at Z=0: if user sank the part into the bed, only voxelize
-        // the portion above the bed surface. Clamp vertices below Z=0.
-        for (auto& v : mesh.its.vertices)
-            if (v.z() < 0) v.z() = 0;
+        // Bed clipping: handled in voxelizer — voxels below Z=0 are
+        // naturally empty because no triangles exist there after the
+        // grid origin is clamped to Z >= 0. We just need to ensure
+        // the grid doesn't extend below the bed surface.
+        // (Vertex clamping would squish geometry, making parts fatter
+        // than their actual cross-section at the bed plane.)
 
         size_t orig_tris = mesh.its.indices.size();
         if (orig_tris > MAX_TRIS_FOR_VOXEL) {

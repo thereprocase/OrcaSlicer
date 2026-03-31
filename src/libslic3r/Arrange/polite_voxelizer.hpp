@@ -430,6 +430,13 @@ inline VoxError voxelize_mesh(
     bounds.max.y += voxel_size_mm;
     bounds.max.z += voxel_size_mm;
 
+    // Bed clipping: don't voxelize below Z=0. If the mesh extends below
+    // the bed (user intentionally sank the part), the grid starts at Z=0.
+    // Triangles crossing Z=0 naturally produce the correct cross-section
+    // via the SAT test — no vertex clamping needed.
+    if (bounds.min.z < 0.0f)
+        bounds.min.z = 0.0f;
+
     // Compute grid dimensions
     Vec3f sz = bounds.size();
     size_t gx = (size_t)std::ceil(sz.x / voxel_size_mm);
