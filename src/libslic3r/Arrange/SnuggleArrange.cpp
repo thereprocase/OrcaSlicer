@@ -174,20 +174,38 @@ void snuggle_arrange(
         << (result.timed_out ? ", TIMED OUT" : "");
 
     // ── Write results back to ArrangePolygons ──────────────
+    // The nester's placement (pl.x, pl.y) is the offset applied to the
+    // voxel grid. The grid's origin is the min corner of the mesh AABB
+    // (in object-local space). OrcaSlicer's translation is the position
+    // of the instance's origin point, NOT the grid corner. So:
+    //   world_position = pl.x + grid.origin.x  (in bed-relative mm)
+    //   orca_translation = world_position + bed_origin (in scaled coords)
+    // But the instance's arrange polygon was prepared with the poly at
+    // the instance's current position. We need to set translation such
+    // that apply() places the instance at the desired world position.
     for (size_t i = 0; i < items.size() && i < result.placements.size(); i++) {
         const auto& pl = result.placements[i];
+        const auto& grid = (i < parts.size()) ? parts[i].grid : parts[0].grid;
 
-        // Convert from bed-relative mm to Orca's scaled coordinates
-        // Snuggle places parts relative to bed (0,0), Orca expects absolute coordinates
+        // Nester places the grid at (pl.x + grid.origin.x, pl.y + grid.origin.y)
+        // in bed-relative coordinates. Convert to Orca's scaled frame.
+        float world_x = pl.x + grid.origin.x + bed_origin_x;
+        float world_y = pl.y + grid.origin.y + bed_origin_y;
+
+        // The arrange polygon's poly.contour has its own bounding box.
+        // The translation maps poly-local to world. For the part to appear
+        // at (world_x, world_y), we need: translation + poly_min = world_pos
+        BoundingBox poly_bb = get_extents(items[i].poly);
         items[i].translation = Vec2crd(
-            scaled(pl.x + bed_origin_x),
-            scaled(pl.y + bed_origin_y)
+            scaled(world_x) - poly_bb.min.x(),
+            scaled(world_y) - poly_bb.min.y()
         );
         items[i].rotation = (double)pl.zrot;
-        items[i].bed_idx = 0; // All on first bed for now
+        items[i].bed_idx = 0;
 
-        BOOST_LOG_TRIVIAL(debug) << "Snuggle: " << items[i].name
-            << " -> (" << pl.x << ", " << pl.y << ") rot=" << (pl.zrot * 180.0 / 3.14159265) << "deg";
+        BOOST_LOG_TRIVIAL(warning) << "Snuggle: " << items[i].name
+            << " -> bed(" << (pl.x + grid.origin.x) << ", " << (pl.y + grid.origin.y) << ")"
+            << " rot=" << (int)(pl.zrot * 180.0 / 3.14159265) << "deg";
     }
 }
 
