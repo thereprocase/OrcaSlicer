@@ -5908,10 +5908,10 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
                                       "Produces tighter blob-shaped clusters.\n"
                                       "Best with 2-30 parts. Takes a few seconds.").c_str());
 
-    // When Snuggle is on, grey out standard rotation (Snuggle has its own control)
+    // When Snuggle is on, explain that it manages rotation differently
     if (settings_out.use_snuggle) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
-        imgui->text(_L("(Standard rotation disabled \u2014 use Lock Rotation below)"));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
+        imgui->text(_L("Snuggle controls rotation \u2014 see Lock Rotation below"));
         ImGui::PopStyleColor();
     }
 
@@ -5977,12 +5977,16 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     }
 
     if (settings_out.use_snuggle) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
-        if (seq_print)
-            imgui->text(_L("\u26A0 Sequential printing: Snuggle will use standard arrange"));
-        else
+        if (seq_print) {
+            // Warning: use orange/amber for visibility
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.60f, 0.0f, 1.0f));
+            imgui->text(_L("\u26A0 Sequential printing active \u2014 Snuggle will fall back to standard arrange"));
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
             imgui->text(_L("Genetic 3D nester \u2014 voxel collision detection"));
-        ImGui::PopStyleColor();
+            ImGui::PopStyleColor();
+        }
     }
 
     ImGui::Separator();
