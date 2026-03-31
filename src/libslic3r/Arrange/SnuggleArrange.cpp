@@ -32,9 +32,26 @@ void snuggle_arrange(
         << " excludes=" << excludes.size()
         << " bed_points=" << bed.size();
 
+    // Bed dimensions (used by several early-exit paths)
+    float bed_width_mm = 0, bed_height_mm = 0;
+    float bed_origin_x_mm = 0, bed_origin_y_mm = 0;
+
     // ── Edge case: nothing to arrange ────────────────────────────────
     if (items.empty()) {
         BOOST_LOG_TRIVIAL(info) << "[SnuggleArrange] No items to arrange, returning.";
+        return;
+    }
+
+    // ── Uruk #1: Single part — just center it, don't waste CPU ──────
+    if (items.size() == 1) {
+        BOOST_LOG_TRIVIAL(info) << "[SnuggleArrange] Single part — centering on bed.";
+        snuggle_xform::bed_dimensions_mm(bed, bed_width_mm, bed_height_mm,
+                                         bed_origin_x_mm, bed_origin_y_mm);
+        float cx_mm = bed_origin_x_mm + bed_width_mm * 0.5f;
+        float cy_mm = bed_origin_y_mm + bed_height_mm * 0.5f;
+        items[0].translation = Vec2crd(snuggle_xform::mm_to_scaled(cx_mm),
+                                       snuggle_xform::mm_to_scaled(cy_mm));
+        items[0].bed_idx = 0;
         return;
     }
 
@@ -48,8 +65,6 @@ void snuggle_arrange(
     }
 
     // ── Step 1: Convert bed to mm dimensions ─────────────────────────
-    float bed_width_mm = 0, bed_height_mm = 0;
-    float bed_origin_x_mm = 0, bed_origin_y_mm = 0;
     snuggle_xform::bed_dimensions_mm(bed, bed_width_mm, bed_height_mm,
                                      bed_origin_x_mm, bed_origin_y_mm);
 
@@ -134,9 +149,9 @@ void snuggle_arrange(
     // ── Step 3: Configure and run nester ─────────────────────────────
     snuggle::NesterConfig cfg;
 
-    // Conservative bed size: shrink by one voxel on each side so that
-    // the voxelizer's outward rounding can't push parts off the bed edge.
-    float bed_margin = DEFAULT_VOXEL_SIZE_MM;
+    // Conservative bed shrink: half a voxel per side for rounding safety.
+    // Use half-voxel (not full) to avoid over-shrinking tiny beds (#5).
+    float bed_margin = DEFAULT_VOXEL_SIZE_MM * 0.5f;
     cfg.bed_width_mm  = std::max(1.0f, bed_width_mm  - 2.0f * bed_margin);
     cfg.bed_height_mm = std::max(1.0f, bed_height_mm - 2.0f * bed_margin);
 
