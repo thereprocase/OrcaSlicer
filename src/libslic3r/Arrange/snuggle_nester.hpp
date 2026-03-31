@@ -59,6 +59,7 @@ struct NesterConfig {
 
     // Fitness weights
     float  w_compactness     = 1.0f;
+    float  w_clustering      = 1.5f;   // penalize spread-out layouts
     float  w_height_center   = 0.3f;
 
     // Politeness
@@ -68,9 +69,14 @@ struct NesterConfig {
 
 // ── Per-part placement (3DOF: x, y, z_rotation) ──────────
 struct Placement {
-    float x    = 0.0f;  // mm, bed coordinates
-    float y    = 0.0f;  // mm, bed coordinates
+    float x    = 0.0f;  // mm, grid offset (internal to nester)
+    float y    = 0.0f;  // mm, grid offset (internal to nester)
     float zrot = 0.0f;  // radians
+
+    // Where the instance origin (mesh-local 0,0) lands on the bed,
+    // in bed-relative mm. Computed after placement by the nester.
+    float origin_bed_x = 0.0f;
+    float origin_bed_y = 0.0f;
 };
 
 // ── Individual: one complete arrangement ──────────────────
@@ -144,11 +150,11 @@ public:
         }
 
         // ── Build rotation cache (one-time cost) ──────────
-        if (!cfg_.lock_rotation) {
-            build_rotation_cache(parts);
-            if (evaluator_) {
-                evaluator_->upload_grids(parts, rot_cache_);
-            }
+        // Always build, even for lock_rotation — the evaluator needs it.
+        // When locked, every bin gets the same grid (at the locked angle).
+        build_rotation_cache(parts);
+        if (evaluator_) {
+            evaluator_->upload_grids(parts, rot_cache_);
         }
 
         // ── Initialize population ──────────────────────────
@@ -266,10 +272,38 @@ public:
         result.feasible       = best.is_feasible();
         result.generations_run = cfg_.max_generations;
         result.time_ms        = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+        // Resolve where each part's instance origin ends up on the bed.
+        // The nester placed grids at (pl.x, pl.y). The grid rotates around
+        // its min corner, but OrcaSlicer rotates around the instance origin.
+        // This compensates for the pivot difference.
+        compute_origin_positions(result, parts);
+
         return result;
     }
 
 private:
+    // Compute where each part's instance origin (mesh-local 0,0) lands
+    // on the bed, given the grid placement and rotation.
+    void compute_origin_positions(
+        NesterResult &result,
+        const std::vector<PartInfo> &parts)
+    {
+        for (size_t i = 0; i < result.placements.size() && i < parts.size(); i++) {
+            auto &pl = result.placements[i];
+            float ox = parts[i].grid.origin.x;
+            float oy = parts[i].grid.origin.y;
+            float ca = std::cos(pl.zrot);
+            float sa = std::sin(pl.zrot);
+
+            // Instance origin (0,0 in mesh space) is at (-ox, -oy) relative
+            // to the rotation pivot (grid min corner). Rotate, then add
+            // the pivot position and placement offset.
+            pl.origin_bed_x = pl.x + ox * (1.0f - ca) + oy * sa;
+            pl.origin_bed_y = pl.y + oy * (1.0f - ca) - ox * sa;
+        }
+    }
+
     NesterConfig cfg_;
     CollisionEvaluator* evaluator_ = nullptr;  // non-owning, caller manages lifetime
     std::mt19937 rng_;
@@ -493,6 +527,36 @@ private:
         float compactness = 1.0f - (bbox_area / bed_area);
         compactness = std::clamp(compactness, 0.0f, 1.0f);
 
+        // Clustering: penalize large average distance between part centers.
+        // Prevents the GA from spreading parts in a line across the bed.
+        float clustering = 0.0f;
+        if (n >= 2) {
+            // Compute centroid of all part centers
+            float cx_sum = 0, cy_sum = 0;
+            for (size_t i = 0; i < n; i++) {
+                const auto &g = *rotated[i];
+                cx_sum += ind.placements[i].x + g.origin.x + g.nx * g.voxel_size * 0.5f;
+                cy_sum += ind.placements[i].y + g.origin.y + g.ny * g.voxel_size * 0.5f;
+            }
+            float centroid_x = cx_sum / n;
+            float centroid_y = cy_sum / n;
+
+            // Average distance from centroid (normalized by bed diagonal)
+            float bed_diag = std::sqrt(cfg_.bed_width_mm * cfg_.bed_width_mm +
+                                       cfg_.bed_height_mm * cfg_.bed_height_mm);
+            float avg_dist = 0;
+            for (size_t i = 0; i < n; i++) {
+                const auto &g = *rotated[i];
+                float pcx = ind.placements[i].x + g.origin.x + g.nx * g.voxel_size * 0.5f;
+                float pcy = ind.placements[i].y + g.origin.y + g.ny * g.voxel_size * 0.5f;
+                float dx = pcx - centroid_x;
+                float dy = pcy - centroid_y;
+                avg_dist += std::sqrt(dx*dx + dy*dy);
+            }
+            avg_dist /= (n * bed_diag);
+            clustering = 1.0f - std::clamp(avg_dist, 0.0f, 1.0f);
+        }
+
         // Height centering: tall parts near center score better
         float height_score = 0.0f;
         float bed_cx = cfg_.bed_width_mm * 0.5f;
@@ -512,6 +576,7 @@ private:
             height_score /= max_possible_height;
 
         ind.fitness = cfg_.w_compactness * compactness
+                    + cfg_.w_clustering * clustering
                     + cfg_.w_height_center * height_score;
     }
 

@@ -191,55 +191,27 @@ void snuggle_arrange(
         << (result.timed_out ? ", TIMED OUT" : "");
 
     // ── Write results back to ArrangePolygons ──────────────
-    // The nester's placement (pl.x, pl.y) is the offset applied to the
-    // voxel grid. The grid's origin is the min corner of the mesh AABB
-    // (in object-local space). OrcaSlicer's translation is the position
-    // of the instance's origin point, NOT the grid corner. So:
-    //   world_position = pl.x + grid.origin.x  (in bed-relative mm)
-    //   orca_translation = world_position + bed_origin (in scaled coords)
-    // But the instance's arrange polygon was prepared with the poly at
-    // the instance's current position. We need to set translation such
-    // that apply() places the instance at the desired world position.
+    // The nester resolved each part's instance origin position on the bed
+    // (origin_bed_x/y), accounting for rotation pivot differences between
+    // the voxel grid and OrcaSlicer's instance model. The ArrangePolygon
+    // translation IS the instance origin in world-space scaled coords.
     for (size_t i = 0; i < items.size() && i < result.placements.size(); i++) {
         const auto& pl = result.placements[i];
-        const auto& grid = (i < parts.size()) ? parts[i].grid : parts[0].grid;
 
-        // The nester placed the ROTATED grid at (pl.x, pl.y). We need the
-        // rotated grid's origin to correctly compute where the mesh lands.
-        // Using the unrotated grid.origin is WRONG when rotation != 0.
-        snuggle::VoxelGrid rot_grid = grid.rotated_copy(pl.zrot);
-        float rot_mesh_min_x = rot_grid.origin.x + rot_grid.voxel_size;
-        float rot_mesh_min_y = rot_grid.origin.y + rot_grid.voxel_size;
-
-        float bed_x = pl.x + rot_mesh_min_x;
-        float bed_y = pl.y + rot_mesh_min_y;
-        float world_x = bed_x + bed_origin_x;
-        float world_y = bed_y + bed_origin_y;
-
-        // The rotated polygon's min corner should land at (world_x, world_y).
-        // OrcaSlicer applies rotation BEFORE translation, so:
-        //   final_pos = translate(rotate(poly))
-        //   poly_min_after_rotate = rotated_poly_bb.min
-        //   world_pos = translation + rotated_poly_bb.min
-        //   translation = scaled(world) - rotated_poly_bb.min
-        ExPolygon rotated_poly = items[i].poly;
-        rotated_poly.rotate(pl.zrot);
-        BoundingBox rot_poly_bb = get_extents(rotated_poly);
         items[i].translation = Vec2crd(
-            scaled(world_x) - rot_poly_bb.min.x(),
-            scaled(world_y) - rot_poly_bb.min.y()
+            scaled(pl.origin_bed_x + bed_origin_x),
+            scaled(pl.origin_bed_y + bed_origin_y)
         );
         items[i].rotation = (double)pl.zrot;
         items[i].bed_idx = 0;
 
         BOOST_LOG_TRIVIAL(warning) << "Snuggle: [" << i << "] " << items[i].name
             << " pl=(" << pl.x << "," << pl.y << ")"
-            << " rot_grid_origin=(" << rot_grid.origin.x << "," << rot_grid.origin.y << ")"
-            << " rot_mesh_min=(" << rot_mesh_min_x << "," << rot_mesh_min_y << ")"
-            << " bed=(" << bed_x << "," << bed_y << ")"
-            << " world=(" << world_x << "," << world_y << ")"
-            << " rot_poly_bb_min=(" << unscale_(rot_poly_bb.min.x()) << "," << unscale_(rot_poly_bb.min.y()) << ")"
-            << " trans=(" << unscale_(items[i].translation.x()) << "," << unscale_(items[i].translation.y()) << ")"
+            << " origin_bed=(" << pl.origin_bed_x << "," << pl.origin_bed_y << ")"
+            << " world=(" << (pl.origin_bed_x + bed_origin_x) << ","
+                          << (pl.origin_bed_y + bed_origin_y) << ")"
+            << " trans=(" << unscale_(items[i].translation.x()) << ","
+                          << unscale_(items[i].translation.y()) << ")"
             << " rot=" << (int)(pl.zrot * 180.0 / 3.14159265) << "deg";
     }
 }
