@@ -575,23 +575,51 @@ void ArrangeJob::process(Ctl &ctl)
             if (item.bed_idx < 0) { has_unarranged = true; break; }
 
         if (has_unarranged) {
-            BOOST_LOG_TRIVIAL(warning) << "Snuggle left unarranged items — falling back to default arranger for overflow";
-            // Collect unarranged items and run default arranger on them
+            // Split: Snuggle-placed items become locked obstacles,
+            // unarranged items go to default arranger for placement.
             ArrangePolygons snuggle_placed, overflow;
             for (auto& item : m_selected) {
-                if (item.bed_idx >= 0)
+                if (item.bed_idx >= 0) {
                     snuggle_placed.push_back(std::move(item));
-                else
+                } else {
                     overflow.push_back(std::move(item));
+                }
             }
-            // Snuggle-placed items become fixed obstacles for the overflow arranger
-            ArrangePolygons combined_fixed = m_unselected;
-            for (auto& placed : snuggle_placed)
-                combined_fixed.push_back(placed);
 
+            BOOST_LOG_TRIVIAL(info) << "Snuggle overflow: "
+                << snuggle_placed.size() << " placed (locked), "
+                << overflow.size() << " overflow -> default arranger";
+
+            // Log locked positions for debugging
+            for (size_t i = 0; i < snuggle_placed.size(); ++i) {
+                BOOST_LOG_TRIVIAL(debug) << "  LOCKED[" << i << "] '"
+                    << snuggle_placed[i].name << "' trans=("
+                    << unscale<double>(snuggle_placed[i].translation.x()) << ","
+                    << unscale<double>(snuggle_placed[i].translation.y()) << ") mm"
+                    << " rot=" << snuggle_placed[i].rotation
+                    << " bed=" << snuggle_placed[i].bed_idx;
+            }
+
+            // Snuggle-placed items become fixed obstacles.
+            // The default arranger reads their hull + translation to know
+            // where they are, and places overflow parts around them.
+            ArrangePolygons combined_fixed = m_unselected;
+            for (const auto& placed : snuggle_placed)
+                combined_fixed.push_back(placed); // Copy — snuggle_placed still needed
+
+            // Default arranger handles overflow + multi-plate spillover
             arrangement::arrange(overflow, combined_fixed, bedpts, params);
 
-            // Recombine
+            // Log overflow results
+            for (size_t i = 0; i < overflow.size(); ++i) {
+                BOOST_LOG_TRIVIAL(debug) << "  OVERFLOW[" << i << "] '"
+                    << overflow[i].name << "' -> bed=" << overflow[i].bed_idx
+                    << " trans=(" << unscale<double>(overflow[i].translation.x()) << ","
+                    << unscale<double>(overflow[i].translation.y()) << ") mm";
+            }
+
+            // Recombine: locked items keep Snuggle positions,
+            // overflow items get default arranger positions
             m_selected.clear();
             for (auto& item : snuggle_placed)
                 m_selected.push_back(std::move(item));
