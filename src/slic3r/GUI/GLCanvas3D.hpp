@@ -498,7 +498,7 @@ public:
         bool  align_to_y_axis    = false;
         bool  use_snuggle           = false;
         bool  snuggle_lock_rotation = false;
-        float snuggle_padding_mm    = 5.0f;
+        float snuggle_padding_mm    = 1.0f;
         int   snuggle_population    = 64;
         int   snuggle_generations   = 30;
         float snuggle_voxel_mm      = 2.0f;

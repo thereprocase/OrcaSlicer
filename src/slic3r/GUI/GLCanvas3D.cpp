@@ -6129,7 +6129,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         // Legolas-tuned defaults: pop=64, gen=30, 2mm voxels, 15deg rotation, 5s timeout
         settings_out.use_snuggle = false;
         settings_out.snuggle_lock_rotation = false;
-        settings_out.snuggle_padding_mm = 5.0f;
+        settings_out.snuggle_padding_mm = 1.0f;
         settings_out.snuggle_population = 64;
         settings_out.snuggle_generations = 30;
         settings_out.snuggle_voxel_mm = 2.0f;
@@ -6144,7 +6144,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         appcfg->set("arrange", align_to_y_axis_key, settings_out.align_to_y_axis ? "1" : "0");
         appcfg->set("arrange", "use_snuggle", "0");
         appcfg->set("arrange", "snuggle_lock_rotation", "0");
-        appcfg->set("arrange", "snuggle_padding_mm", "5.0");
+        appcfg->set("arrange", "snuggle_padding_mm", "1.0");
         appcfg->set("arrange", "snuggle_population", "64");
         appcfg->set("arrange", "snuggle_generations", "30");
         appcfg->set("arrange", "snuggle_voxel_mm", "2.0");

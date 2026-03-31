@@ -125,7 +125,7 @@ struct ArrangeParams {
     // Snuggle: 3D-aware genetic nesting
     bool  use_snuggle            = false;
     bool  snuggle_lock_rotation  = false;
-    float snuggle_padding_mm     = 5.0f;   // min gap (mm)
+    float snuggle_padding_mm     = 1.0f;   // min gap (mm)
     int   snuggle_population     = 64;     // GA candidates per generation
     int   snuggle_generations    = 30;     // GA evolution cycles
     float snuggle_voxel_mm       = 2.0f;   // voxel resolution (mm)
