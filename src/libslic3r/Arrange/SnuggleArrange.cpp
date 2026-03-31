@@ -5,6 +5,7 @@
 
 #include "SnuggleArrange.hpp"
 #include "polite_voxelizer.hpp"
+#include "gpu_collision.hpp"
 #include "snuggle_nester.hpp"
 #include "snuggle_radial.hpp"
 
@@ -210,19 +211,13 @@ void snuggle_arrange(
     BOOST_LOG_TRIVIAL(warning) << "Snuggle: voxelized " << parts.size()
                                << " parts in " << (int)vox_ms << "ms";
 
-    // ── Configure and run the genetic nester ───────────────
-    snuggle::NesterConfig cfg;
-    cfg.bed_width_mm    = bed_w;
-    cfg.bed_height_mm   = bed_h;
-    cfg.min_gap_mm      = std::max(1.0f, params.snuggle_padding_mm);
-
     // ── Configure radial expansion nester ───────────────────
     snuggle::RadialConfig rcfg;
     rcfg.bed_width_mm  = bed_w;
     rcfg.bed_height_mm = bed_h;
     rcfg.min_gap_mm    = std::max(1.0f, params.snuggle_padding_mm);
     rcfg.bed_margin_mm = rcfg.min_gap_mm;
-    rcfg.step_mm       = base_voxel_size;
+    rcfg.step_mm       = voxel_size;
     rcfg.timeout_s     = std::max(2.0, (double)params.snuggle_timeout_s);
 
     if (params.snuggle_rotation_step <= 0 || params.snuggle_lock_rotation) {
