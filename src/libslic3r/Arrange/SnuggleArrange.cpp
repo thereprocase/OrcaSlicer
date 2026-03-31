@@ -10,6 +10,7 @@
 
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/BoundingBox.hpp"
+#include "libslic3r/QuadricEdgeCollapse.hpp"
 
 #include <boost/log/trivial.hpp>
 
@@ -22,7 +23,7 @@ void snuggle_arrange(
     const ArrangeParams&      params,
     const Model&              model)
 {
-    BOOST_LOG_TRIVIAL(info) << "Snuggle: starting 3D-aware arrangement for " << items.size() << " items";
+    BOOST_LOG_TRIVIAL(warning) << "Snuggle: starting 3D-aware arrangement for " << items.size() << " items";
 
     if (items.empty()) return;
 
@@ -38,17 +39,21 @@ void snuggle_arrange(
     float bed_origin_x = unscale_(bed_bb.min.x());
     float bed_origin_y = unscale_(bed_bb.min.y());
 
-    BOOST_LOG_TRIVIAL(info) << "Snuggle: bed " << bed_w << " x " << bed_h
-                            << " mm, origin (" << bed_origin_x << ", " << bed_origin_y << ")";
+    BOOST_LOG_TRIVIAL(warning) << "Snuggle: bed " << bed_w << " x " << bed_h
+                               << " mm, origin (" << bed_origin_x << ", " << bed_origin_y << ")";
 
     // ── Voxelize each part ─────────────────────────────────
-    float voxel_size = 2.0f; // Default balanced resolution
+    // At 2mm voxels, a 100mm part is a 50x50 grid — triangle count
+    // doesn't matter much since we iterate the grid, not the mesh.
+    // But high-poly meshes (>10K tris) make the SAT test expensive.
+    // Decimate to ~5K tris max — sufficient for 2mm voxel accuracy.
+    float voxel_size = 2.0f;
+    constexpr size_t MAX_TRIS_FOR_VOXEL = 5000;
+
     std::vector<snuggle::PartInfo> parts;
     size_t instance_idx = 0;
+    auto t_vox_start = std::chrono::steady_clock::now();
 
-    // Walk the model to match items to meshes.
-    // Items are in the same order as model objects/instances were enumerated
-    // during prepare(). We walk the model in the same order.
     for (const ModelObject* obj : model.objects) {
         for (const ModelInstance* inst : obj->instances) {
             if (instance_idx >= items.size()) break;
@@ -57,12 +62,19 @@ void snuggle_arrange(
             pi.name = obj->name;
             pi.initial_zrot = (float)inst->get_rotation().z();
 
-            // Get the combined mesh for this object (all model-part volumes,
-            // each transformed by its volume matrix, in object-local frame).
             TriangleMesh mesh = obj->raw_mesh();
+
+            // Decimate high-poly meshes for faster voxelization.
+            // At 2mm voxels, sub-2mm mesh detail is invisible. 5K tris is plenty.
+            size_t orig_tris = mesh.its.indices.size();
+            if (orig_tris > MAX_TRIS_FOR_VOXEL) {
+                its_quadric_edge_collapse(mesh.its, (uint32_t)MAX_TRIS_FOR_VOXEL);
+                BOOST_LOG_TRIVIAL(warning) << "Snuggle: decimated " << obj->name
+                    << " from " << orig_tris << " to " << mesh.its.indices.size() << " tris";
+            }
+
             const auto& its = mesh.its;
 
-            // Extract vertices and indices for voxelizer
             std::vector<float> verts(its.vertices.size() * 3);
             std::vector<uint32_t> indices(its.indices.size() * 3);
 
@@ -85,14 +97,15 @@ void snuggle_arrange(
             if (err != snuggle::VoxError::OK) {
                 BOOST_LOG_TRIVIAL(warning) << "Snuggle: voxelization failed for "
                     << obj->name << ": " << snuggle::vox_error_str(err);
-                // Fall through with empty grid — nester will place it but skip collision
                 pi.max_height_mm = 0;
                 pi.hull_area_mm2 = 0;
             } else {
                 pi.max_height_mm = pi.grid.nz * pi.grid.voxel_size;
                 pi.hull_area_mm2 = pi.grid.nx * pi.grid.ny * voxel_size * voxel_size;
-                BOOST_LOG_TRIVIAL(debug) << "Snuggle: voxelized " << obj->name
-                    << " -> " << pi.grid.nx << "x" << pi.grid.ny << "x" << pi.grid.nz;
+                BOOST_LOG_TRIVIAL(warning) << "Snuggle: voxelized " << obj->name
+                    << " (" << its.indices.size() << " tris) -> "
+                    << pi.grid.nx << "x" << pi.grid.ny << "x" << pi.grid.nz
+                    << " (" << pi.grid.count_solid() << " solid voxels)";
             }
 
             parts.push_back(std::move(pi));
@@ -100,7 +113,10 @@ void snuggle_arrange(
         }
     }
 
-    BOOST_LOG_TRIVIAL(info) << "Snuggle: voxelized " << parts.size() << " parts";
+    auto t_vox_end = std::chrono::steady_clock::now();
+    double vox_ms = std::chrono::duration<double, std::milli>(t_vox_end - t_vox_start).count();
+    BOOST_LOG_TRIVIAL(warning) << "Snuggle: voxelized " << parts.size()
+                               << " parts in " << (int)vox_ms << "ms";
 
     // ── Configure and run the genetic nester ───────────────
     snuggle::NesterConfig cfg;
@@ -128,7 +144,7 @@ void snuggle_arrange(
     }
 #endif
 
-    BOOST_LOG_TRIVIAL(info) << "Snuggle: using " << backend_name << " collision backend";
+    BOOST_LOG_TRIVIAL(warning) << "Snuggle: using " << backend_name << " collision backend";
 
     snuggle::SnuggleNester nester(cfg, evaluator.get());
 
@@ -149,7 +165,7 @@ void snuggle_arrange(
         return true;
     });
 
-    BOOST_LOG_TRIVIAL(info) << "Snuggle [" << backend_name << "]: "
+    BOOST_LOG_TRIVIAL(warning) << "Snuggle [" << backend_name << "]: "
         << parts.size() << " parts, "
         << result.time_ms << "ms, "
         << result.generations_run << " gens, "
