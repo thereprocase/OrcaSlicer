@@ -179,32 +179,32 @@ inline RadialResult radial_arrange(
             continue;
         }
 
-        // Slide outward from center along each radial direction.
-        // For each direction, find the minimum distance where the part fits.
-        // Pick the direction with the shortest distance (tightest to cluster).
+        // Expand outward from center in concentric rings.
+        // At each distance, try ALL directions and ALL rotations.
+        // First valid distance wins — guarantees tightest packing.
         struct Candidate {
             float x, y, rot, dist;
         };
         Candidate best = {0, 0, 0, max_slide + 1};
+        bool found = false;
 
-        for (const auto& [dx, dy] : directions) {
-            for (float dist = 0; dist <= max_slide; dist += cfg.step_mm) {
+        for (float dist = 0; dist <= max_slide && !found; dist += cfg.step_mm) {
+            for (const auto& [dx, dy] : directions) {
                 float px = bed_cx + dx * dist;
                 float py = bed_cy + dy * dist;
 
                 for (float rot : part_rots) {
                     if (is_valid(idx, px, py, rot, placed_indices, result.placements)) {
-                        if (dist < best.dist) {
-                            best = {px, py, rot, dist};
-                        }
-                        goto next_direction; // found for this direction, try next
+                        best = {px, py, rot, dist};
+                        found = true;
+                        goto ring_done; // first valid at this distance is good enough
                     }
                 }
             }
-            next_direction:;
         }
+        ring_done:;
 
-        if (best.dist <= max_slide) {
+        if (found) {
             result.placements[idx] = {best.x, best.y, best.rot, 0, 0, true};
             placed_indices.push_back(idx);
         }
