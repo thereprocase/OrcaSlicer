@@ -1146,6 +1146,14 @@ void GLCanvas3D::load_arrange_settings()
     if (!snuggle_lock_str.empty())
         m_arrange_settings_fff.snuggle_lock_rotation = (snuggle_lock_str == "1" || snuggle_lock_str == "true");
 
+    std::string snuggle_padding_str = wxGetApp().app_config->get("arrange", "snuggle_padding_mm");
+    if (!snuggle_padding_str.empty())
+        try { m_arrange_settings_fff.snuggle_padding_mm = std::stof(snuggle_padding_str); } catch (...) {}
+
+    std::string snuggle_quality_str = wxGetApp().app_config->get("arrange", "snuggle_quality");
+    if (!snuggle_quality_str.empty())
+        try { m_arrange_settings_fff.snuggle_quality = std::stoi(snuggle_quality_str); } catch (...) {}
+
     //BBS: add specific arrange settings
     m_arrange_settings_fff_seq_print.is_seq_print = true;
 }
@@ -5907,6 +5915,41 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         if (!settings_out.use_snuggle) { imgui->disabled_end(); }
     }
 
+    {
+        if (!settings_out.use_snuggle) { imgui->disabled_begin(true); }
+
+        ImGui::AlignTextToFramePadding();
+        imgui->text(_L("Part gap"));
+        ImGui::SameLine(1.2 * cursor_slider_left);
+        ImGui::PushItemWidth(window_width - slider_icon_width);
+        bool b_padding = imgui->bbl_slider_float_style("##SnugglePadding", &settings.snuggle_padding_mm, 0.0f, 20.0f, "%4.1f");
+        ImGui::SameLine(window_width - slider_icon_width + 1.3 * cursor_slider_left);
+        ImGui::PushItemWidth(1.5 * slider_icon_width);
+        bool b_padding_input = ImGui::BBLDragFloat("##snuggle_padding_input", &settings.snuggle_padding_mm, 0.1f, 0.0f, 20.0f, "%.1f");
+        if (b_padding || b_padding_input) {
+            settings.snuggle_padding_mm = std::clamp(settings.snuggle_padding_mm, 0.0f, 20.0f);
+            settings_out.snuggle_padding_mm = settings.snuggle_padding_mm;
+            appcfg->set("arrange", "snuggle_padding_mm", float_to_string_decimal_point(settings_out.snuggle_padding_mm));
+            settings_changed = true;
+        }
+
+        ImGui::AlignTextToFramePadding();
+        imgui->text(_L("Quality"));
+        ImGui::SameLine(1.2 * cursor_slider_left);
+        ImGui::PushItemWidth(window_width - slider_icon_width);
+        float quality_f = (float)settings.snuggle_quality;
+        if (imgui->bbl_slider_float_style("##SnuggleQuality", &quality_f, 1.0f, 10.0f, "%.0f")) {
+            settings.snuggle_quality = (int)quality_f;
+            settings_out.snuggle_quality = settings.snuggle_quality;
+            appcfg->set("arrange", "snuggle_quality", std::to_string(settings_out.snuggle_quality));
+            settings_changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", _u8L("Higher = better packing, slower").c_str());
+
+        if (!settings_out.use_snuggle) { imgui->disabled_end(); }
+    }
+
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
     imgui->text(_L("Genetic 3D nester \u2014 GPU-accelerated when available"));
     ImGui::PopStyleColor();
@@ -5934,12 +5977,16 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
 
         settings_out.use_snuggle = false;
         settings_out.snuggle_lock_rotation = false;
+        settings_out.snuggle_padding_mm = 5.0f;
+        settings_out.snuggle_quality = 5;
 
         appcfg->set("arrange", dist_key, float_to_string_decimal_point(settings_out.distance));
         appcfg->set("arrange", rot_key, settings_out.enable_rotation ? "1" : "0");
         appcfg->set("arrange", align_to_y_axis_key, settings_out.align_to_y_axis ? "1" : "0");
         appcfg->set("arrange", "use_snuggle", "0");
         appcfg->set("arrange", "snuggle_lock_rotation", "0");
+        appcfg->set("arrange", "snuggle_padding_mm", float_to_string_decimal_point(5.0f));
+        appcfg->set("arrange", "snuggle_quality", "5");
         settings_changed = true;
     }
     ImGui::PopStyleVar(1);

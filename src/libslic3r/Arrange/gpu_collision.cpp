@@ -43,7 +43,7 @@ const VoxelGrid& CpuCollisionEvaluator::get_rotated(size_t part_idx, float angle
 void CpuCollisionEvaluator::evaluate_batch(
     std::vector<Individual>& individuals,
     const std::vector<PartInfo>& parts,
-    float bed_w, float bed_h)
+    float bed_w, float bed_h, float bed_margin)
 {
     if (!rot_cache_) return;
     size_t n = parts.size();
@@ -52,13 +52,10 @@ void CpuCollisionEvaluator::evaluate_batch(
         ind.collision_count = 0;
         ind.oob_count = 0;
 
-        // Resolve rotated grids
         std::vector<const VoxelGrid*> rotated(n);
-        for (size_t i = 0; i < n; i++) {
+        for (size_t i = 0; i < n; i++)
             rotated[i] = &get_rotated(i, ind.placements[i].zrot);
-        }
 
-        // Pairwise collision
         for (size_t i = 0; i < n; i++) {
             const auto& pi = ind.placements[i];
             Vec3f off_i = {pi.x, pi.y, 0.0f};
@@ -66,28 +63,24 @@ void CpuCollisionEvaluator::evaluate_batch(
             for (size_t j = i + 1; j < n; j++) {
                 const auto& pj = ind.placements[j];
                 Vec3f off_j = {pj.x, pj.y, 0.0f};
-
-                size_t c = VoxelGrid::collision_count(
-                    *rotated[i], off_i,
-                    *rotated[j], off_j);
+                size_t c = VoxelGrid::collision_count(*rotated[i], off_i, *rotated[j], off_j);
                 ind.collision_count += c;
             }
 
-            // Bed bounds check
             const auto& g = *rotated[i];
             float part_min_x = pi.x + g.origin.x;
             float part_min_y = pi.y + g.origin.y;
             float part_max_x = pi.x + g.origin.x + g.nx * g.voxel_size;
             float part_max_y = pi.y + g.origin.y + g.ny * g.voxel_size;
 
-            if (part_min_x < 0)
-                ind.oob_count += (size_t)(-part_min_x / g.voxel_size);
-            if (part_min_y < 0)
-                ind.oob_count += (size_t)(-part_min_y / g.voxel_size);
-            if (part_max_x > bed_w)
-                ind.oob_count += (size_t)((part_max_x - bed_w) / g.voxel_size);
-            if (part_max_y > bed_h)
-                ind.oob_count += (size_t)((part_max_y - bed_h) / g.voxel_size);
+            if (part_min_x < bed_margin)
+                ind.oob_count += (size_t)((bed_margin - part_min_x) / g.voxel_size);
+            if (part_min_y < bed_margin)
+                ind.oob_count += (size_t)((bed_margin - part_min_y) / g.voxel_size);
+            if (part_max_x > bed_w - bed_margin)
+                ind.oob_count += (size_t)((part_max_x - bed_w + bed_margin) / g.voxel_size);
+            if (part_max_y > bed_h - bed_margin)
+                ind.oob_count += (size_t)((part_max_y - bed_h + bed_margin) / g.voxel_size);
         }
     }
 }
@@ -478,8 +471,10 @@ void GpuCollisionEvaluator::upload_grids(
 void GpuCollisionEvaluator::evaluate_batch(
     std::vector<Individual>& individuals,
     const std::vector<PartInfo>& parts,
-    float bed_w, float bed_h)
+    float bed_w, float bed_h, float bed_margin)
 {
+    // TODO: pass bed_margin to shader as uniform for GPU OOB check
+    (void)bed_margin;
     if (!available_ || individuals.empty()) return;
 
     size_t pop_size = individuals.size();
@@ -592,10 +587,16 @@ void GpuCollisionEvaluator::cleanup()
 
 std::unique_ptr<CollisionEvaluator> create_collision_evaluator()
 {
-    // TODO: GPU backend has a collision detection bug — parts that overlap
-    // report 0 collisions. Force CPU until the shader is debugged.
-    // The CPU path is verified correct by standalone tests.
-    BOOST_LOG_TRIVIAL(warning) << "Snuggle: GPU collision disabled (debugging), using CPU";
+#ifdef SLIC3R_GUI
+    auto gpu = std::make_unique<GpuCollisionEvaluator>();
+    if (gpu->is_available()) {
+        BOOST_LOG_TRIVIAL(warning) << "Snuggle: using GPU collision evaluator";
+        return gpu;
+    }
+    BOOST_LOG_TRIVIAL(warning) << "Snuggle: GPU not available, using CPU collision evaluator";
+#else
+    BOOST_LOG_TRIVIAL(warning) << "Snuggle: headless build, using CPU collision evaluator";
+#endif
     return std::make_unique<CpuCollisionEvaluator>();
 }
 

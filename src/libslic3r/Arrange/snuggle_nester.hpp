@@ -53,6 +53,7 @@ struct NesterConfig {
     float  bed_width_mm      = 256.0f;
     float  bed_height_mm     = 256.0f;
     float  min_gap_mm        = 5.0f;   // Minimum clearance between parts
+    float  bed_margin_mm     = 4.0f;   // Safety margin from bed edge (voxel padding + gap)
 
     // Rotation control
     bool   lock_rotation     = false;  // true = XY only, preserve user's Z rotation
@@ -186,7 +187,8 @@ public:
             // Evaluate all individuals
             if (evaluator_) {
                 // Batch collision/bounds check via accelerated backend
-                evaluator_->evaluate_batch(pop, parts, cfg_.bed_width_mm, cfg_.bed_height_mm);
+                evaluator_->evaluate_batch(pop, parts,
+                    cfg_.bed_width_mm, cfg_.bed_height_mm, cfg_.bed_margin_mm);
                 // Fitness scoring stays on CPU (cheap)
                 for (auto &ind : pop) {
                     if (ind.is_feasible())
@@ -348,9 +350,10 @@ private:
     void randomize_placement(Individual &ind, const std::vector<PartInfo> &parts) {
         for (size_t i = 0; i < ind.placements.size(); i++) {
             auto &p = ind.placements[i];
-            float margin = parts[i].grid.nx * parts[i].grid.voxel_size * 0.5f;
-            p.x = randf(margin, cfg_.bed_width_mm - margin);
-            p.y = randf(margin, cfg_.bed_height_mm - margin);
+            float part_margin = parts[i].grid.nx * parts[i].grid.voxel_size * 0.5f;
+            float lo = std::max(part_margin, cfg_.bed_margin_mm);
+            p.x = randf(lo, cfg_.bed_width_mm - lo);
+            p.y = randf(lo, cfg_.bed_height_mm - lo);
             p.zrot = cfg_.lock_rotation
                 ? parts[i].initial_zrot
                 : randf(0.0f, 2.0f * 3.14159265f);
@@ -378,10 +381,9 @@ private:
             p.y = cy + radius * std::sin(angle);
             p.zrot = cfg_.lock_rotation ? parts[idx].initial_zrot : 0.0f;
 
-            // Clamp to bed
-            float margin = 10.0f;
-            p.x = std::clamp(p.x, margin, cfg_.bed_width_mm - margin);
-            p.y = std::clamp(p.y, margin, cfg_.bed_height_mm - margin);
+            // Clamp to bed (respect bed margin)
+            p.x = std::clamp(p.x, cfg_.bed_margin_mm, cfg_.bed_width_mm - cfg_.bed_margin_mm);
+            p.y = std::clamp(p.y, cfg_.bed_margin_mm, cfg_.bed_height_mm - cfg_.bed_margin_mm);
 
             float part_size = std::sqrt(parts[idx].hull_area_mm2) * 0.5f;
             radius += part_size + cfg_.min_gap_mm;
@@ -401,8 +403,8 @@ private:
             p.y = cursor_y;
             p.zrot = cfg_.lock_rotation ? parts[i].initial_zrot : 0.0f;
 
-            // Clamp to bed
-            p.x = std::clamp(p.x, 0.0f, cfg_.bed_width_mm);
+            // Clamp to bed (respect bed margin)
+            p.x = std::clamp(p.x, cfg_.bed_margin_mm, cfg_.bed_width_mm - cfg_.bed_margin_mm);
 
             cursor_x += part_width + cfg_.min_gap_mm;
             // Wrap to next row if needed
@@ -462,16 +464,17 @@ private:
                 }
             } else {
                 // Wildcard: completely random new XY (+ rotation if unlocked)
-                float margin = parts[i].grid.nx * parts[i].grid.voxel_size * 0.5f;
-                p.x = randf(margin, cfg_.bed_width_mm - margin);
-                p.y = randf(margin, cfg_.bed_height_mm - margin);
+                float wild_margin = std::max(parts[i].grid.nx * parts[i].grid.voxel_size * 0.5f,
+                                             cfg_.bed_margin_mm);
+                p.x = randf(wild_margin, cfg_.bed_width_mm - wild_margin);
+                p.y = randf(wild_margin, cfg_.bed_height_mm - wild_margin);
                 if (!cfg_.lock_rotation)
                     p.zrot = randf(0, 2.0f * 3.14159265f);
             }
 
-            // Clamp to bed bounds (always)
-            p.x = std::clamp(p.x, 0.0f, cfg_.bed_width_mm);
-            p.y = std::clamp(p.y, 0.0f, cfg_.bed_height_mm);
+            // Clamp to bed bounds (always, respect bed margin)
+            p.x = std::clamp(p.x, cfg_.bed_margin_mm, cfg_.bed_width_mm - cfg_.bed_margin_mm);
+            p.y = std::clamp(p.y, cfg_.bed_margin_mm, cfg_.bed_height_mm - cfg_.bed_margin_mm);
 
             // Normalize rotation
             while (p.zrot < 0) p.zrot += 2.0f * 3.14159265f;
@@ -629,10 +632,11 @@ private:
             float part_max_x = pi.x + g.origin.x + g.nx * g.voxel_size;
             float part_max_y = pi.y + g.origin.y + g.ny * g.voxel_size;
 
-            if (part_min_x < 0) ind.oob_count += (size_t)(-part_min_x / g.voxel_size);
-            if (part_min_y < 0) ind.oob_count += (size_t)(-part_min_y / g.voxel_size);
-            if (part_max_x > cfg_.bed_width_mm) ind.oob_count += (size_t)((part_max_x - cfg_.bed_width_mm) / g.voxel_size);
-            if (part_max_y > cfg_.bed_height_mm) ind.oob_count += (size_t)((part_max_y - cfg_.bed_height_mm) / g.voxel_size);
+            float margin = cfg_.bed_margin_mm;
+            if (part_min_x < margin) ind.oob_count += (size_t)((margin - part_min_x) / g.voxel_size);
+            if (part_min_y < margin) ind.oob_count += (size_t)((margin - part_min_y) / g.voxel_size);
+            if (part_max_x > cfg_.bed_width_mm - margin) ind.oob_count += (size_t)((part_max_x - cfg_.bed_width_mm + margin) / g.voxel_size);
+            if (part_max_y > cfg_.bed_height_mm - margin) ind.oob_count += (size_t)((part_max_y - cfg_.bed_height_mm + margin) / g.voxel_size);
         }
 
         // ── Fitness (only meaningful if feasible) ──────────

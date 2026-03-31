@@ -39,7 +39,8 @@ public:
         std::vector<Individual>& pop,
         const std::vector<PartInfo>& parts,
         float bed_width_mm,
-        float bed_height_mm) = 0;
+        float bed_height_mm,
+        float bed_margin_mm = 0.0f) = 0;
 };
 
 // CPU fallback -- extracts the collision/bounds logic from SnuggleNester::evaluate()
@@ -49,7 +50,8 @@ public:
                       const std::vector<std::vector<VoxelGrid>>& rot_cache) override;
     void evaluate_batch(std::vector<Individual>& individuals,
                         const std::vector<PartInfo>& parts,
-                        float bed_w, float bed_h) override;
+                        float bed_w, float bed_h,
+                        float bed_margin = 0.0f) override;
 private:
     const std::vector<std::vector<VoxelGrid>>* rot_cache_ = nullptr;
     static constexpr int ROT_CACHE_BINS = 360;
@@ -71,7 +73,8 @@ public:
                       const std::vector<std::vector<VoxelGrid>>& rot_cache) override;
     void evaluate_batch(std::vector<Individual>& individuals,
                         const std::vector<PartInfo>& parts,
-                        float bed_w, float bed_h) override;
+                        float bed_w, float bed_h,
+                        float bed_margin = 0.0f) override;
 
 private:
     bool available_ = false;

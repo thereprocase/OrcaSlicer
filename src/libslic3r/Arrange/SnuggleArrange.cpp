@@ -139,11 +139,18 @@ void snuggle_arrange(
     snuggle::NesterConfig cfg;
     cfg.bed_width_mm    = bed_w;
     cfg.bed_height_mm   = bed_h;
-    cfg.population_size = 256;
-    cfg.max_generations = 50;
-    cfg.timeout_seconds = 20.0;
-    cfg.min_gap_mm      = std::max(1.0f, (float)unscale_(params.min_obj_distance));
+    cfg.min_gap_mm      = std::max(1.0f, params.snuggle_padding_mm);
+
+    // Quality 1-10 maps to population and generations
+    int quality = std::clamp(params.snuggle_quality, 1, 10);
+    cfg.population_size = 64 + quality * 64;    // 128 to 704
+    cfg.max_generations = 20 + quality * 10;    // 30 to 120
+    cfg.timeout_seconds = 5.0 + quality * 5.0;  // 10s to 55s
+
     cfg.lock_rotation   = params.snuggle_lock_rotation;
+
+    // Shrink effective bed by voxel padding (1 voxel per side) + min gap
+    cfg.bed_margin_mm   = voxel_size + cfg.min_gap_mm;
 
     // Wire progress/stop to Orca's callbacks
     if (params.stopcondition) {
@@ -191,29 +198,84 @@ void snuggle_arrange(
         << (result.timed_out ? ", TIMED OUT" : "");
 
     // ── Write results back to ArrangePolygons ──────────────
-    // The nester resolved each part's instance origin position on the bed
-    // (origin_bed_x/y), accounting for rotation pivot differences between
-    // the voxel grid and OrcaSlicer's instance model. The ArrangePolygon
-    // translation IS the instance origin in world-space scaled coords.
+    // The nester resolved each part's instance origin position on the bed.
+    // If the result is feasible, place everything. If not, greedily accept
+    // parts that fit and send the rest off-plate (bed_idx = -1).
+    int placed = 0, rejected = 0;
+
+    if (result.feasible) {
+        // All fit — place everything
+        for (size_t i = 0; i < items.size() && i < result.placements.size(); i++) {
+            const auto& pl = result.placements[i];
+            items[i].translation = Vec2crd(
+                scaled(pl.origin_bed_x + bed_origin_x),
+                scaled(pl.origin_bed_y + bed_origin_y)
+            );
+            items[i].rotation = (double)pl.zrot;
+            items[i].bed_idx = 0;
+            placed++;
+        }
+    } else {
+        // Infeasible — greedy accept: place each part if it doesn't collide
+        // with already-accepted parts and stays within bed bounds.
+        float margin = cfg.bed_margin_mm;
+        std::vector<size_t> accepted;
+
+        for (size_t i = 0; i < items.size() && i < result.placements.size(); i++) {
+            const auto& pl = result.placements[i];
+            const auto& grid_i = parts[i].grid;
+            auto rot_i = grid_i.rotated_copy(pl.zrot);
+
+            // Bounds check
+            float pmin_x = pl.x + rot_i.origin.x;
+            float pmin_y = pl.y + rot_i.origin.y;
+            float pmax_x = pmin_x + rot_i.nx * rot_i.voxel_size;
+            float pmax_y = pmin_y + rot_i.ny * rot_i.voxel_size;
+            bool in_bounds = (pmin_x >= margin && pmin_y >= margin &&
+                              pmax_x <= bed_w - margin && pmax_y <= bed_h - margin);
+
+            // Collision check against accepted parts
+            bool collides = false;
+            if (in_bounds) {
+                snuggle::Vec3f off_i = {pl.x, pl.y, 0.0f};
+                for (size_t j : accepted) {
+                    const auto& pl_j = result.placements[j];
+                    auto rot_j = parts[j].grid.rotated_copy(pl_j.zrot);
+                    snuggle::Vec3f off_j = {pl_j.x, pl_j.y, 0.0f};
+                    if (snuggle::VoxelGrid::collision_count(rot_i, off_i, rot_j, off_j) > 0) {
+                        collides = true;
+                        break;
+                    }
+                }
+            }
+
+            if (in_bounds && !collides) {
+                items[i].translation = Vec2crd(
+                    scaled(pl.origin_bed_x + bed_origin_x),
+                    scaled(pl.origin_bed_y + bed_origin_y)
+                );
+                items[i].rotation = (double)pl.zrot;
+                items[i].bed_idx = 0;
+                accepted.push_back(i);
+                placed++;
+            } else {
+                items[i].bed_idx = -1;  // off-plate
+                rejected++;
+            }
+        }
+    }
+
     for (size_t i = 0; i < items.size() && i < result.placements.size(); i++) {
+        if (items[i].bed_idx < 0) continue;
         const auto& pl = result.placements[i];
-
-        items[i].translation = Vec2crd(
-            scaled(pl.origin_bed_x + bed_origin_x),
-            scaled(pl.origin_bed_y + bed_origin_y)
-        );
-        items[i].rotation = (double)pl.zrot;
-        items[i].bed_idx = 0;
-
         BOOST_LOG_TRIVIAL(warning) << "Snuggle: [" << i << "] " << items[i].name
-            << " pl=(" << pl.x << "," << pl.y << ")"
             << " origin_bed=(" << pl.origin_bed_x << "," << pl.origin_bed_y << ")"
-            << " world=(" << (pl.origin_bed_x + bed_origin_x) << ","
-                          << (pl.origin_bed_y + bed_origin_y) << ")"
-            << " trans=(" << unscale_(items[i].translation.x()) << ","
-                          << unscale_(items[i].translation.y()) << ")"
             << " rot=" << (int)(pl.zrot * 180.0 / 3.14159265) << "deg";
     }
+
+    if (rejected > 0)
+        BOOST_LOG_TRIVIAL(warning) << "Snuggle: " << placed << " placed, "
+                                   << rejected << " off-plate (didn't fit)";
 }
 
 }} // namespace Slic3r::arrangement

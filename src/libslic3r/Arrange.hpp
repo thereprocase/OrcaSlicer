@@ -123,8 +123,10 @@ struct ArrangeParams {
     bool do_final_align = true;
 
     // Snuggle: 3D-aware genetic nesting (proof-of-concept)
-    bool use_snuggle = false;
-    bool snuggle_lock_rotation = false; // true = XY only, preserve user Z rotation
+    bool  use_snuggle            = false;
+    bool  snuggle_lock_rotation  = false; // true = XY only, preserve user Z rotation
+    float snuggle_padding_mm     = 5.0f;  // min gap between parts (mm)
+    int   snuggle_quality        = 5;     // 1-10: maps to population/generations
 
     //BBS: add specific arrange params
     bool  allow_multi_materials_on_same_plate = true;
