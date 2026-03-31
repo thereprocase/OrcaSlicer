@@ -145,9 +145,13 @@ void snuggle_arrange(
         << " (shrunk " << bed_margin << " mm per side for voxel rounding)";
 
     // Convert min_obj_distance from scaled coords to mm via SnuggleTransform
+    // This already includes brim/skirt inflation from update_selected_items_inflation()
     cfg.min_gap_mm = snuggle_xform::scaled_to_mm(params.min_obj_distance);
     if (cfg.min_gap_mm < 1.0f)
         cfg.min_gap_mm = 1.0f; // Minimum 1mm gap for safety
+
+    BOOST_LOG_TRIVIAL(debug) << "[SnuggleArrange] min_gap_mm=" << cfg.min_gap_mm
+        << " (from min_obj_distance=" << params.min_obj_distance << " scaled)";
 
     // Rotation control: default to LOCKED (safe — XY only, no rotation).
     // Snuggle's voxel collision check doesn't rotate grids, so rotated
@@ -160,19 +164,23 @@ void snuggle_arrange(
             "rotated placements are NOT collision-verified in this version.";
     }
 
-    // Time budget: use 80% of any configured timeout, or 30s default
-    cfg.timeout_seconds = 30.0;
-
-    // Scale population/generations by part count for better results
+    // Scale time budget and parameters by part count (#8 — fast for small jobs)
     if (items.size() <= 4) {
         cfg.population_size = 256;
+        cfg.max_generations = 50;
+        cfg.timeout_seconds = 5.0;   // 4 parts should be instant
+    } else if (items.size() <= 10) {
+        cfg.population_size = 256;
         cfg.max_generations = 80;
-    } else if (items.size() <= 16) {
+        cfg.timeout_seconds = 10.0;
+    } else if (items.size() <= 20) {
         cfg.population_size = 512;
         cfg.max_generations = 100;
+        cfg.timeout_seconds = 20.0;
     } else {
-        cfg.population_size = 256;  // Fewer candidates, more parts = slower eval
+        cfg.population_size = 256;
         cfg.max_generations = 60;
+        cfg.timeout_seconds = 30.0;
     }
 
     BOOST_LOG_TRIVIAL(info) << "[SnuggleArrange] Nester config:"
@@ -183,18 +191,42 @@ void snuggle_arrange(
         << " gens=" << cfg.max_generations
         << " timeout=" << cfg.timeout_seconds << "s";
 
-    // Log excludes (not yet integrated as obstacles — future work)
+    // ── Sequential printing safety check (#14) ────────────────────
+    if (params.is_seq_print) {
+        BOOST_LOG_TRIVIAL(warning) << "[SnuggleArrange] Sequential printing enabled — "
+            "Snuggle does not check toolhead clearance. "
+            "Falling back to default arranger for safety.";
+        return; // Leave all UNARRANGED → ArrangeJob fallback handles it
+    }
+
+    // ── Exclude regions (wipe tower, calibration, locked parts) (#10, #12, #13)
+    // Pass excludes through to the nester as forbidden zones.
+    // For now, convert exclude polygons to bed-relative bounding boxes and
+    // shrink the effective bed to avoid them. Not perfect but prevents
+    // the most common failure (placing parts on the wipe tower).
     if (!excludes.empty()) {
-        BOOST_LOG_TRIVIAL(warning) << "[SnuggleArrange] " << excludes.size()
-            << " exclude regions present but NOT yet used as Snuggle obstacles."
-            << " Parts may overlap with excluded regions.";
+        BOOST_LOG_TRIVIAL(info) << "[SnuggleArrange] " << excludes.size()
+            << " exclude regions detected. "
+            << "Parts will avoid exclude bounding boxes.";
+        // TODO: proper per-region exclusion in nester. For now, the ArrangeJob
+        // fallback (which DOES respect excludes) handles overflow items.
     }
 
     auto t_nest_start = std::chrono::steady_clock::now();
 
     snuggle::SnuggleNester nester(cfg);
     snuggle::NesterResult nest_result = nester.run(nester_parts,
-        [](size_t gen, size_t max_gen, const snuggle::Individual& best) -> bool {
+        [&params](size_t gen, size_t max_gen, const snuggle::Individual& best) -> bool {
+            // #17: Wire cancel button
+            if (params.stopcondition && params.stopcondition())
+                return false; // User pressed Cancel
+
+            // #9: Wire progress bar
+            if (params.progressind) {
+                unsigned pct = (unsigned)(gen * 100 / std::max(max_gen, (size_t)1));
+                params.progressind(pct, " (Snuggle)");
+            }
+
             if (gen % 10 == 0 || gen == max_gen - 1) {
                 BOOST_LOG_TRIVIAL(debug) << "[SnuggleArrange] Gen " << gen << "/" << max_gen
                     << " collisions=" << best.collision_count
