@@ -29,6 +29,9 @@
 
 namespace snuggle {
 
+// Forward declaration — full definition in gpu_collision.hpp
+class CollisionEvaluator;
+
 // ── Configuration ─────────────────────────────────────────
 struct NesterConfig {
     // Population & evolution
@@ -122,8 +125,8 @@ using NesterProgressFn = std::function<bool(size_t gen, size_t max_gen,
 // ── The Nester ────────────────────────────────────────────
 class SnuggleNester {
 public:
-    SnuggleNester(const NesterConfig &cfg, uint64_t seed = 42)
-        : cfg_(cfg), rng_(seed) {}
+    SnuggleNester(const NesterConfig &cfg, CollisionEvaluator* evaluator = nullptr, uint64_t seed = 42)
+        : cfg_(cfg), evaluator_(evaluator), rng_(seed) {}
 
     NesterResult run(
         const std::vector<PartInfo> &parts,
@@ -141,6 +144,9 @@ public:
         // ── Build rotation cache (one-time cost) ──────────
         if (!cfg_.lock_rotation) {
             build_rotation_cache(parts);
+            if (evaluator_) {
+                evaluator_->upload_grids(parts, rot_cache_);
+            }
         }
 
         // ── Initialize population ──────────────────────────
@@ -170,8 +176,19 @@ public:
             }
 
             // Evaluate all individuals
-            for (auto &ind : pop) {
-                evaluate(ind, parts);
+            if (evaluator_) {
+                // Batch collision/bounds check via accelerated backend
+                evaluator_->evaluate_batch(pop, parts, cfg_.bed_width_mm, cfg_.bed_height_mm);
+                // Fitness scoring stays on CPU (cheap)
+                for (auto &ind : pop) {
+                    if (ind.is_feasible())
+                        compute_fitness(ind, parts);
+                }
+            } else {
+                // CPU fallback: inline collision + fitness
+                for (auto &ind : pop) {
+                    evaluate(ind, parts);
+                }
             }
 
             // Find best
@@ -252,6 +269,7 @@ public:
 
 private:
     NesterConfig cfg_;
+    CollisionEvaluator* evaluator_ = nullptr;  // non-owning, caller manages lifetime
     std::mt19937 rng_;
 
     // ── Rotation cache ────────────────────────────────────
@@ -425,11 +443,79 @@ private:
         }
     }
 
-    // ── Evaluate an individual ────────────────────────────
-    //    1. Build rotation-corrected voxel grids
-    //    2. Collision check (pairwise voxel AND)
-    //    3. Bed bounds check
-    //    4. Fitness scoring (only matters if feasible)
+    // ── Fitness scoring (CPU only, no collision data needed) ─
+    //    Computes compactness + height-centering score.
+    //    Called separately when using an external evaluator,
+    //    or as part of evaluate() on the CPU fallback path.
+    void compute_fitness(Individual &ind, const std::vector<PartInfo> &parts) {
+        size_t n = parts.size();
+        ind.fitness = 0.0f;
+
+        if (!ind.is_feasible()) return;
+
+        // Need rotated grid bounds for bounding-box calculation
+        std::vector<const VoxelGrid*> rotated(n);
+        std::vector<VoxelGrid> rotated_locked;
+        if (cfg_.lock_rotation) {
+            rotated_locked.resize(n);
+            for (size_t i = 0; i < n; i++) {
+                rotated_locked[i] = parts[i].grid.rotated_copy(ind.placements[i].zrot);
+                rotated[i] = &rotated_locked[i];
+            }
+        } else {
+            for (size_t i = 0; i < n; i++) {
+                rotated[i] = &cached_rotated(i, ind.placements[i].zrot);
+            }
+        }
+
+        // Compactness: minimize bounding rectangle of all parts
+        float min_x = 1e18f, max_x = -1e18f;
+        float min_y = 1e18f, max_y = -1e18f;
+
+        for (size_t i = 0; i < n; i++) {
+            const auto &pi = ind.placements[i];
+            const auto &g = *rotated[i];
+            float px_min = pi.x + g.origin.x;
+            float py_min = pi.y + g.origin.y;
+            float px_max = pi.x + g.origin.x + g.nx * g.voxel_size;
+            float py_max = pi.y + g.origin.y + g.ny * g.voxel_size;
+
+            min_x = std::min(min_x, px_min);
+            min_y = std::min(min_y, py_min);
+            max_x = std::max(max_x, px_max);
+            max_y = std::max(max_y, py_max);
+        }
+
+        float bbox_area = (max_x - min_x) * (max_y - min_y);
+        float bed_area = cfg_.bed_width_mm * cfg_.bed_height_mm;
+        float compactness = 1.0f - (bbox_area / bed_area);
+        compactness = std::clamp(compactness, 0.0f, 1.0f);
+
+        // Height centering: tall parts near center score better
+        float height_score = 0.0f;
+        float bed_cx = cfg_.bed_width_mm * 0.5f;
+        float bed_cy = cfg_.bed_height_mm * 0.5f;
+        float max_dist = std::sqrt(bed_cx * bed_cx + bed_cy * bed_cy);
+
+        for (size_t i = 0; i < n; i++) {
+            float dx = ind.placements[i].x - bed_cx;
+            float dy = ind.placements[i].y - bed_cy;
+            float dist = std::sqrt(dx*dx + dy*dy);
+            float centrality = 1.0f - (dist / max_dist);
+            height_score += parts[i].max_height_mm * centrality;
+        }
+        float max_possible_height = 0;
+        for (const auto &p : parts) max_possible_height += p.max_height_mm;
+        if (max_possible_height > 0)
+            height_score /= max_possible_height;
+
+        ind.fitness = cfg_.w_compactness * compactness
+                    + cfg_.w_height_center * height_score;
+    }
+
+    // ── Evaluate an individual (CPU fallback) ─────────────
+    //    Full inline path: collision + bounds + fitness.
+    //    Used when no CollisionEvaluator is provided.
     void evaluate(Individual &ind, const std::vector<PartInfo> &parts) {
         size_t n = parts.size();
         ind.collision_count = 0;
@@ -439,13 +525,10 @@ private:
         // ── Get rotated grids for each part ───────────────
         // When rotation is locked, use the original grid (no rotation applied).
         // When unlocked, use the pre-built rotation cache (quantized to 1° bins).
-        // This avoids O(N × grid_volume) rotated_copy calls per evaluation.
+        // This avoids O(N * grid_volume) rotated_copy calls per evaluation.
         std::vector<const VoxelGrid*> rotated(n);
         std::vector<VoxelGrid> rotated_locked; // storage for lock_rotation case
         if (cfg_.lock_rotation) {
-            // Locked: each part stays at its initial rotation.
-            // rotated_copy(initial_zrot) is called once per part, but since
-            // locked rotations don't change across evaluations, cache locally.
             rotated_locked.resize(n);
             for (size_t i = 0; i < n; i++) {
                 rotated_locked[i] = parts[i].grid.rotated_copy(ind.placements[i].zrot);
@@ -487,50 +570,7 @@ private:
 
         // ── Fitness (only meaningful if feasible) ──────────
         if (ind.is_feasible()) {
-            // Compactness: minimize bounding rectangle of all parts
-            float min_x = 1e18f, max_x = -1e18f;
-            float min_y = 1e18f, max_y = -1e18f;
-
-            for (size_t i = 0; i < n; i++) {
-                const auto &pi = ind.placements[i];
-                const auto &g = *rotated[i];
-                float px_min = pi.x + g.origin.x;
-                float py_min = pi.y + g.origin.y;
-                float px_max = pi.x + g.origin.x + g.nx * g.voxel_size;
-                float py_max = pi.y + g.origin.y + g.ny * g.voxel_size;
-
-                min_x = std::min(min_x, px_min);
-                min_y = std::min(min_y, py_min);
-                max_x = std::max(max_x, px_max);
-                max_y = std::max(max_y, py_max);
-            }
-
-            float bbox_area = (max_x - min_x) * (max_y - min_y);
-            float bed_area = cfg_.bed_width_mm * cfg_.bed_height_mm;
-            float compactness = 1.0f - (bbox_area / bed_area);
-            compactness = std::clamp(compactness, 0.0f, 1.0f);
-
-            // Height centering: tall parts near center score better
-            float height_score = 0.0f;
-            float bed_cx = cfg_.bed_width_mm * 0.5f;
-            float bed_cy = cfg_.bed_height_mm * 0.5f;
-            float max_dist = std::sqrt(bed_cx * bed_cx + bed_cy * bed_cy);
-
-            for (size_t i = 0; i < n; i++) {
-                float dx = ind.placements[i].x - bed_cx;
-                float dy = ind.placements[i].y - bed_cy;
-                float dist = std::sqrt(dx*dx + dy*dy);
-                float centrality = 1.0f - (dist / max_dist);
-                height_score += parts[i].max_height_mm * centrality;
-            }
-            // Normalize
-            float max_possible_height = 0;
-            for (const auto &p : parts) max_possible_height += p.max_height_mm;
-            if (max_possible_height > 0)
-                height_score /= max_possible_height;
-
-            ind.fitness = cfg_.w_compactness * compactness
-                        + cfg_.w_height_center * height_score;
+            compute_fitness(ind, parts);
         }
     }
 };

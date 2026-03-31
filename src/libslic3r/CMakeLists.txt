@@ -75,6 +75,8 @@ set(lisbslic3r_sources
     Arrange.hpp
     Arrange/SnuggleArrange.cpp
     Arrange/SnuggleArrange.hpp
+    Arrange/gpu_collision.cpp
+    Arrange/gpu_collision.hpp
     Arrange/polite_voxelizer.hpp
     Arrange/snuggle_nester.hpp
     BlacklistedLibraryCheck.cpp
@@ -629,6 +631,11 @@ endif()
 
 if(WIN32)
     target_link_libraries(libslic3r PRIVATE Psapi.lib bcrypt.lib)
+endif()
+
+# GPU collision evaluator needs GLEW + OpenGL when building with GUI
+if(SLIC3R_GUI)
+    target_link_libraries(libslic3r PRIVATE GLEW::GLEW OpenGL::GL)
 endif()
 
 if(SLIC3R_PROFILE)

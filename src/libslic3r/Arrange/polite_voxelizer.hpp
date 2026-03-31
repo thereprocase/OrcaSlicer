@@ -259,6 +259,10 @@ public:
         return rot;
     }
 
+    // ── Raw data access (for GPU upload) ────────────────────
+    const uint8_t* bits_data() const { return bits_.data(); }
+    size_t bits_bytes() const { return bits_.size(); }
+
     // ── Count solid voxels ─────────────────────────────────
     size_t count_solid() const {
         size_t count = 0;
