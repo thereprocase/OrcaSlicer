@@ -100,8 +100,9 @@ void snuggle_arrange(
     if (cfg.min_gap_mm < 1.0f)
         cfg.min_gap_mm = 1.0f; // Minimum 1mm gap for safety
 
-    // Rotation control
-    cfg.lock_rotation = !params.allow_rotations;
+    // Rotation control: snuggle_lock_rotation takes priority if set,
+    // otherwise fall back to the inverse of allow_rotations
+    cfg.lock_rotation = params.snuggle_lock_rotation || !params.allow_rotations;
 
     // Time budget: use 80% of any configured timeout, or 30s default
     cfg.timeout_seconds = 30.0;
@@ -237,8 +238,7 @@ void snuggle_arrange(
                 BOOST_LOG_TRIVIAL(warning) << "[SnuggleArrange] Part " << i
                     << " '" << part_data[i].name << "' UNARRANGED (out of bed bounds)"
                     << " pos=(" << pl.x << "," << pl.y << ") mm"
-                    << " part_bounds=[" << part_min_x << "," << part_min_y
-                    << "]->[" << part_max_x << "," << part_max_y << "]"
+                    << " center=(" << cx << "," << cy << ") rot_half=(" << rot_hw << "," << rot_hh << ")"
                     << " bed=[0,0]->[" << bed_width_mm << "," << bed_height_mm << "]";
             }
         }

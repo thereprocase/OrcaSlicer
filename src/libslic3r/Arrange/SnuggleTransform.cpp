@@ -30,12 +30,12 @@ float scaled_to_mm(coord_t val)
 }
 
 // ── Snuggle mm -> Orca scaled coords ────────────────────────────────
-// Input space:  Snuggle mm (float).
+// Input space:  Snuggle mm (double for precision on large beds).
 // Output space: Orca scaled integer (coord_t). 1 unit = SCALING_FACTOR mm.
-coord_t mm_to_scaled(float val_mm)
+coord_t mm_to_scaled(double val_mm)
 {
     // scale: val_mm / SCALING_FACTOR -> scaled integer
-    coord_t result = scaled<coord_t>(static_cast<double>(val_mm));
+    coord_t result = scaled<coord_t>(val_mm);
 
     BOOST_LOG_TRIVIAL(trace) << "[SnuggleXform] mm_to_scaled: "
         << val_mm << " mm -> " << result << " scaled"

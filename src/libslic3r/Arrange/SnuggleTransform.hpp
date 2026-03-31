@@ -26,7 +26,7 @@ float scaled_to_mm(coord_t val);
 // Input:  val_mm in millimeters (float), from Snuggle placement result.
 // Output: equivalent value in Orca scaled integer coordinates (coord_t).
 // Formula: scaled = mm / SCALING_FACTOR
-coord_t mm_to_scaled(float val_mm);
+coord_t mm_to_scaled(double val_mm);
 
 // ── Bed points (scaled) -> bed dimensions in mm ─────────────────────
 // Input:  bed — polygon vertices in Orca scaled coordinates (coord_t).
