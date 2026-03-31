@@ -131,6 +131,10 @@ struct ArrangeParams {
 
     bool do_final_align = true;
 
+    // Snuggle: 3D-aware genetic nesting (proof-of-concept)
+    bool use_snuggle = false;
+    bool snuggle_lock_rotation = false;
+
     //BBS: add specific arrange params
     bool  allow_multi_materials_on_same_plate = true;
     bool  avoid_extrusion_cali_region         = true;

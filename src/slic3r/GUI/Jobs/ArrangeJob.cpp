@@ -1,5 +1,6 @@
 #include "ArrangeJob.hpp"
 
+#include "libslic3r/Arrange/SnuggleArrange.hpp"
 #include "libslic3r/BuildVolume.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/SVG.hpp"
@@ -846,7 +847,14 @@ void ArrangeJob::process(Ctl &ctl)
             }
         }
     } else {
-        arrangement::arrange(m_selected, m_unselected, bedpts, params);
+        // Snuggle: 3D-aware genetic nesting (proof-of-concept)
+        if (params.use_snuggle) {
+            BOOST_LOG_TRIVIAL(info) << "Using Snuggle 3D-aware arrangement";
+            arrangement::snuggle_arrange(m_selected, m_unselected, bedpts, params,
+                                         m_plater->model());
+        } else {
+            arrangement::arrange(m_selected, m_unselected, bedpts, params);
+        }
     }
 
     // Stragglers: offset bed_idx so new items land AFTER existing plates
@@ -1144,6 +1152,9 @@ arrangement::ArrangeParams init_arrange_params(Plater *p)
     params.compaction_mode                     = settings.compaction_mode;
     params.best_fit_compact                    = settings.best_fit_compact;
     params.placement_bias                      = settings.placement_bias;
+
+    // Snuggle PoC: hardcoded ON for testing. Replace with GUI toggle later.
+    params.use_snuggle = true;
 
     int state = p->get_prepare_state();
     if (state == Job::JobPrepareState::PREPARE_STATE_MENU) {

@@ -75,6 +75,10 @@ set(lisbslic3r_sources
     Arrange.hpp
     Arrange/BitmapArranger.cpp
     Arrange/BitmapArranger.hpp
+    Arrange/SnuggleArrange.cpp
+    Arrange/SnuggleArrange.hpp
+    Arrange/polite_voxelizer.hpp
+    Arrange/snuggle_nester.hpp
     BlacklistedLibraryCheck.cpp
     BlacklistedLibraryCheck.hpp
     BoundingBox.cpp
