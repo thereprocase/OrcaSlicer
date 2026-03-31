@@ -37,12 +37,12 @@ struct RadialConfig {
     float min_gap_mm    = 1.0f;
     float bed_margin_mm = 3.0f;
 
-    int   n_directions  = 36;    // radial angles to try (360/36 = 10° each)
+    int   n_directions  = 24;    // radial angles to try (360/24 = 15° each)
     int   n_rotations   = 24;    // rotation angles to try (360/24 = 15° each)
     float step_mm       = 2.0f;  // slide distance per step (= voxel size)
 
     bool  lock_rotation = false;
-    double timeout_s    = 30.0;
+    double timeout_s    = 15.0;
 };
 
 struct RadialResult {

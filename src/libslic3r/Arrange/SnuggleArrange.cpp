@@ -215,7 +215,7 @@ void snuggle_arrange(
     snuggle::RadialConfig rcfg;
     rcfg.bed_width_mm  = bed_w;
     rcfg.bed_height_mm = bed_h;
-    rcfg.min_gap_mm    = std::max(1.0f, params.snuggle_padding_mm);
+    rcfg.min_gap_mm    = std::max(1.5f, params.snuggle_padding_mm);
     rcfg.bed_margin_mm = rcfg.min_gap_mm;
     rcfg.step_mm       = voxel_size;
     rcfg.timeout_s     = std::max(2.0, (double)params.snuggle_timeout_s);
