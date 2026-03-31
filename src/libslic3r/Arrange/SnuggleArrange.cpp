@@ -204,37 +204,42 @@ void snuggle_arrange(
         const auto& pl = result.placements[i];
         const auto& grid = (i < parts.size()) ? parts[i].grid : parts[0].grid;
 
-        // The nester placement (pl.x, pl.y) is an XY offset for the voxel grid.
-        // grid.origin is the padded mesh AABB min (expanded by 1 voxel).
-        // The mesh's actual min corner is grid.origin + voxel_size (undo padding).
-        // We want to place the mesh's min corner at the nester's intended position
-        // on the bed.
-        float mesh_min_x = grid.origin.x + grid.voxel_size;  // undo 1-voxel padding
-        float mesh_min_y = grid.origin.y + grid.voxel_size;
-        float bed_x = pl.x + mesh_min_x;  // position on bed in mm (0 to bed_w)
-        float bed_y = pl.y + mesh_min_y;
-        float world_x = bed_x + bed_origin_x;  // convert to Orca world coords
+        // The nester placed the ROTATED grid at (pl.x, pl.y). We need the
+        // rotated grid's origin to correctly compute where the mesh lands.
+        // Using the unrotated grid.origin is WRONG when rotation != 0.
+        snuggle::VoxelGrid rot_grid = grid.rotated_copy(pl.zrot);
+        float rot_mesh_min_x = rot_grid.origin.x + rot_grid.voxel_size;
+        float rot_mesh_min_y = rot_grid.origin.y + rot_grid.voxel_size;
+
+        float bed_x = pl.x + rot_mesh_min_x;
+        float bed_y = pl.y + rot_mesh_min_y;
+        float world_x = bed_x + bed_origin_x;
         float world_y = bed_y + bed_origin_y;
 
-        // OrcaSlicer applies rotation BEFORE translation, so compensate
-        // with the ROTATED polygon bounding box.
+        // The rotated polygon's min corner should land at (world_x, world_y).
+        // OrcaSlicer applies rotation BEFORE translation, so:
+        //   final_pos = translate(rotate(poly))
+        //   poly_min_after_rotate = rotated_poly_bb.min
+        //   world_pos = translation + rotated_poly_bb.min
+        //   translation = scaled(world) - rotated_poly_bb.min
         ExPolygon rotated_poly = items[i].poly;
         rotated_poly.rotate(pl.zrot);
-        BoundingBox poly_bb = get_extents(rotated_poly);
+        BoundingBox rot_poly_bb = get_extents(rotated_poly);
         items[i].translation = Vec2crd(
-            scaled(world_x) - poly_bb.min.x(),
-            scaled(world_y) - poly_bb.min.y()
+            scaled(world_x) - rot_poly_bb.min.x(),
+            scaled(world_y) - rot_poly_bb.min.y()
         );
         items[i].rotation = (double)pl.zrot;
         items[i].bed_idx = 0;
 
         BOOST_LOG_TRIVIAL(warning) << "Snuggle: [" << i << "] " << items[i].name
-            << " placement=(" << pl.x << "," << pl.y << ")"
-            << " mesh_min=(" << mesh_min_x << "," << mesh_min_y << ")"
-            << " bed_pos=(" << bed_x << "," << bed_y << ")"
+            << " pl=(" << pl.x << "," << pl.y << ")"
+            << " rot_grid_origin=(" << rot_grid.origin.x << "," << rot_grid.origin.y << ")"
+            << " rot_mesh_min=(" << rot_mesh_min_x << "," << rot_mesh_min_y << ")"
+            << " bed=(" << bed_x << "," << bed_y << ")"
             << " world=(" << world_x << "," << world_y << ")"
-            << " poly_bb_min=(" << unscale_(poly_bb.min.x()) << "," << unscale_(poly_bb.min.y()) << ")"
-            << " translation=(" << unscale_(items[i].translation.x()) << "," << unscale_(items[i].translation.y()) << ")"
+            << " rot_poly_bb_min=(" << unscale_(rot_poly_bb.min.x()) << "," << unscale_(rot_poly_bb.min.y()) << ")"
+            << " trans=(" << unscale_(items[i].translation.x()) << "," << unscale_(items[i].translation.y()) << ")"
             << " rot=" << (int)(pl.zrot * 180.0 / 3.14159265) << "deg";
     }
 }
