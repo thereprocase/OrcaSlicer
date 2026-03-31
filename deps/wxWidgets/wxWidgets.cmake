@@ -23,7 +23,7 @@ endif ()
 
 orcaslicer_add_cmake_project(
     wxWidgets
-    GIT_REPOSITORY "https://github.com/SoftFever/Orca-deps-wxWidgets"
+    GIT_REPOSITORY "https://github.com/wxWidgets/wxWidgets"
     GIT_TAG v3.3.2
     GIT_SHALLOW ON
     DEPENDS ${PNG_PKG} ${ZLIB_PKG} ${EXPAT_PKG} ${JPEG_PKG}

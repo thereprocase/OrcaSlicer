@@ -337,8 +337,13 @@ wxWebView* WebView::CreateWebView(wxWindow * parent, wxString const & url)
 bool WebView::CheckWebViewRuntime()
 {
     wxWebViewFactoryEdge factory;
+#if wxCHECK_VERSION(3, 3, 0)
     auto wxVersion = factory.GetVersionInfo(wxVersionContext::RunTime);
     return wxVersion.GetMajor() != 0;
+#else
+    // wx 3.1 doesn't have wxVersionContext::RunTime — just check if Edge is available
+    return wxWebView::IsBackendAvailable(wxWebViewBackendEdge);
+#endif
 }
 
 bool WebView::DownloadAndInstallWebViewRuntime()
