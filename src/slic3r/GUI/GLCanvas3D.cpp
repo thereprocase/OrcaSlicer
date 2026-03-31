@@ -1142,9 +1142,9 @@ void GLCanvas3D::load_arrange_settings()
     if (!snuggle_str.empty())
         m_arrange_settings_fff.use_snuggle = (snuggle_str == "1" || snuggle_str == "true");
 
-    std::string snuggle_lock_str = wxGetApp().app_config->get("arrange", "snuggle_lock_rotation");
-    if (!snuggle_lock_str.empty())
-        m_arrange_settings_fff.snuggle_lock_rotation = (snuggle_lock_str == "1" || snuggle_lock_str == "true");
+    // snuggle_lock_rotation is now derived from snuggle_rotation_step (0 = locked).
+    // Load the step first (below), then derive lock state from it.
+    // Legacy config key "snuggle_lock_rotation" is ignored — dropdown is source of truth.
 
     std::string snuggle_padding_str = wxGetApp().app_config->get("arrange", "snuggle_padding_mm");
     if (!snuggle_padding_str.empty())
@@ -1152,7 +1152,7 @@ void GLCanvas3D::load_arrange_settings()
 
     std::string snuggle_quality_str = wxGetApp().app_config->get("arrange", "snuggle_quality");
     if (!snuggle_quality_str.empty())
-        try { m_arrange_settings_fff.snuggle_quality = std::stoi(snuggle_quality_str); } catch (...) {}
+        try { m_arrange_settings_fff.snuggle_quality = std::clamp(std::stoi(snuggle_quality_str), 1, 10); } catch (...) {}
 
     std::string snuggle_compact_str = wxGetApp().app_config->get("arrange", "snuggle_compact");
     if (!snuggle_compact_str.empty())
@@ -1173,6 +1173,9 @@ void GLCanvas3D::load_arrange_settings()
     std::string snuggle_multi_plate_str = wxGetApp().app_config->get("arrange", "snuggle_multi_plate");
     if (!snuggle_multi_plate_str.empty())
         m_arrange_settings_fff.snuggle_multi_plate = (snuggle_multi_plate_str == "1" || snuggle_multi_plate_str == "true");
+
+    // Derive lock_rotation from rotation_step (dropdown is source of truth)
+    m_arrange_settings_fff.snuggle_lock_rotation = (m_arrange_settings_fff.snuggle_rotation_step == 0);
 
     //BBS: add specific arrange settings
     m_arrange_settings_fff_seq_print.is_seq_print = true;
@@ -5964,9 +5967,16 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         ImGui::SameLine(1.2 * cursor_slider_left);
         const char* rot_labels[] = {"Locked", "90\xC2\xB0", "45\xC2\xB0", "15\xC2\xB0", "5\xC2\xB0", "1\xC2\xB0"};
         int rot_values[] = {0, 90, 45, 15, 5, 1};
+        // Snap invalid config values to nearest valid option
         int rot_idx = 0;
-        for (int ri = 0; ri < 6; ri++)
-            if (settings.snuggle_rotation_step == rot_values[ri]) { rot_idx = ri; break; }
+        int best_diff = 999;
+        for (int ri = 0; ri < 6; ri++) {
+            int diff = std::abs(settings.snuggle_rotation_step - rot_values[ri]);
+            if (diff < best_diff) { best_diff = diff; rot_idx = ri; }
+        }
+        // Sync the actual value to the snapped option
+        settings.snuggle_rotation_step = rot_values[rot_idx];
+        settings_out.snuggle_rotation_step = rot_values[rot_idx];
         ImGui::PushItemWidth(window_width);
         if (ImGui::Combo("##SnuggleRotStep", &rot_idx, rot_labels, 6)) {
             settings.snuggle_rotation_step = rot_values[rot_idx];
@@ -6100,6 +6110,10 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         appcfg->set("arrange", "snuggle_padding_mm", float_to_string_decimal_point(5.0f));
         appcfg->set("arrange", "snuggle_quality", "5");
         appcfg->set("arrange", "snuggle_compact", "1");
+        appcfg->set("arrange", "snuggle_max_parts", "200");
+        appcfg->set("arrange", "snuggle_timeout_s", "40.0");
+        appcfg->set("arrange", "snuggle_rotation_step", "0");
+        appcfg->set("arrange", "snuggle_multi_plate", "1");
         settings_changed = true;
     }
     ImGui::PopStyleVar(1);

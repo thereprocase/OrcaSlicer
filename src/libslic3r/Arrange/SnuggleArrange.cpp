@@ -40,7 +40,8 @@ void snuggle_arrange(
         float cx = bed_origin_x + bed_w * 0.5f;
         float cy = bed_origin_y + bed_h * 0.5f;
         items[0].translation = Vec2crd(scaled(cx), scaled(cy));
-        items[0].rotation = 0.0;
+        // Preserve user's Z rotation — don't zero it
+        // items[0].rotation is already set from get_arrange_polygon
         items[0].bed_idx = 0;
         return;
     }
