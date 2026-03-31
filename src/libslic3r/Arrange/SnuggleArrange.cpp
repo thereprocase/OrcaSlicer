@@ -51,6 +51,7 @@ void snuggle_arrange(
         float cy_mm = bed_origin_y_mm + bed_height_mm * 0.5f;
         items[0].translation = Vec2crd(snuggle_xform::mm_to_scaled(cx_mm),
                                        snuggle_xform::mm_to_scaled(cy_mm));
+        items[0].rotation = 0.0; // Explicit — arranger contract requires this
         items[0].bed_idx = 0;
         return;
     }
@@ -129,11 +130,33 @@ void snuggle_arrange(
     }
 
     // ── Build PartInfo vector for nester ─────────────────────────────
+    // Skip parts with empty voxel grids (failed voxelization, empty mesh).
+    // These get marked UNARRANGED so the fallback arranger handles them.
     std::vector<snuggle::PartInfo> nester_parts;
+    std::vector<size_t> nester_to_item; // maps nester index → items index
     nester_parts.reserve(part_data.size());
-    for (auto& pd : part_data) {
-        nester_parts.push_back(std::move(pd.info));
+    for (size_t i = 0; i < part_data.size(); ++i) {
+        if (part_data[i].info.grid.total_voxels() == 0 ||
+            part_data[i].info.grid.count_solid() == 0) {
+            BOOST_LOG_TRIVIAL(warning) << "[SnuggleArrange] Part " << i
+                << " '" << part_data[i].name << "' has empty voxel grid — "
+                << "marking UNARRANGED (fallback arranger will handle it)";
+            items[i].bed_idx = UNARRANGED;
+            continue;
+        }
+        nester_to_item.push_back(i);
+        nester_parts.push_back(std::move(part_data[i].info));
     }
+
+    // If no parts have valid grids, bail entirely
+    if (nester_parts.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << "[SnuggleArrange] No parts with valid voxel grids. "
+            << "Falling back to default arranger.";
+        return;
+    }
+
+    BOOST_LOG_TRIVIAL(info) << "[SnuggleArrange] " << nester_parts.size()
+        << " parts with valid grids (of " << items.size() << " total)";
 
     // ── Step 2b: Build volume check ────────────────────────────────
     // Warn about parts that exceed the printable height
@@ -264,17 +287,19 @@ void snuggle_arrange(
         << (nest_result.timed_out ? " [TIMED OUT]" : "");
 
     // ── Step 4: Convert results back to ArrangePolygon fields ────────
-    if (nest_result.placements.size() != items.size()) {
+    // nester_parts may be smaller than items (empty grids were skipped)
+    if (nest_result.placements.size() != nester_parts.size()) {
         BOOST_LOG_TRIVIAL(error) << "[SnuggleArrange] Nester returned "
             << nest_result.placements.size() << " placements but expected "
-            << items.size() << ". Leaving items unarranged.";
+            << nester_parts.size() << ". Leaving items unarranged.";
         return;
     }
 
     if (nest_result.feasible) {
-        // All parts fit on one bed
-        for (size_t i = 0; i < items.size(); ++i) {
-            const snuggle::Placement& pl = nest_result.placements[i];
+        // All valid parts fit on one bed
+        for (size_t ni = 0; ni < nester_parts.size(); ++ni) {
+            size_t i = nester_to_item[ni]; // Map back to items index
+            const snuggle::Placement& pl = nest_result.placements[ni];
 
             Vec2crd out_translation;
             double out_rotation;
@@ -302,13 +327,12 @@ void snuggle_arrange(
 
         // Apply placements anyway — parts that are within bed bounds get bed_idx=0,
         // parts that are out of bounds get UNARRANGED.
-        for (size_t i = 0; i < items.size(); ++i) {
-            const snuggle::Placement& pl = nest_result.placements[i];
+        for (size_t ni = 0; ni < nester_parts.size(); ++ni) {
+            size_t i = nester_to_item[ni];
+            const snuggle::Placement& pl = nest_result.placements[ni];
 
             // Check if this part's placement is within bed bounds.
-            // Use rotation-aware bounding box: compute the rotated AABB diagonal
-            // so parts at 45 degrees are correctly bounded.
-            const snuggle::VoxelGrid& grid = nester_parts[i].grid;
+            const snuggle::VoxelGrid& grid = nester_parts[ni].grid;
             float hw = grid.nx * grid.voxel_size * 0.5f; // half-width
             float hh = grid.ny * grid.voxel_size * 0.5f; // half-height
             float cos_r = std::abs(std::cos(pl.zrot));
