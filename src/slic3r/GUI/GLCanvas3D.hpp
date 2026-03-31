@@ -499,11 +499,13 @@ public:
         bool  use_snuggle           = false;
         bool  snuggle_lock_rotation = false;
         float snuggle_padding_mm    = 5.0f;
-        int   snuggle_quality       = 5;
-        bool  snuggle_compact       = true;
+        int   snuggle_population    = 64;
+        int   snuggle_generations   = 30;
+        float snuggle_voxel_mm      = 2.0f;
+        bool  snuggle_compact       = false;
         int   snuggle_max_parts     = 200;
-        float snuggle_timeout_s     = 40.0f;
-        int   snuggle_rotation_step = 0;    // 0=locked, 1,5,15,45,90
+        float snuggle_timeout_s     = 5.0f;
+        int   snuggle_rotation_step = 15;
         bool  snuggle_multi_plate   = true;
     };
 

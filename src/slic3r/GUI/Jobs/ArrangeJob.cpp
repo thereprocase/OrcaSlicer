@@ -864,7 +864,9 @@ arrangement::ArrangeParams init_arrange_params(Plater *p)
     params.use_snuggle                         = settings.use_snuggle;
     params.snuggle_lock_rotation               = settings.snuggle_lock_rotation;
     params.snuggle_padding_mm                  = settings.snuggle_padding_mm;
-    params.snuggle_quality                     = settings.snuggle_quality;
+    params.snuggle_population                  = settings.snuggle_population;
+    params.snuggle_generations                 = settings.snuggle_generations;
+    params.snuggle_voxel_mm                    = settings.snuggle_voxel_mm;
     params.snuggle_compact                     = settings.snuggle_compact;
     params.snuggle_max_parts                   = settings.snuggle_max_parts;
     params.snuggle_timeout_s                   = settings.snuggle_timeout_s;

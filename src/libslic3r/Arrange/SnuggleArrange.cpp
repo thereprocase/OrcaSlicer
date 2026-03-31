@@ -94,7 +94,7 @@ void snuggle_arrange(
     // doesn't matter much since we iterate the grid, not the mesh.
     // But high-poly meshes (>10K tris) make the SAT test expensive.
     // Decimate to ~5K tris max — sufficient for 2mm voxel accuracy.
-    float voxel_size = 2.0f;
+    float voxel_size = std::clamp(params.snuggle_voxel_mm, 0.5f, 5.0f);
     constexpr size_t MAX_TRIS_FOR_VOXEL = 5000;
 
     // Walk the model to match items to instances. Build a flat list of
@@ -216,11 +216,10 @@ void snuggle_arrange(
     cfg.bed_height_mm   = bed_h;
     cfg.min_gap_mm      = std::max(1.0f, params.snuggle_padding_mm);
 
-    // Quality 1-10: population = quality * 64, generations = quality * 10 + 20
-    int quality = std::clamp(params.snuggle_quality, 1, 10);
-    cfg.population_size = quality * 64;        // 64 to 640
-    cfg.max_generations = 20 + quality * 10;   // 30 to 120
-    cfg.timeout_seconds = std::max(5.0, (double)params.snuggle_timeout_s);
+    // Direct numeric controls — user sets population, generations, timeout
+    cfg.population_size = std::clamp(params.snuggle_population, 16, 1024);
+    cfg.max_generations = std::clamp(params.snuggle_generations, 10, 500);
+    cfg.timeout_seconds = std::max(2.0, (double)params.snuggle_timeout_s);
 
     // Rotation step: 0=locked, else degrees per snap increment
     // The initial_zrot on each part is the user's pre-rotation (their starting position)

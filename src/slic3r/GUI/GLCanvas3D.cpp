@@ -1150,9 +1150,17 @@ void GLCanvas3D::load_arrange_settings()
     if (!snuggle_padding_str.empty())
         try { m_arrange_settings_fff.snuggle_padding_mm = std::clamp(std::stof(snuggle_padding_str), 0.0f, 20.0f); } catch (...) {}
 
-    std::string snuggle_quality_str = wxGetApp().app_config->get("arrange", "snuggle_quality");
-    if (!snuggle_quality_str.empty())
-        try { m_arrange_settings_fff.snuggle_quality = std::clamp(std::stoi(snuggle_quality_str), 1, 10); } catch (...) {}
+    std::string snuggle_pop_str = wxGetApp().app_config->get("arrange", "snuggle_population");
+    if (!snuggle_pop_str.empty())
+        try { m_arrange_settings_fff.snuggle_population = std::clamp(std::stoi(snuggle_pop_str), 16, 1024); } catch (...) {}
+
+    std::string snuggle_gen_str = wxGetApp().app_config->get("arrange", "snuggle_generations");
+    if (!snuggle_gen_str.empty())
+        try { m_arrange_settings_fff.snuggle_generations = std::clamp(std::stoi(snuggle_gen_str), 10, 500); } catch (...) {}
+
+    std::string snuggle_voxel_str = wxGetApp().app_config->get("arrange", "snuggle_voxel_mm");
+    if (!snuggle_voxel_str.empty())
+        try { m_arrange_settings_fff.snuggle_voxel_mm = std::clamp(std::stof(snuggle_voxel_str), 0.5f, 5.0f); } catch (...) {}
 
     std::string snuggle_compact_str = wxGetApp().app_config->get("arrange", "snuggle_compact");
     if (!snuggle_compact_str.empty())
@@ -1164,7 +1172,7 @@ void GLCanvas3D::load_arrange_settings()
 
     std::string snuggle_timeout_str = wxGetApp().app_config->get("arrange", "snuggle_timeout_s");
     if (!snuggle_timeout_str.empty())
-        try { m_arrange_settings_fff.snuggle_timeout_s = std::clamp(std::stof(snuggle_timeout_str), 5.0f, 300.0f); } catch (...) {}
+        try { m_arrange_settings_fff.snuggle_timeout_s = std::clamp(std::stof(snuggle_timeout_str), 2.0f, 300.0f); } catch (...) {}
 
     std::string snuggle_rot_step_str = wxGetApp().app_config->get("arrange", "snuggle_rotation_step");
     if (!snuggle_rot_step_str.empty())
@@ -5992,42 +6000,65 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
                                           "Locked = parts keep their current rotation.\n"
                                           "90\xC2\xB0 = try 0, 90, 180, 270 from starting position.").c_str());
 
-        // Quality with text input
+        // Resolution
         ImGui::AlignTextToFramePadding();
-        imgui->text(_L("Quality"));
+        imgui->text(_L("Resolution"));
         ImGui::SameLine(1.2 * cursor_slider_left);
         ImGui::PushItemWidth(window_width - slider_icon_width);
-        float quality_f = (float)settings.snuggle_quality;
-        bool b_quality = imgui->bbl_slider_float_style("##SnuggleQuality", &quality_f, 1.0f, 10.0f, "%.0f");
+        bool b_voxel = imgui->bbl_slider_float_style("##SnuggleVoxel", &settings.snuggle_voxel_mm, 0.5f, 5.0f, "%3.1f mm");
         ImGui::SameLine(window_width - slider_icon_width + 1.3 * cursor_slider_left);
         ImGui::PushItemWidth(1.5 * slider_icon_width);
-        int quality_i = settings.snuggle_quality;
-        bool b_quality_input = ImGui::InputInt("##quality_input", &quality_i, 0, 0);
-        if (b_quality || b_quality_input) {
-            settings.snuggle_quality = b_quality ? (int)quality_f : std::clamp(quality_i, 1, 10);
-            settings_out.snuggle_quality = settings.snuggle_quality;
-            appcfg->set("arrange", "snuggle_quality", std::to_string(settings_out.snuggle_quality));
+        bool b_voxel_input = ImGui::BBLDragFloat("##voxel_input", &settings.snuggle_voxel_mm, 0.1f, 0.5f, 5.0f, "%.1f");
+        if (b_voxel || b_voxel_input) {
+            settings.snuggle_voxel_mm = std::clamp(settings.snuggle_voxel_mm, 0.5f, 5.0f);
+            settings_out.snuggle_voxel_mm = settings.snuggle_voxel_mm;
+            appcfg->set("arrange", "snuggle_voxel_mm", float_to_string_decimal_point(settings_out.snuggle_voxel_mm));
             settings_changed = true;
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", _u8L("Population = quality \xC3\x97 64 candidates.\n"
-                                          "Generations = 20 + quality \xC3\x97 10.\n"
-                                          "Higher = better packing, slower.").c_str());
+            ImGui::SetTooltip("%s", _u8L("Voxel size in mm. Lower = more precise but slower.\n"
+                                          "2.0 mm is a good default. 0.5 mm for tight packing.").c_str());
 
-        // ── Collapsible debug menu ────────────────────────────
-        if (ImGui::TreeNode(_u8L("Debug / Advanced").c_str())) {
+        // ── Collapsible effort / debug menu ───────────────────
+        if (ImGui::TreeNode(_u8L("Effort / Advanced").c_str())) {
+            ImGui::AlignTextToFramePadding();
+            imgui->text(_L("Population"));
+            ImGui::SameLine(1.2 * cursor_slider_left);
+            ImGui::PushItemWidth(window_width);
+            if (ImGui::InputInt("##SnugglePop", &settings.snuggle_population, 16, 64)) {
+                settings.snuggle_population = std::clamp(settings.snuggle_population, 16, 1024);
+                settings_out.snuggle_population = settings.snuggle_population;
+                appcfg->set("arrange", "snuggle_population", std::to_string(settings_out.snuggle_population));
+                settings_changed = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", _u8L("Number of candidate arrangements per generation.\n"
+                                              "64 is fast. 256+ for better quality.").c_str());
+
+            ImGui::AlignTextToFramePadding();
+            imgui->text(_L("Generations"));
+            ImGui::SameLine(1.2 * cursor_slider_left);
+            ImGui::PushItemWidth(window_width);
+            if (ImGui::InputInt("##SnuggleGen", &settings.snuggle_generations, 10, 30)) {
+                settings.snuggle_generations = std::clamp(settings.snuggle_generations, 10, 500);
+                settings_out.snuggle_generations = settings.snuggle_generations;
+                appcfg->set("arrange", "snuggle_generations", std::to_string(settings_out.snuggle_generations));
+                settings_changed = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", _u8L("Evolution cycles. More = better convergence.\n"
+                                              "30 is fast. 100+ for complex arrangements.").c_str());
+
             ImGui::AlignTextToFramePadding();
             imgui->text(_L("Timeout (s)"));
             ImGui::SameLine(1.2 * cursor_slider_left);
             ImGui::PushItemWidth(window_width);
-            if (ImGui::InputFloat("##SnuggleTimeout", &settings.snuggle_timeout_s, 5.0f, 10.0f, "%.0f")) {
-                settings.snuggle_timeout_s = std::clamp(settings.snuggle_timeout_s, 5.0f, 300.0f);
+            if (ImGui::InputFloat("##SnuggleTimeout", &settings.snuggle_timeout_s, 1.0f, 5.0f, "%.0f")) {
+                settings.snuggle_timeout_s = std::clamp(settings.snuggle_timeout_s, 2.0f, 300.0f);
                 settings_out.snuggle_timeout_s = settings.snuggle_timeout_s;
                 appcfg->set("arrange", "snuggle_timeout_s", float_to_string_decimal_point(settings_out.snuggle_timeout_s));
                 settings_changed = true;
             }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", _u8L("Maximum seconds for the genetic nester per plate.").c_str());
 
             ImGui::AlignTextToFramePadding();
             imgui->text(_L("Max parts"));
@@ -6039,18 +6070,21 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
                 appcfg->set("arrange", "snuggle_max_parts", std::to_string(settings_out.snuggle_max_parts));
                 settings_changed = true;
             }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", _u8L("Maximum parts per plate before overflow to next plate.\n"
-                                              "Higher values use more CPU/GPU time.").c_str());
 
             if (imgui->bbl_checkbox(_L("Multi-plate overflow"), settings.snuggle_multi_plate)) {
                 settings_out.snuggle_multi_plate = settings.snuggle_multi_plate;
                 appcfg->set("arrange", "snuggle_multi_plate", settings_out.snuggle_multi_plate ? "1" : "0");
                 settings_changed = true;
             }
+
+            if (imgui->bbl_checkbox(_L("Post-GA compaction"), settings.snuggle_compact)) {
+                settings_out.snuggle_compact = settings.snuggle_compact;
+                appcfg->set("arrange", "snuggle_compact", settings_out.snuggle_compact ? "1" : "0");
+                settings_changed = true;
+            }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", _u8L("When parts don't fit, automatically overflow to additional plates.\n"
-                                              "Each plate is arranged independently.").c_str());
+                ImGui::SetTooltip("%s", _u8L("Jiggle parts toward center after GA. Usually not needed —\n"
+                                              "the GA's fitness function already optimizes for tight clusters.").c_str());
 
             ImGui::TreePop();
         }
@@ -6092,14 +6126,17 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         else
             settings_out.align_to_y_axis = false;
 
+        // Legolas-tuned defaults: pop=64, gen=30, 2mm voxels, 15deg rotation, 5s timeout
         settings_out.use_snuggle = false;
         settings_out.snuggle_lock_rotation = false;
         settings_out.snuggle_padding_mm = 5.0f;
-        settings_out.snuggle_quality = 5;
-        settings_out.snuggle_compact = true;
+        settings_out.snuggle_population = 64;
+        settings_out.snuggle_generations = 30;
+        settings_out.snuggle_voxel_mm = 2.0f;
+        settings_out.snuggle_compact = false;
         settings_out.snuggle_max_parts = 200;
-        settings_out.snuggle_timeout_s = 40.0f;
-        settings_out.snuggle_rotation_step = 0;
+        settings_out.snuggle_timeout_s = 5.0f;
+        settings_out.snuggle_rotation_step = 15;
         settings_out.snuggle_multi_plate = true;
 
         appcfg->set("arrange", dist_key, float_to_string_decimal_point(settings_out.distance));
@@ -6107,12 +6144,14 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         appcfg->set("arrange", align_to_y_axis_key, settings_out.align_to_y_axis ? "1" : "0");
         appcfg->set("arrange", "use_snuggle", "0");
         appcfg->set("arrange", "snuggle_lock_rotation", "0");
-        appcfg->set("arrange", "snuggle_padding_mm", float_to_string_decimal_point(5.0f));
-        appcfg->set("arrange", "snuggle_quality", "5");
-        appcfg->set("arrange", "snuggle_compact", "1");
+        appcfg->set("arrange", "snuggle_padding_mm", "5.0");
+        appcfg->set("arrange", "snuggle_population", "64");
+        appcfg->set("arrange", "snuggle_generations", "30");
+        appcfg->set("arrange", "snuggle_voxel_mm", "2.0");
+        appcfg->set("arrange", "snuggle_compact", "0");
         appcfg->set("arrange", "snuggle_max_parts", "200");
-        appcfg->set("arrange", "snuggle_timeout_s", "40.0");
-        appcfg->set("arrange", "snuggle_rotation_step", "0");
+        appcfg->set("arrange", "snuggle_timeout_s", "5.0");
+        appcfg->set("arrange", "snuggle_rotation_step", "15");
         appcfg->set("arrange", "snuggle_multi_plate", "1");
         settings_changed = true;
     }
