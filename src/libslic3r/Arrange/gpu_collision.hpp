@@ -13,6 +13,7 @@
 #include "polite_voxelizer.hpp"
 #include <vector>
 #include <memory>
+#include <atomic>
 
 namespace snuggle {
 
@@ -77,7 +78,7 @@ public:
                         float bed_margin = 0.0f) override;
 
 private:
-    bool available_ = false;
+    std::atomic<bool> available_{false};
     // GL handles
     unsigned int program_ = 0;
     unsigned int voxel_ssbo_ = 0;

@@ -666,7 +666,10 @@ void ArrangeJob::process(Ctl &ctl)
             finish_msg = GUI::format(_L("Snuggle complete \u2014 %1% parts arranged. Bed usage: %2%%%"),
                                     placed, pct);
         } else {
-            finish_msg = GUI::format(_L("Snuggle complete \u2014 %1% parts arranged."), placed);
+            // Full fallback (seq print, too many parts, etc.) — all items bed_idx=-1
+            // The overflow handler already passed them to the default arranger,
+            // so show a neutral message rather than "Snuggle complete — 0 parts"
+            finish_msg = _u8L("Arranging done.");
         }
     } else if (we_have_unpackable_items) {
         finish_msg = _u8L("Arranging is done but there are unpacked items. Reduce spacing and try again.");

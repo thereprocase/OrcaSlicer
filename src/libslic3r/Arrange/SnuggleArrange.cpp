@@ -237,14 +237,19 @@ void snuggle_arrange(
 
     cfg.compact         = params.snuggle_compact;
 
-    BOOST_LOG_TRIVIAL(info) << "Snuggle config: quality=" << quality
+    BOOST_LOG_TRIVIAL(info) << "Snuggle config:"
         << " pop=" << cfg.population_size << " gens=" << cfg.max_generations
         << " timeout=" << cfg.timeout_seconds << "s"
+        << " voxel=" << voxel_size << "mm"
         << " rot_step=" << params.snuggle_rotation_step << "deg"
         << " lock_rot=" << cfg.lock_rotation;
 
-    // Shrink effective bed by voxel padding (1 voxel per side) + min gap
-    cfg.bed_margin_mm   = voxel_size + cfg.min_gap_mm;
+    // Margin = clearance from grid boundary to bed edge.
+    // The rotated grid already includes 1-voxel padding beyond geometry,
+    // so the margin only needs the gap clearance. Using max_voxel + gap
+    // double-counted the padding and wasted bed space (8mm total with 4mm voxels),
+    // making tight layouts infeasible with adaptive per-part voxel sizes.
+    cfg.bed_margin_mm   = cfg.min_gap_mm;
 
     // Wire progress/stop to Orca's callbacks
     if (params.stopcondition) {

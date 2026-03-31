@@ -91,6 +91,7 @@ enum class VoxError {
     NO_TRIANGLES,
     ABORTED_BY_USER,
     INVALID_RESOLUTION,
+    INVALID_INPUT,
 };
 
 inline const char* vox_error_str(VoxError e) {
@@ -101,6 +102,7 @@ inline const char* vox_error_str(VoxError e) {
         case VoxError::NO_TRIANGLES:        return "No triangles provided";
         case VoxError::ABORTED_BY_USER:     return "Aborted by progress callback";
         case VoxError::INVALID_RESOLUTION:  return "Invalid voxel resolution";
+        case VoxError::INVALID_INPUT:       return "Invalid mesh indices";
     }
     return "Unknown error";
 }
@@ -553,6 +555,8 @@ inline VoxError voxelize_indexed_mesh(
         uint32_t i0 = indices[i * 3 + 0];
         uint32_t i1 = indices[i * 3 + 1];
         uint32_t i2 = indices[i * 3 + 2];
+        if (i0 >= num_verts || i1 >= num_verts || i2 >= num_verts)
+            return VoxError::INVALID_INPUT;
         tris[i].v0 = {vertices[i0*3], vertices[i0*3+1], vertices[i0*3+2]};
         tris[i].v1 = {vertices[i1*3], vertices[i1*3+1], vertices[i1*3+2]};
         tris[i].v2 = {vertices[i2*3], vertices[i2*3+1], vertices[i2*3+2]};

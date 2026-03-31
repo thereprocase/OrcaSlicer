@@ -53,7 +53,7 @@ struct NesterConfig {
     float  bed_width_mm      = 256.0f;
     float  bed_height_mm     = 256.0f;
     float  min_gap_mm        = 5.0f;   // Minimum clearance between parts
-    float  bed_margin_mm     = 4.0f;   // Safety margin from bed edge (voxel padding + gap)
+    float  bed_margin_mm     = 5.0f;   // Clearance from grid boundary to bed edge (= min_gap_mm)
 
     // Rotation control
     bool   lock_rotation     = false;  // true = XY only, preserve user's Z rotation
@@ -372,17 +372,14 @@ private:
                 float dir_x = dx / dist;
                 float dir_y = dy / dist;
 
-                // Build rotated grid for this part
-                VoxelGrid rot_i = parts[idx].grid.rotated_copy(pl.zrot);
+                // Use cached rotated grids (avoids expensive live rotated_copy)
+                const VoxelGrid &rot_i = cached_rotated(idx, pl.zrot);
 
-                // Pre-compute rotated copies for collision partners (avoid redundant copies)
+                // Point to cached rotated copies for collision partners
                 std::vector<const VoxelGrid*> rot_others(n, nullptr);
-                std::vector<VoxelGrid> rot_others_storage;
-                rot_others_storage.reserve(n);
                 for (size_t j = 0; j < n; j++) {
                     if (j == idx) continue;
-                    rot_others_storage.push_back(parts[j].grid.rotated_copy(result.placements[j].zrot));
-                    rot_others[j] = &rot_others_storage.back();
+                    rot_others[j] = &cached_rotated(j, result.placements[j].zrot);
                 }
 
                 // Binary search: max step toward center without collision
@@ -434,13 +431,13 @@ private:
 
                     for (float da : test_angles) {
                         float test_rot = pl.zrot + da;
-                        VoxelGrid rot_test = parts[idx].grid.rotated_copy(test_rot);
+                        const VoxelGrid &rot_test = cached_rotated(idx, test_rot);
                         Vec3f off_test = {base_x, base_y, 0.0f};
 
                         bool ok = true;
                         for (size_t j = 0; j < n && ok; j++) {
                             if (j == idx) continue;
-                            VoxelGrid rot_j = parts[j].grid.rotated_copy(result.placements[j].zrot);
+                            const VoxelGrid &rot_j = cached_rotated(j, result.placements[j].zrot);
                             Vec3f off_j = {result.placements[j].x, result.placements[j].y, 0.0f};
                             if (VoxelGrid::collision_count(rot_test, off_test, rot_j, off_j) > 0)
                                 ok = false;
@@ -454,12 +451,12 @@ private:
                                 float mid2 = (extra_lo + extra_hi) * 0.5f;
                                 float tx = pl.x + dir_x * mid2;
                                 float ty = pl.y + dir_y * mid2;
-                                VoxelGrid rot2 = parts[idx].grid.rotated_copy(test_rot);
+                                const VoxelGrid &rot2 = cached_rotated(idx, test_rot);
                                 Vec3f off2 = {tx, ty, 0.0f};
                                 bool col2 = false;
                                 for (size_t j = 0; j < n && !col2; j++) {
                                     if (j == idx) continue;
-                                    VoxelGrid rj2 = parts[j].grid.rotated_copy(result.placements[j].zrot);
+                                    const VoxelGrid &rj2 = cached_rotated(j, result.placements[j].zrot);
                                     Vec3f oj2 = {result.placements[j].x, result.placements[j].y, 0.0f};
                                     if (VoxelGrid::collision_count(rot2, off2, rj2, oj2) > 0)
                                         col2 = true;
