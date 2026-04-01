@@ -27,7 +27,9 @@ void snuggle_arrange(
     const ArrangePolygons&    excludes,
     const Points&             bed,
     const ArrangeParams&      params,
-    const Model&              model)
+    const Model&              model,
+    std::string*              out_gpu_renderer,
+    float*                    out_gpu_ratio)
 {
     BOOST_LOG_TRIVIAL(info) << "Snuggle: starting 3D-aware arrangement for " << items.size() << " items";
 
@@ -330,10 +332,9 @@ void snuggle_arrange(
             if (gpu->gpu_cpu_ratio() <= 0.0f)
                 gpu->probe_gpu_performance();
 
-            // Write probe result back for persistent caching
-            // (ArrangeJob reads these after arrange completes and saves to AppConfig)
-            const_cast<ArrangeParams&>(params).gpu_probe_renderer = gpu->renderer();
-            const_cast<ArrangeParams&>(params).gpu_probe_ratio = gpu->gpu_cpu_ratio();
+            // Write probe result to out-params for persistent caching
+            if (out_gpu_renderer) *out_gpu_renderer = gpu->renderer();
+            if (out_gpu_ratio)    *out_gpu_ratio = gpu->gpu_cpu_ratio();
 
             if (gpu->is_worthwhile()) {
                 BOOST_LOG_TRIVIAL(warning) << "Snuggle: using GPU evaluator ("
@@ -343,10 +344,10 @@ void snuggle_arrange(
                 BOOST_LOG_TRIVIAL(warning) << "Snuggle: GPU slower than CPU ("
                     << gpu->renderer() << ", ratio=" << gpu->gpu_cpu_ratio()
                     << "). Using CPU.";
+                // Don't move gpu_eval — let it drop, fall through to CPU below
             }
         }
 #endif
-        if (!evaluator) evaluator = std::move(gpu_eval);
     }
 
     if (!evaluator) {

@@ -563,9 +563,8 @@ void GpuCollisionEvaluator::probe_gpu_performance()
             return;
         }
 
-        // Best-of-5 (drop worst, take best — avoids warm-up bias)
-        double gpu_best = gpu_total_us; // conservative: use total/5 as fallback
-        gpu_best = gpu_total_us / 5.0;
+        // Average of 5 reps (includes warm-up, which is realistic)
+        double gpu_avg = gpu_total_us / 5.0;
 
         // Time CPU — same workload
         CpuCollisionEvaluator cpu_probe;
@@ -579,12 +578,12 @@ void GpuCollisionEvaluator::probe_gpu_performance()
                                       1.5f, 256.0f, 256.0f, 1.5f, cpu_r);
         }
         auto cpu_end = std::chrono::steady_clock::now();
-        double cpu_best = std::chrono::duration<double, std::micro>(cpu_end - cpu_start).count() / 5.0;
+        double cpu_avg = std::chrono::duration<double, std::micro>(cpu_end - cpu_start).count() / 5.0;
 
-        gpu_cpu_ratio_ = (cpu_best > 0) ? (float)(gpu_best / cpu_best) : 999.0f;
+        gpu_cpu_ratio_ = (cpu_avg > 0) ? (float)(gpu_avg / cpu_avg) : 999.0f;
 
-        BOOST_LOG_TRIVIAL(info) << "Snuggle GPU probe: GPU=" << (int)gpu_best << "us, CPU="
-            << (int)cpu_best << "us, ratio=" << gpu_cpu_ratio_
+        BOOST_LOG_TRIVIAL(info) << "Snuggle GPU probe: GPU=" << (int)gpu_avg << "us, CPU="
+            << (int)cpu_avg << "us, ratio=" << gpu_cpu_ratio_
             << (gpu_cpu_ratio_ < 1.0f ? " (GPU wins)" : " (CPU wins)")
             << " on " << renderer_name_;
     }

@@ -568,16 +568,19 @@ void ArrangeJob::process(Ctl &ctl)
     // Snuggle: 3D-aware genetic nesting
     if (params.use_snuggle) {
         BOOST_LOG_TRIVIAL(info) << "Snuggle: arranging " << m_selected.size() << " items";
+        std::string probe_renderer;
+        float probe_ratio = 0.0f;
         arrangement::snuggle_arrange(m_selected, m_unselected, bedpts, params,
-                                     m_plater->model());
+                                     m_plater->model(),
+                                     &probe_renderer, &probe_ratio);
 
         // Persist GPU probe result so we don't re-benchmark next launch
-        if (!params.gpu_probe_renderer.empty() && params.gpu_probe_ratio > 0.0f) {
+        if (!probe_renderer.empty() && probe_ratio > 0.0f) {
             auto* ac = wxGetApp().app_config;
             if (ac) {
-                ac->set("arrange", "gpu_probe_renderer", params.gpu_probe_renderer);
+                ac->set("arrange", "gpu_probe_renderer", probe_renderer);
                 ac->set("arrange", "gpu_probe_ratio",
-                        std::to_string(params.gpu_probe_ratio));
+                        std::to_string(probe_ratio));
             }
         }
 

@@ -16,6 +16,8 @@ void snuggle_arrange(
     const ArrangePolygons&    excludes,
     const Points&             bed,
     const ArrangeParams&      params,
-    const Model&              model);
+    const Model&              model,
+    std::string*              out_gpu_renderer = nullptr,
+    float*                    out_gpu_ratio = nullptr);
 
 }} // namespace Slic3r::arrangement
