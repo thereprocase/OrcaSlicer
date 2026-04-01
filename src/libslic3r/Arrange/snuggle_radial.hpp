@@ -254,7 +254,35 @@ inline RadialResult radial_arrange(
             }
         }
 
-        for (float dist = 0; dist <= max_slide; dist += cfg.step_mm) {
+        // Bounding-circle skip: the new part can't fit inside the existing
+        // cluster. Estimate the cluster's inner radius and start searching
+        // from there instead of distance 0.
+        //
+        // For each placed part, its "occupied radius" from bed center is
+        // (distance_to_center + bounding_radius). The cluster occupies at
+        // least as far as the first placed part's radius (the center part).
+        // Start the ring search just inside where the new part's bounding
+        // circle could first clear the innermost placed part.
+        float new_r = std::sqrt(parts[idx].hull_area_mm2 / PI_F);
+        float start_dist = 0.0f;
+        if (!placed_indices.empty()) {
+            // The center part (first placed, at or near bed_cx/bed_cy)
+            // blocks distance 0. Its occupied radius from center is
+            // approximately its own bounding radius.
+            const auto& center = result.placements[placed_indices[0]];
+            float center_r = std::sqrt(parts[placed_indices[0]].hull_area_mm2 / PI_F);
+            float center_dist = std::sqrt(
+                (bed_cx - center.x) * (bed_cx - center.x) +
+                (bed_cy - center.y) * (bed_cy - center.y));
+            // New part needs to clear the center part: start at
+            // (center_dist + center_r + gap - new_r), but back off
+            // a few steps to catch concave interlocking.
+            start_dist = std::max(0.0f,
+                center_dist + center_r + cfg.min_gap_mm - new_r
+                - cfg.step_mm * 3.0f);
+        }
+
+        for (float dist = start_dist; dist <= max_slide; dist += cfg.step_mm) {
             ring_candidates.clear();
 
             int dirs_to_try = std::min(active_directions, (int)directions.size());
