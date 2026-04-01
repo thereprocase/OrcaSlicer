@@ -24,6 +24,11 @@ add_executable(${_TEST_NAME}_tests
     # test_png_io.cpp
     test_indexed_triangle_set.cpp
     test_bitmap_nester.cpp
+    test_bitmap_multibed.cpp
+    test_bitmap_determinism.cpp
+    test_bitmap_geometry.cpp
+    test_bitmap_performance.cpp
+    test_bitmap_overlap.cpp
     ../libnest2d/printer_parts.cpp
     )
 
