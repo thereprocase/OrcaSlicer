@@ -19,6 +19,7 @@
 #include <numeric>
 #include <cmath>
 #include <chrono>
+#include <boost/log/trivial.hpp>
 
 namespace snuggle {
 
@@ -161,25 +162,51 @@ inline RadialResult radial_arrange(
 
     std::vector<size_t> placed_indices;
 
+    // Active search parameters — can be reduced mid-run if over budget
+    int active_directions = n_dirs;
+    int active_rotations  = (int)rot_angles.size();
+    bool degraded = false;
+
     for (size_t rank = 0; rank < n; rank++) {
         size_t idx = order[rank];
 
         // Timeout check
         auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration<double>(now - t_start).count() > cfg.timeout_s) {
+        double elapsed = std::chrono::duration<double>(now - t_start).count();
+        if (elapsed > cfg.timeout_s) {
             result.timed_out = true;
             break;
+        }
+
+        // Graceful degradation: if running over budget, reduce search breadth
+        // rather than timing out with unplaced parts.
+        float remaining_frac = (float)(n - placed_indices.size()) / (float)n;
+        float budget_used = (float)(elapsed / cfg.timeout_s);
+
+        if (budget_used > 0.8f && remaining_frac > 0.4f && active_directions > 6) {
+            active_directions = std::max(6, active_directions / 2);
+            if (!degraded) {
+                BOOST_LOG_TRIVIAL(warning) << "Snuggle: degrading search — "
+                    << active_directions << " dirs (budget " << (int)(budget_used * 100) << "%)";
+                degraded = true;
+            }
+        }
+        if (budget_used > 0.9f && remaining_frac > 0.2f && active_rotations > 4) {
+            active_rotations = std::max(4, active_rotations / 2);
+            BOOST_LOG_TRIVIAL(warning) << "Snuggle: degrading rotations — "
+                << active_rotations << " rots (budget " << (int)(budget_used * 100) << "%)";
         }
 
         if (progress && !progress((int)placed_indices.size(), (int)n, parts[idx].name.c_str()))
             break;
 
-        // Per-part rotation list
+        // Per-part rotation list (may be truncated by degradation)
         std::vector<float> part_rots;
         if (cfg.lock_rotation) {
             part_rots = {parts[idx].initial_zrot};
         } else {
-            part_rots = rot_angles;
+            int n_rots = std::min(active_rotations, (int)rot_angles.size());
+            part_rots.assign(rot_angles.begin(), rot_angles.begin() + n_rots);
         }
 
         // First part: try to place at center with each rotation
@@ -229,12 +256,14 @@ inline RadialResult radial_arrange(
         for (float dist = 0; dist <= max_slide; dist += cfg.step_mm) {
             ring_candidates.clear();
 
+            int dirs_to_try = std::min(active_directions, (int)directions.size());
+
             if (evaluator) {
-                // Batch path: collect all candidates at this distance, evaluate together
+                // Batch path: collect candidates at this distance, evaluate together
                 std::vector<RadialCandidate> batch;
-                for (const auto& [dx, dy] : directions) {
-                    float px = bed_cx + dx * dist;
-                    float py = bed_cy + dy * dist;
+                for (int d = 0; d < dirs_to_try; d++) {
+                    float px = bed_cx + directions[d].first * dist;
+                    float py = bed_cy + directions[d].second * dist;
                     for (float rot : part_rots) {
                         batch.push_back({px, py, rot});
                     }
@@ -248,12 +277,11 @@ inline RadialResult radial_arrange(
 
                 // Scan results: for each direction, take the first valid rotation
                 size_t bi = 0;
-                for (int d = 0; d < cfg.n_directions; d++) {
+                for (int d = 0; d < dirs_to_try; d++) {
                     for (size_t ri = 0; ri < part_rots.size(); ri++, bi++) {
                         if (bi < batch_results.size() && !batch_results[bi].collides) {
                             ring_candidates.push_back({batch[bi].x, batch[bi].y,
                                                        batch[bi].zrot, dist});
-                            // Skip remaining rotations for this direction
                             bi += part_rots.size() - ri - 1;
                             break;
                         }
@@ -261,9 +289,9 @@ inline RadialResult radial_arrange(
                 }
             } else {
                 // Inline CPU path (no evaluator)
-                for (const auto& [dx, dy] : directions) {
-                    float px = bed_cx + dx * dist;
-                    float py = bed_cy + dy * dist;
+                for (int d = 0; d < dirs_to_try; d++) {
+                    float px = bed_cx + directions[d].first * dist;
+                    float py = bed_cy + directions[d].second * dist;
 
                     for (float rot : part_rots) {
                         if (is_valid(idx, px, py, rot, placed_indices, result.placements)) {
