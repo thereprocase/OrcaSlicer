@@ -1125,17 +1125,7 @@ static bool try_bitmap_arrange(ArrangePolygons &arrangables,
 {
     if (!params.use_concave_shapes) return false;
 
-    BitmapNester::Config cfg;
-    cfg.resolution_mm = 0.5;
-    cfg.rotation_steps = params.allow_rotations ? 4 : 1;
-    cfg.spacing = params.min_obj_distance;
-    cfg.bed_shrink_x = params.bed_shrink_x;
-    cfg.bed_shrink_y = params.bed_shrink_y;
-    cfg.allow_multi_materials_on_same_plate = params.allow_multi_materials_on_same_plate;
-    cfg.progress = params.progressind;
-    cfg.stopcondition = params.stopcondition;
-
-    BitmapNester::arrange(arrangables, excludes, bed, cfg);
+    BitmapNester::arrange(arrangables, excludes, bed, params);
     return true;
 }
 
