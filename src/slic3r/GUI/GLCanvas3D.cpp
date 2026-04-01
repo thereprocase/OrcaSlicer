@@ -1138,13 +1138,20 @@ void GLCanvas3D::load_arrange_settings()
     if (!en_rot_sla_str.empty())
         m_arrange_settings_sla.enable_rotation = (en_rot_sla_str == "1" || en_rot_sla_str == "true");
 
-    std::string use_concave_str =
-        wxGetApp().app_config->get("arrange", "use_concave_shapes");
-    if (!use_concave_str.empty()) {
-        bool val = (use_concave_str == "1" || use_concave_str == "true");
-        m_arrange_settings_fff.use_concave_shapes = val;
-        m_arrange_settings_fff_seq_print.use_concave_shapes = val;
-    }
+    std::string use_concave_fff_str =
+        wxGetApp().app_config->get("arrange", "use_concave_shapes_fff");
+    if (!use_concave_fff_str.empty())
+        m_arrange_settings_fff.use_concave_shapes = (use_concave_fff_str == "1" || use_concave_fff_str == "true");
+
+    std::string use_concave_seq_str =
+        wxGetApp().app_config->get("arrange", "use_concave_shapes_fff_seq_print");
+    if (!use_concave_seq_str.empty())
+        m_arrange_settings_fff_seq_print.use_concave_shapes = (use_concave_seq_str == "1" || use_concave_seq_str == "true");
+
+    std::string use_concave_sla_str =
+        wxGetApp().app_config->get("arrange", "use_concave_shapes_sla");
+    if (!use_concave_sla_str.empty())
+        m_arrange_settings_sla.use_concave_shapes = (use_concave_sla_str == "1" || use_concave_sla_str == "true");
 
     //BBS: add specific arrange settings
     m_arrange_settings_fff_seq_print.is_seq_print = true;
@@ -5803,6 +5810,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     std::string multi_material_key = "allow_multi_materials_on_same_plate";
     std::string avoid_extrusion_key = "avoid_extrusion_cali_region";
     std::string align_to_y_axis_key = "align_to_y_axis";
+    std::string concave_key = "use_concave_shapes";
     std::string postfix;
     //BBS:
     bool seq_print = false;
@@ -5822,6 +5830,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     rot_key  += postfix;
     bed_shrink_x_key += postfix;
     bed_shrink_y_key += postfix;
+    concave_key += postfix;
 
     ImGui::AlignTextToFramePadding();
     imgui->text(_L("Spacing"));
@@ -5842,7 +5851,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
 
     if (imgui->bbl_checkbox(_L("Use actual part shape"), settings.use_concave_shapes)) {
         settings_out.use_concave_shapes = settings.use_concave_shapes;
-        appcfg->set("arrange", "use_concave_shapes", settings_out.use_concave_shapes ? "1" : "0");
+        appcfg->set("arrange", concave_key.c_str(), settings_out.use_concave_shapes ? "1" : "0");
         settings_changed = true;
     }
 
@@ -5913,7 +5922,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         appcfg->set("arrange", dist_key, float_to_string_decimal_point(settings_out.distance));
         appcfg->set("arrange", rot_key, settings_out.enable_rotation ? "1" : "0");
         appcfg->set("arrange", align_to_y_axis_key, settings_out.align_to_y_axis ? "1" : "0");
-        appcfg->set("arrange", "use_concave_shapes", settings_out.use_concave_shapes ? "1" : "0");
+        appcfg->set("arrange", concave_key.c_str(), settings_out.use_concave_shapes ? "1" : "0");
         settings_changed = true;
     }
     ImGui::PopStyleVar(1);
