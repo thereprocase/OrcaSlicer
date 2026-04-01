@@ -579,8 +579,9 @@ void ArrangeJob::process(Ctl &ctl)
             auto* ac = wxGetApp().app_config;
             if (ac) {
                 ac->set("arrange", "gpu_probe_renderer", probe_renderer);
-                ac->set("arrange", "gpu_probe_ratio",
-                        std::to_string(probe_ratio));
+                char ratio_buf[32];
+                snprintf(ratio_buf, sizeof(ratio_buf), "%.6f", probe_ratio);
+                ac->set("arrange", "gpu_probe_ratio", ratio_buf);
             }
         }
 

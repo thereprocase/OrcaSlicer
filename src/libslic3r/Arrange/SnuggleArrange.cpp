@@ -33,7 +33,7 @@ void snuggle_arrange(
 {
     BOOST_LOG_TRIVIAL(info) << "Snuggle: starting 3D-aware arrangement for " << items.size() << " items";
 
-    if (items.empty()) return;
+    if (items.empty() || bed.empty()) return;
 
     // ── Determine bed dimensions ──────────────────────────
     BoundingBox bed_bb(bed);

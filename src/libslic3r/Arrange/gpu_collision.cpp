@@ -978,6 +978,7 @@ void GpuCollisionEvaluator::evaluate_radial(
     std::vector<RadialCollisionResult>&   results)
 {
     results.resize(candidates.size());
+    if (candidates.empty()) return;
 
     // Fall back to CPU if GPU isn't available or radial shader failed
     if (!available_ || !radial_program_ || !rot_cache_ptr_) {
