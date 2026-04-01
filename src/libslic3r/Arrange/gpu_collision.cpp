@@ -120,20 +120,29 @@ void CpuCollisionEvaluator::evaluate_radial(
             continue;
         }
 
-        // 9-probe gap-inflated collision check against all placed parts
+        // Gap-inflated collision check against all placed parts.
+        // Skip redundant probes when gap < half voxel (Legolas optimization).
+        bool use_probes = gap_mm >= grid_c.voxel_size * 0.5f;
+        Vec3f off_c_center = {cand.x, cand.y, 0.0f};
+
         for (size_t pi = 0; pi < placed_parts.size() && !results[ci].collides; pi++) {
             const VoxelGrid& grid_p = get_rotated(placed_parts[pi], placed_positions[pi].zrot);
             Vec3f off_p = {placed_positions[pi].x, placed_positions[pi].y, 0.0f};
 
-            for (float dx : {0.0f, gap_mm, -gap_mm}) {
-                if (results[ci].collides) break;
-                for (float dy : {0.0f, gap_mm, -gap_mm}) {
-                    Vec3f off_c = {cand.x + dx, cand.y + dy, 0.0f};
-                    if (VoxelGrid::collision_count(grid_c, off_c, grid_p, off_p) > 0) {
-                        results[ci].collides = true;
-                        break;
+            if (use_probes) {
+                for (float dx : {0.0f, gap_mm, -gap_mm}) {
+                    if (results[ci].collides) break;
+                    for (float dy : {0.0f, gap_mm, -gap_mm}) {
+                        Vec3f off_c = {cand.x + dx, cand.y + dy, 0.0f};
+                        if (VoxelGrid::collision_count(grid_c, off_c, grid_p, off_p) > 0) {
+                            results[ci].collides = true;
+                            break;
+                        }
                     }
                 }
+            } else {
+                if (VoxelGrid::collision_count(grid_c, off_c_center, grid_p, off_p) > 0)
+                    results[ci].collides = true;
             }
         }
     }
@@ -865,8 +874,7 @@ void GpuCollisionEvaluator::evaluate_radial(
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, radial_results_ssbo_);
     glBufferData(GL_SHADER_STORAGE_BUFFER, n_cand * sizeof(uint32_t), nullptr, GL_DYNAMIC_READ);
     // Zero-initialize results
-    std::vector<uint32_t> zeros(n_cand, 0);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, n_cand * sizeof(uint32_t), zeros.data());
+    // No zero-init needed — shader writes every slot (0 or 1)
 
     // Bind SSBOs
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, voxel_ssbo_);

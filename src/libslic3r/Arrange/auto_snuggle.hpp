@@ -90,8 +90,9 @@ inline AutoSnuggleConfig compute_auto_config(
     // Clamp to sane range
     voxel = std::clamp(voxel, 0.5f, 5.0f);
 
-    // GPU bonus: can afford finer resolution
-    if (has_gpu) {
+    // GPU bonus: can afford finer resolution (only worth it above 5 parts
+    // where dispatch overhead is amortized across enough candidates)
+    if (has_gpu && n_parts > 5) {
         voxel *= 0.75f;
         voxel = std::clamp(voxel, 0.5f, 5.0f);
     }
