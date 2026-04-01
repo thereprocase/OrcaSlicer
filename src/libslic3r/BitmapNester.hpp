@@ -109,6 +109,7 @@ public:
 
                         // Bit-shift to align item bitmap to bed position
                         int bit_offset = px + wx * 64;
+                        if (bit_offset < 0 || bit_offset >= bw) continue;
                         int bed_word = bit_offset / 64;
                         int shift = bit_offset % 64;
 
@@ -139,6 +140,7 @@ public:
                         if (word == 0) continue;
 
                         int bit_offset = px + wx * 64;
+                        if (bit_offset < 0 || bit_offset >= bw) continue;
                         int bed_word = bit_offset / 64;
                         int shift = bit_offset % 64;
 
@@ -327,63 +329,31 @@ public:
                 plates[best_plate].stamp(best_bm, best_iw, best_ih, best_iwpr,
                                         best_px, best_py);
 
-                // Convert pixel position back to scaled coordinates
-                // best_px is relative to the rasterized inflated polygon's bbox min
-                // The polygon was rasterized relative to its own bbox.
-                ExPolygon placed_poly = item.poly;
-                if (best_rot != 0.0) placed_poly.rotate(best_rot);
-                ExPolygons placed_infl;
-                if (pad_px > 0) {
-                    placed_infl = offset_ex(placed_poly, scaled(pad_px * res));
-                    if (!placed_infl.empty()) placed_poly = placed_infl.front();
-                }
-                BoundingBox pbb = get_extents(placed_poly);
+                // Convert pixel position back to the polygon's origin in absolute
+                // bed coordinates. apply_arrange_result() interprets translation as
+                // the absolute position of the polygon's local (0,0) point.
+                //
+                // The rasterizer places the inflated polygon's bbox.min at pixel
+                // (best_px, best_py). The actual (uninflated, rotated) polygon's
+                // bbox.min is offset inward from the inflated bbox by pad_px pixels.
+                // The polygon's (0,0) is at -bbox.min relative to the bbox corner.
+                //
+                // So: origin_in_bed_mm = pixel_to_mm(best_px) + pad_offset_mm
+                //                        - unscaled(rotated_bbox.min) + unscaled(ebed.min)
 
-                // Pixel position → world position
-                double world_x = best_px * res + unscaled<double>(pbb.min.x());
-                double world_y = best_py * res + unscaled<double>(pbb.min.y());
+                ExPolygon rot_poly = item.poly;
+                if (best_rot != 0.0) rot_poly.rotate(best_rot);
+                BoundingBox rot_bb = get_extents(rot_poly);
 
-                // We need the center of the original (un-rotated) polygon's bbox
-                // as the reference point, since translation is from origin
-                BoundingBox orig_bb = get_extents(item.poly);
-                double cx = unscaled<double>(orig_bb.center().x());
-                double cy = unscaled<double>(orig_bb.center().y());
+                double pad_mm = pad_px * res;
+                double origin_x = (best_px * res + pad_mm)
+                                  - unscaled<double>(rot_bb.min.x())
+                                  + unscaled<double>(ebed.min.x());
+                double origin_y = (best_py * res + pad_mm)
+                                  - unscaled<double>(rot_bb.min.y())
+                                  + unscaled<double>(ebed.min.y());
 
-                // The placed position in bed coordinates
-                BoundingBox rot_bb = get_extents([&]{
-                    ExPolygon r = item.poly;
-                    if (best_rot != 0.0) r.rotate(best_rot);
-                    return r;
-                }());
-
-                // Translation = bed_position - original_center
-                // bed_position is the center of where the rotated poly landed
-                double placed_cx = (best_px + best_iw * 0.5) * res;
-                double placed_cy = (best_py + best_ih * 0.5) * res;
-
-                // Convert to absolute bed coordinates
-                double abs_x = placed_cx + unscaled<double>(ebed.min.x());
-                double abs_y = placed_cy + unscaled<double>(ebed.min.y());
-
-                // Correct for the inflation offset: the rasterized shape includes
-                // padding, so its center is the center of the padded shape.
-                // We want the center of the actual shape.
-                if (pad_px > 0) {
-                    BoundingBox actual_rot_bb = get_extents([&]{
-                        ExPolygon r = item.poly;
-                        if (best_rot != 0.0) r.rotate(best_rot);
-                        return r;
-                    }());
-                    double actual_w = unscaled<double>(actual_rot_bb.size().x());
-                    double actual_h = unscaled<double>(actual_rot_bb.size().y());
-                    double padded_w = best_iw * res;
-                    double padded_h = best_ih * res;
-                    // Center of actual shape within padded raster
-                    abs_x += (actual_w - padded_w) * 0.5;
-                    abs_y += (actual_h - padded_h) * 0.5;
-                }
-
-                item.translation = Vec2crd{scaled(abs_x), scaled(abs_y)};
+                item.translation = Vec2crd{scaled(origin_x), scaled(origin_y)};
                 item.rotation = best_rot;
                 item.bed_idx = best_plate;
             } else {
