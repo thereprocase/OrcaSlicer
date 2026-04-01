@@ -198,8 +198,8 @@ inline RadialResult radial_arrange(
         // Expand outward from center in concentric rings.
         // At each distance, try ALL directions and ALL rotations.
         // Collect all valid placements at the first distance that works,
-        // then pick the one that best fills the ring (maximizes minimum
-        // distance to already-placed parts).
+        // then pick the tightest fit (minimizes distance to nearest
+        // placed part — parts cluster instead of scattering).
         //
         // When an evaluator is provided, batch all candidates per ring
         // for GPU dispatch. Otherwise, use inline collision checks (CPU).
