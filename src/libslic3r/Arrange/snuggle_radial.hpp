@@ -254,27 +254,26 @@ inline RadialResult radial_arrange(
             }
         }
 
-        // Outside-in search: start from where we definitely fit (far out,
-        // beyond all placed parts) and walk inward until we stop fitting.
-        // The last ring that had any valid candidates is the tightest fit.
+        // Outside-in search from the cluster's farthest edge.
         //
-        // This is faster than inside-out because:
-        // 1. Far-out rings are cheap (AABB early-exit, nothing overlaps)
-        // 2. We converge on the tight fit from outside, correct direction
-        // 3. No wasted work scanning through the dense cluster interior
+        // For each placed part, its "edge distance" from bed center is
+        // dist_to_center + bounding_radius. The cluster's frontier is the
+        // max of those. Start the new part at frontier + new_radius + gap
+        // and walk inward until we stop fitting. The last valid ring is
+        // the tightest fit.
         //
-        // Compute outer start: farthest placed part's edge + our radius
+        // O(N) computation, conservative by ~1 part radius (2-4 steps).
         float new_r = std::sqrt(parts[idx].hull_area_mm2 / PI_F);
         float outer_start = 0.0f;
         for (size_t pi : placed_indices) {
             const auto& pp = result.placements[pi];
-            float dx = bed_cx - pp.x, dy = bed_cy - pp.y;
-            float pd = std::sqrt(dx * dx + dy * dy);
+            float dx = pp.x - bed_cx, dy = pp.y - bed_cy;
+            float dist = std::sqrt(dx * dx + dy * dy);
             float pr = std::sqrt(parts[pi].hull_area_mm2 / PI_F);
-            outer_start = std::max(outer_start, pd + pr + cfg.min_gap_mm + new_r);
+            outer_start = std::max(outer_start, dist + pr);
         }
-        // Add a small buffer and cap at max_slide
-        outer_start = std::min(outer_start + cfg.step_mm * 2.0f, max_slide);
+        outer_start += new_r + cfg.min_gap_mm;
+        outer_start = std::min(outer_start, max_slide);
 
         // Walk inward. Track the best (innermost) ring that had candidates.
         std::vector<Candidate> best_ring;
