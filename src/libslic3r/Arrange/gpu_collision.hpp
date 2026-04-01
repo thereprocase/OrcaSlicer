@@ -144,7 +144,9 @@ private:
     std::string renderer_name_;
 
     bool compile_radial_shader();
+public:
     void probe_gpu_performance();  // micro-benchmark to decide GPU vs CPU
+private:
     // Context (platform-specific, stored as opaque pointers)
     void* gl_context_ = nullptr;
     void* gl_dc_ = nullptr;

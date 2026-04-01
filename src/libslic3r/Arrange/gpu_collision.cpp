@@ -459,18 +459,20 @@ void GpuCollisionEvaluator::probe_gpu_performance()
     // Build a tiny 8x8x8 voxel grid, run GPU and CPU 5 times, take best-of-5.
     // If GPU hangs or total probe takes >500ms, GPU loses by default.
 
-    constexpr int PROBE_N = 64;
-    constexpr int PROBE_GRID = 8;
+    // Use a realistic workload so compute dominates overhead.
+    // Tiny grids would bias toward CPU (overhead dominates GPU path).
+    constexpr int PROBE_N = 576;   // one full ring of candidates
+    constexpr int PROBE_GRID = 32; // 32³ = 32K voxels, ~realistic part size
 
     // Build a tiny solid grid
     VoxelGrid probe_grid;
-    probe_grid.nx = probe_grid.ny = probe_grid.nz = PROBE_GRID;
-    probe_grid.voxel_size = 2.0f;
+    probe_grid.allocate(PROBE_GRID, PROBE_GRID, PROBE_GRID, 2.0f);
     probe_grid.origin = {0, 0, 0};
-    size_t total_bits = PROBE_GRID * PROBE_GRID * PROBE_GRID;
-    size_t n_bytes = (total_bits + 7) / 8;
-    std::vector<uint8_t> bits(n_bytes, 0xFF); // all solid
-    probe_grid.set_bits(bits.data(), n_bytes);
+    // Fill all voxels solid
+    for (int z = 0; z < PROBE_GRID; z++)
+        for (int y = 0; y < PROBE_GRID; y++)
+            for (int x = 0; x < PROBE_GRID; x++)
+                probe_grid.set(x, y, z);
 
     // Build rot_cache with 1 bin
     std::vector<std::vector<VoxelGrid>> probe_cache(1);
