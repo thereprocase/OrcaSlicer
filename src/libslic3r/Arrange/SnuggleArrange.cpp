@@ -330,6 +330,11 @@ void snuggle_arrange(
             if (gpu->gpu_cpu_ratio() <= 0.0f)
                 gpu->probe_gpu_performance();
 
+            // Write probe result back for persistent caching
+            // (ArrangeJob reads these after arrange completes and saves to AppConfig)
+            const_cast<ArrangeParams&>(params).gpu_probe_renderer = gpu->renderer();
+            const_cast<ArrangeParams&>(params).gpu_probe_ratio = gpu->gpu_cpu_ratio();
+
             if (gpu->is_worthwhile()) {
                 BOOST_LOG_TRIVIAL(warning) << "Snuggle: using GPU evaluator ("
                     << gpu->renderer() << ", ratio=" << gpu->gpu_cpu_ratio() << ")";

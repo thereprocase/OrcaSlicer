@@ -466,7 +466,8 @@ void GpuCollisionEvaluator::probe_gpu_performance()
 
     // Build a tiny solid grid
     VoxelGrid probe_grid;
-    probe_grid.allocate(PROBE_GRID, PROBE_GRID, PROBE_GRID, 2.0f);
+    probe_grid.allocate(PROBE_GRID, PROBE_GRID, PROBE_GRID);
+    probe_grid.voxel_size = 2.0f;
     probe_grid.origin = {0, 0, 0};
     // Fill all voxels solid
     for (int z = 0; z < PROBE_GRID; z++)

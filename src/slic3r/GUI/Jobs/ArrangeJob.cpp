@@ -571,6 +571,13 @@ void ArrangeJob::process(Ctl &ctl)
         arrangement::snuggle_arrange(m_selected, m_unselected, bedpts, params,
                                      m_plater->model());
 
+        // Persist GPU probe result so we don't re-benchmark next launch
+        if (!params.gpu_probe_renderer.empty() && params.gpu_probe_ratio > 0.0f && appcfg) {
+            appcfg->set("arrange", "gpu_probe_renderer", params.gpu_probe_renderer);
+            appcfg->set("arrange", "gpu_probe_ratio",
+                        std::to_string(params.gpu_probe_ratio));
+        }
+
         // Overflow fallback: if Snuggle left items unarranged, pass them
         // to the default arranger with Snuggle-placed items as fixed obstacles.
         bool has_unarranged = false;
@@ -875,6 +882,15 @@ arrangement::ArrangeParams init_arrange_params(Plater *p)
     params.snuggle_multi_plate                 = settings.snuggle_multi_plate;
     params.snuggle_use_gpu                     = settings.snuggle_use_gpu;
     params.snuggle_auto_mode                   = settings.snuggle_auto_mode;
+
+    // Load GPU probe cache from persistent config
+    auto* appcfg = wxGetApp().app_config;
+    if (appcfg) {
+        params.gpu_probe_renderer = appcfg->get("arrange", "gpu_probe_renderer");
+        std::string ratio_str = appcfg->get("arrange", "gpu_probe_ratio");
+        if (!ratio_str.empty())
+            try { params.gpu_probe_ratio = std::stof(ratio_str); } catch (...) {}
+    }
 
     int state = p->get_prepare_state();
     if (state == Job::JobPrepareState::PREPARE_STATE_MENU) {
