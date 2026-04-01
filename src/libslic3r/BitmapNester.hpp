@@ -155,9 +155,9 @@ public:
             else if (params.min_obj_distance > 0)
                 pad_px = std::max(1, (int)std::ceil(unscaled<double>(params.min_obj_distance / 2) / res));
 
-            // Use item's allowed rotations, or default list
-            const auto &rots = (item.allowed_rotations.size() > 1 ||
-                               (item.allowed_rotations.size() == 1 && item.allowed_rotations[0] != 0.0))
+            // Use item's allowed rotations if specified, otherwise default list.
+            // {0.0} means "rotation locked to 0" — respect it, don't override.
+            const auto &rots = !item.allowed_rotations.empty()
                                ? item.allowed_rotations : default_rotations;
 
             bool placed = false;
