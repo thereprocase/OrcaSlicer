@@ -156,7 +156,7 @@ inline RadialResult radial_arrange(
     int n_dirs = std::max(1, cfg.n_directions);
     std::vector<std::pair<float, float>> directions; // (dx, dy) unit vectors
     for (int d = 0; d < n_dirs; d++) {
-        float angle = (float)d * TWO_PI_F / cfg.n_directions;
+        float angle = (float)d * TWO_PI_F / n_dirs;
         directions.push_back({std::cos(angle), std::sin(angle)});
     }
 
@@ -219,8 +219,9 @@ inline RadialResult radial_arrange(
                 }
             }
             if (!result.placements[idx].placed) {
-                // Can't even place at center — try origin
-                result.placements[idx] = {bed_cx, bed_cy, part_rots[0], 0, 0, false};
+                // Can't even place at center — mark unplaced
+                float fallback_rot = part_rots.empty() ? 0.0f : part_rots[0];
+                result.placements[idx] = {bed_cx, bed_cy, fallback_rot, 0, 0, false};
             }
             continue;
         }
