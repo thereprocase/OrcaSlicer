@@ -5,6 +5,8 @@
 #include "libslic3r/MTUtils.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/ModelArrange.hpp"
+#include "libslic3r/TriangleMeshSlicer.hpp"
+#include "libslic3r/ClipperUtils.hpp"
 
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/GLCanvas3D.hpp"
@@ -564,6 +566,66 @@ void ArrangeJob::process(Ctl &ctl)
             <<", bbox:"<<get_extents(item.poly).min.transpose()<<","<<get_extents(item.poly).max.transpose();
     }
 
+    // When concave shapes are enabled, replace convex hull silhouettes with
+    // actual 2D outlines projected from the mesh. This allows the bitmap nester
+    // to interlock concave parts (crescents, L-brackets, etc.) instead of treating
+    // them as convex blobs.
+    if (params.use_concave_shapes) {
+        auto &model = m_plater->model();
+        for (auto &ap : m_selected) {
+            // Find the ModelInstance this ArrangePolygon corresponds to
+            for (auto *obj : model.objects) {
+                for (auto *inst : obj->instances) {
+                    Vec2crd inst_pos{scaled(inst->get_offset(X)), scaled(inst->get_offset(Y))};
+                    // Match by translation (the unique identifier set in get_arrange_polygon)
+                    if (inst_pos == ap.translation) {
+                        // Build the instance transform without XY offset and Z rotation
+                        Vec3d rotation = inst->get_rotation();
+                        rotation.z() = 0.;
+                        Geometry::Transformation t(inst->get_transformation());
+                        t.set_offset(inst->get_offset().z() * Vec3d::UnitZ());
+                        t.set_rotation(rotation);
+
+                        // Project all model-part volumes to 2D using project_mesh
+                        Polygons top_polys, bottom_polys;
+                        for (auto *vol : obj->volumes) {
+                            if (!vol->is_model_part()) continue;
+                            Transform3d full_trafo = t.get_matrix() * vol->get_matrix();
+                            Polygons vtop, vbot;
+                            project_mesh(vol->mesh().its, full_trafo, &vtop, &vbot, []{});
+                            append(top_polys, vtop);
+                            append(bottom_polys, vbot);
+                        }
+
+                        // Union all projected polygons to get concave 2D silhouette
+                        Polygons all_polys;
+                        append(all_polys, top_polys);
+                        append(all_polys, bottom_polys);
+                        ExPolygons silhouette = union_ex(all_polys);
+
+                        if (!silhouette.empty()) {
+                            // Use the largest polygon as the silhouette
+                            auto largest = std::max_element(silhouette.begin(), silhouette.end(),
+                                [](const ExPolygon &a, const ExPolygon &b) {
+                                    return std::abs(a.area()) < std::abs(b.area());
+                                });
+                            // Simplify to reduce vertex count (0.1mm tolerance)
+                            ExPolygons simplified = offset_ex(
+                                offset_ex(*largest, scaled(-0.05)),
+                                scaled(0.05));
+                            if (!simplified.empty())
+                                ap.poly = simplified.front();
+                            else
+                                ap.poly = *largest;
+                        }
+                        goto next_item;
+                    }
+                }
+            }
+            next_item:;
+        }
+    }
+
     arrangement::arrange(m_selected, m_unselected, bedpts, params);
 
     // sort by item id
@@ -780,6 +842,7 @@ arrangement::ArrangeParams init_arrange_params(Plater *p)
     params.is_seq_print                        = settings.is_seq_print;
     params.min_obj_distance                    = scaled(settings.distance);
     params.align_to_y_axis                     = settings.align_to_y_axis;
+    params.use_concave_shapes                  = settings.use_concave_shapes;
 
     int state = p->get_prepare_state();
     if (state == Job::JobPrepareState::PREPARE_STATE_MENU) {

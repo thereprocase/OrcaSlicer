@@ -1138,6 +1138,14 @@ void GLCanvas3D::load_arrange_settings()
     if (!en_rot_sla_str.empty())
         m_arrange_settings_sla.enable_rotation = (en_rot_sla_str == "1" || en_rot_sla_str == "true");
 
+    std::string use_concave_str =
+        wxGetApp().app_config->get("arrange", "use_concave_shapes");
+    if (!use_concave_str.empty()) {
+        bool val = (use_concave_str == "1" || use_concave_str == "true");
+        m_arrange_settings_fff.use_concave_shapes = val;
+        m_arrange_settings_fff_seq_print.use_concave_shapes = val;
+    }
+
     //BBS: add specific arrange settings
     m_arrange_settings_fff_seq_print.is_seq_print = true;
 }
@@ -5832,6 +5840,12 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     }
     imgui->text(_L("0 means auto spacing."));
 
+    if (imgui->bbl_checkbox(_L("Use actual part shape"), settings.use_concave_shapes)) {
+        settings_out.use_concave_shapes = settings.use_concave_shapes;
+        appcfg->set("arrange", "use_concave_shapes", settings_out.use_concave_shapes ? "1" : "0");
+        settings_changed = true;
+    }
+
     ImGui::Separator();
     if (imgui->bbl_checkbox(_L("Auto rotate for arrangement"), settings.enable_rotation)) {
         settings_out.enable_rotation = settings.enable_rotation;
@@ -5899,6 +5913,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         appcfg->set("arrange", dist_key, float_to_string_decimal_point(settings_out.distance));
         appcfg->set("arrange", rot_key, settings_out.enable_rotation ? "1" : "0");
         appcfg->set("arrange", align_to_y_axis_key, settings_out.align_to_y_axis ? "1" : "0");
+        appcfg->set("arrange", "use_concave_shapes", settings_out.use_concave_shapes ? "1" : "0");
         settings_changed = true;
     }
     ImGui::PopStyleVar(1);

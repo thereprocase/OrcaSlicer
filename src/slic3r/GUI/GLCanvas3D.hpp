@@ -496,6 +496,7 @@ public:
         //BBS: add more arrangeSettings
         bool is_seq_print        = false;
         bool  align_to_y_axis    = false;
+        bool  use_concave_shapes = false;
     };
 
     struct OrientSettings

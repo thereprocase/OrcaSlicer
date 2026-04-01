@@ -1,4 +1,5 @@
 #include "Arrange.hpp"
+#include "BitmapNester.hpp"
 #include "Print.hpp"
 #include "BoundingBox.hpp"
 #include "libslic3r.h"
@@ -1116,12 +1117,47 @@ void arrange(ArrangePolygons &      items,
     });
 }
 
+// Bitmap nester dispatch for rectangular beds
+static bool try_bitmap_arrange(ArrangePolygons &arrangables,
+                               const ArrangePolygons &excludes,
+                               const BoundingBox &bed,
+                               const ArrangeParams &params)
+{
+    if (!params.use_concave_shapes) return false;
+
+    BitmapNester::Config cfg;
+    cfg.resolution_mm = 0.5;
+    cfg.rotation_steps = params.allow_rotations ? 4 : 1;
+    cfg.spacing = params.min_obj_distance;
+    cfg.bed_shrink_x = params.bed_shrink_x;
+    cfg.bed_shrink_y = params.bed_shrink_y;
+    cfg.allow_multi_materials_on_same_plate = params.allow_multi_materials_on_same_plate;
+    cfg.progress = params.progressind;
+    cfg.stopcondition = params.stopcondition;
+
+    BitmapNester::arrange(arrangables, excludes, bed, cfg);
+    return true;
+}
+
+// Fallback overloads for non-rectangular beds — bitmap nester only supports BoundingBox
+template<class BedT>
+static bool try_bitmap_arrange(ArrangePolygons &, const ArrangePolygons &,
+                               const BedT &, const ArrangeParams &)
+{
+    return false;
+}
+
 template<class BedT>
 void arrange(ArrangePolygons &      arrangables,
              const ArrangePolygons &excludes,
              const BedT &           bed,
              const ArrangeParams &  params)
 {
+    // Try bitmap nester first (rectangular beds only, when enabled)
+    if (try_bitmap_arrange(arrangables, excludes, bed, params))
+        return;
+
+    // Fall through to libnest2d convex hull path
     namespace clppr = Slic3r::ClipperLib;
 
     std::vector<Item> items, fixeditems;
