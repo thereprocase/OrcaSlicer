@@ -83,13 +83,15 @@ inline RadialResult radial_arrange(
     });
 
     // Helper: get rotated grid from cache
+    // Lookup rotated grid from cache. Cache may have any number of bins
+    // (24 for radial, 1 for lock_rotation). Index by angle → bin.
     auto get_rot = [&](size_t part_idx, float angle) -> const VoxelGrid& {
         static const VoxelGrid empty;
         if (part_idx >= rot_cache.size() || rot_cache[part_idx].empty())
             return empty;
-        int bin = (int)std::floor(angle * ROT_CACHE_BINS / TWO_PI_F);
-        bin = ((bin % ROT_CACHE_BINS) + ROT_CACHE_BINS) % ROT_CACHE_BINS;
-        if (bin >= (int)rot_cache[part_idx].size()) bin = 0;
+        int n_bins = (int)rot_cache[part_idx].size();
+        int bin = (int)std::floor(angle * n_bins / TWO_PI_F);
+        bin = ((bin % n_bins) + n_bins) % n_bins;
         return rot_cache[part_idx][bin];
     };
 
@@ -150,8 +152,9 @@ inline RadialResult radial_arrange(
     }
 
     // Build radial direction list
+    int n_dirs = std::max(1, cfg.n_directions);
     std::vector<std::pair<float, float>> directions; // (dx, dy) unit vectors
-    for (int d = 0; d < cfg.n_directions; d++) {
+    for (int d = 0; d < n_dirs; d++) {
         float angle = (float)d * TWO_PI_F / cfg.n_directions;
         directions.push_back({std::cos(angle), std::sin(angle)});
     }

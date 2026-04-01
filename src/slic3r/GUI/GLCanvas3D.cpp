@@ -5934,7 +5934,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     // When Snuggle is on, explain that it manages rotation differently
     if (settings_out.use_snuggle) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
-        imgui->text(_L("Snuggle controls rotation \u2014 see Rotation dropdown below"));
+        imgui->text(_L("Snuggle overrides auto-rotate \u2014 use Rotation below"));
         ImGui::PopStyleColor();
     }
 
@@ -5946,7 +5946,7 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         imgui->text(_L("Part gap"));
         ImGui::SameLine(1.2 * cursor_slider_left);
         ImGui::PushItemWidth(window_width - slider_icon_width);
-        bool b_padding = imgui->bbl_slider_float_style("##SnugglePadding", &settings.snuggle_padding_mm, 0.0f, 20.0f, "%4.1f");
+        bool b_padding = imgui->bbl_slider_float_style("##SnugglePadding", &settings.snuggle_padding_mm, 0.0f, 20.0f, "%4.1f mm");
         ImGui::SameLine(window_width - slider_icon_width + 1.3 * cursor_slider_left);
         ImGui::PushItemWidth(1.5 * slider_icon_width);
         bool b_padding_input = ImGui::BBLDragFloat("##snuggle_padding_input", &settings.snuggle_padding_mm, 0.1f, 0.0f, 20.0f, "%.1f");
@@ -5956,8 +5956,11 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
             appcfg->set("arrange", "snuggle_padding_mm", float_to_string_decimal_point(settings_out.snuggle_padding_mm));
             settings_changed = true;
         }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", _u8L("Minimum gap between parts in mm.\n"
+                                          "1.5 mm is safe for FDM. Increase for easier part removal.").c_str());
 
-        if (imgui->bbl_checkbox(_L("Compact after arrange"), settings.snuggle_compact)) {
+        if (imgui->bbl_checkbox(_L("Close gaps"), settings.snuggle_compact)) {
             settings_out.snuggle_compact = settings.snuggle_compact;
             appcfg->set("arrange", "snuggle_compact", settings_out.snuggle_compact ? "1" : "0");
             settings_changed = true;
@@ -5992,9 +5995,9 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
                                           "Locked = parts keep their current rotation.\n"
                                           "90\xC2\xB0 = try 0, 90, 180, 270 from starting position.").c_str());
 
-        // Resolution
+        // Detail level (voxel size)
         ImGui::AlignTextToFramePadding();
-        imgui->text(_L("Voxel size"));
+        imgui->text(_L("Detail level"));
         ImGui::SameLine(1.2 * cursor_slider_left);
         ImGui::PushItemWidth(window_width - slider_icon_width);
         bool b_voxel = imgui->bbl_slider_float_style("##SnuggleVoxel", &settings.snuggle_voxel_mm, 0.5f, 5.0f, "%3.1f mm");
@@ -6008,8 +6011,9 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
             settings_changed = true;
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", _u8L("Voxel size in mm. Lower = more precise but slower.\n"
-                                          "2.0 mm is a good default. 0.5 mm for tight packing.").c_str());
+            ImGui::SetTooltip("%s", _u8L("Grid resolution in mm. Lower = more precise but slower.\n"
+                                          "2.0 mm is a good default. 0.5 mm for tight packing.\n"
+                                          "Higher values use less memory and are faster for many parts.").c_str());
 
         // ── Collapsible advanced menu ──────────────────────────
         if (ImGui::TreeNode(_u8L("Advanced").c_str())) {
@@ -6023,6 +6027,9 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
                 appcfg->set("arrange", "snuggle_timeout_s", float_to_string_decimal_point(settings_out.snuggle_timeout_s));
                 settings_changed = true;
             }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", _u8L("Maximum time in seconds before giving up.\n"
+                                              "15s is plenty for 5-20 parts. Increase for large plates.").c_str());
 
             ImGui::AlignTextToFramePadding();
             imgui->text(_L("Max parts"));
@@ -6034,22 +6041,28 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
                 appcfg->set("arrange", "snuggle_max_parts", std::to_string(settings_out.snuggle_max_parts));
                 settings_changed = true;
             }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", _u8L("Parts above this limit fall back to standard arrange.\n"
+                                              "50 is a good default. Snuggle works best with 5-30 parts.").c_str());
 
             if (imgui->bbl_checkbox(_L("Multi-plate overflow"), settings.snuggle_multi_plate)) {
                 settings_out.snuggle_multi_plate = settings.snuggle_multi_plate;
                 appcfg->set("arrange", "snuggle_multi_plate", settings_out.snuggle_multi_plate ? "1" : "0");
                 settings_changed = true;
             }
-
-            if (imgui->bbl_checkbox(_L("GPU acceleration"), settings.snuggle_use_gpu)) {
-                settings_out.snuggle_use_gpu = settings.snuggle_use_gpu;
-                appcfg->set("arrange", "snuggle_use_gpu", settings_out.snuggle_use_gpu ? "1" : "0");
-                settings_changed = true;
-            }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", _u8L("Use GPU compute shaders for collision detection.\n"
-                                              "Falls back to CPU automatically if GPU is unavailable.\n"
-                                              "Disable for debugging or if GPU causes issues.").c_str());
+                ImGui::SetTooltip("%s", _u8L("When parts don't fit on one plate, overflow to additional plates\n"
+                                              "instead of leaving them unarranged.").c_str());
+
+            imgui->disabled_begin(true);
+            bool gpu_dummy = settings.snuggle_use_gpu;
+            if (imgui->bbl_checkbox(_L("GPU acceleration (coming soon)"), gpu_dummy)) {
+                // GPU shader not yet implemented — checkbox is read-only
+            }
+            imgui->disabled_end();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", _u8L("GPU compute shader acceleration is designed but not yet implemented.\n"
+                                              "Currently uses CPU. Enable this once a future update adds GPU support.").c_str());
 
             ImGui::TreePop();
         }

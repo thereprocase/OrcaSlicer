@@ -57,7 +57,11 @@ void snuggle_arrange(
     if (items.size() > max_parts) {
         BOOST_LOG_TRIVIAL(warning) << "Snuggle: " << items.size() << " parts exceeds limit ("
             << max_parts << "). Falling back to standard arranger.";
-        // Mark all UNARRANGED so ArrangeJob overflow fallback triggers
+        if (params.progressind) {
+            std::string msg = " (Snuggle bypassed: " + std::to_string(items.size())
+                + " parts exceeds limit of " + std::to_string(max_parts) + ")";
+            params.progressind(0, msg);
+        }
         for (auto& item : items) item.bed_idx = -1;
         return;
     }
@@ -114,7 +118,7 @@ void snuggle_arrange(
     for (size_t i = 0; i < items.size(); i++) {
         snuggle::PartInfo pi;
         pi.name = items[i].name;
-        pi.initial_zrot = (float)items[i].rotation;
+        pi.initial_zrot = std::isfinite((float)items[i].rotation) ? (float)items[i].rotation : 0.0f;
 
         // Find matching instance by name (first unused match)
         const ModelObject* obj = nullptr;
@@ -233,16 +237,21 @@ void snuggle_arrange(
         << ", step=" << rcfg.step_mm << "mm, margin=" << rcfg.bed_margin_mm << "mm"
         << ", lock_rot=" << rcfg.lock_rotation;
 
-    // Build rotation cache for radial nester
+    // Build rotation cache — only n_rotations bins, not 360.
+    // Memory: 0.8 MB/part at 24 bins vs 12 MB/part at 360 (Legolas optimization).
+    int cache_bins = rcfg.lock_rotation ? 1 : std::max(1, rcfg.n_rotations);
+    BOOST_LOG_TRIVIAL(warning) << "Snuggle: building rotation cache: "
+        << cache_bins << " bins x " << parts.size() << " parts";
+
     std::vector<std::vector<snuggle::VoxelGrid>> rot_cache(parts.size());
     for (size_t i = 0; i < parts.size(); i++) {
         if (rcfg.lock_rotation) {
-            snuggle::VoxelGrid single = parts[i].grid.rotated_copy(parts[i].initial_zrot);
-            rot_cache[i].resize(snuggle::ROT_CACHE_BINS, single);
+            rot_cache[i].resize(1);
+            rot_cache[i][0] = parts[i].grid.rotated_copy(parts[i].initial_zrot);
         } else {
-            rot_cache[i].resize(snuggle::ROT_CACHE_BINS);
-            for (int bin = 0; bin < snuggle::ROT_CACHE_BINS; bin++) {
-                float angle = (float)bin * snuggle::TWO_PI_F / snuggle::ROT_CACHE_BINS;
+            rot_cache[i].resize(cache_bins);
+            for (int bin = 0; bin < cache_bins; bin++) {
+                float angle = (float)bin * snuggle::TWO_PI_F / cache_bins;
                 rot_cache[i][bin] = parts[i].grid.rotated_copy(angle);
             }
         }
