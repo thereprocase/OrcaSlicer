@@ -134,6 +134,9 @@ struct ArrangeParams {
     bool  snuggle_multi_plate    = true;
     bool  snuggle_use_gpu        = true;   // GPU radial shader implemented — try GPU first
     bool  snuggle_auto_mode      = true;   // AutoSnuggle picks params from part count/size
+    // GPU probe cache (persisted to avoid re-benchmarking)
+    std::string gpu_probe_renderer;         // GL_RENDERER at last probe
+    float gpu_probe_ratio        = 0.0f;   // GPU/CPU timing ratio (0 = not probed)
     // Legacy GA fields (unused by radial nester, kept for config compat)
     int   snuggle_population     = 64;
     int   snuggle_generations    = 30;

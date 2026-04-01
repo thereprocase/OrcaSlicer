@@ -96,6 +96,18 @@ public:
     ~GpuCollisionEvaluator() override;
 
     bool is_available() const { return available_; }
+    bool is_worthwhile() const { return available_ && gpu_cpu_ratio_ > 0.0f && gpu_cpu_ratio_ < 1.0f; }
+    float gpu_cpu_ratio() const { return gpu_cpu_ratio_; }
+    const std::string& renderer() const { return renderer_name_; }
+
+    // Set cached probe result (skip re-benchmark if renderer matches)
+    void set_cached_probe(const std::string& cached_renderer, float cached_ratio) {
+        if (cached_renderer == renderer_name_ && cached_ratio > 0.0f) {
+            gpu_cpu_ratio_ = cached_ratio;
+            BOOST_LOG_TRIVIAL(info) << "Snuggle GPU: using cached probe ratio="
+                << cached_ratio << " for " << renderer_name_;
+        }
+    }
 
     void upload_grids(const std::vector<PartInfo>& parts,
                       const std::vector<std::vector<VoxelGrid>>& rot_cache) override;
@@ -128,8 +140,11 @@ private:
     // CPU fallback for evaluate_radial when shader isn't ready
     const std::vector<std::vector<VoxelGrid>>* rot_cache_ptr_ = nullptr;
     int actual_rot_bins_ = 0;  // actual cache size per part (may differ from ROT_BINS)
+    float gpu_cpu_ratio_ = 0.0f;  // <1 means GPU is faster. 0 = not yet probed.
+    std::string renderer_name_;
 
     bool compile_radial_shader();
+    void probe_gpu_performance();  // micro-benchmark to decide GPU vs CPU
     // Context (platform-specific, stored as opaque pointers)
     void* gl_context_ = nullptr;
     void* gl_dc_ = nullptr;

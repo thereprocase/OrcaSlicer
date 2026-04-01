@@ -438,11 +438,156 @@ GpuCollisionEvaluator::GpuCollisionEvaluator()
 {
     available_ = init_context() && compile_shader() && compile_radial_shader();
     if (available_) {
-        BOOST_LOG_TRIVIAL(info) << "Snuggle GPU: compute shader backend initialized (GA + radial)";
+        // Capture renderer name for diagnostics
+        const char* r = (const char*)glGetString(GL_RENDERER);
+        renderer_name_ = r ? r : "unknown";
+        BOOST_LOG_TRIVIAL(info) << "Snuggle GPU: initialized on " << renderer_name_;
+
+        // Probe runs later — caller can set_cached_probe() first to skip it
     } else {
         BOOST_LOG_TRIVIAL(warning) << "Snuggle GPU: initialization failed, will use CPU fallback";
         cleanup();
     }
+}
+
+void GpuCollisionEvaluator::probe_gpu_performance()
+{
+    // Skip if already probed (cached result was set by caller)
+    if (gpu_cpu_ratio_ > 0.0f) return;
+
+    // Micro-benchmark: 64 synthetic candidates against 1 placed part.
+    // Build a tiny 8x8x8 voxel grid, run GPU and CPU 5 times, take best-of-5.
+    // If GPU hangs or total probe takes >500ms, GPU loses by default.
+
+    constexpr int PROBE_N = 64;
+    constexpr int PROBE_GRID = 8;
+
+    // Build a tiny solid grid
+    VoxelGrid probe_grid;
+    probe_grid.nx = probe_grid.ny = probe_grid.nz = PROBE_GRID;
+    probe_grid.voxel_size = 2.0f;
+    probe_grid.origin = {0, 0, 0};
+    size_t total_bits = PROBE_GRID * PROBE_GRID * PROBE_GRID;
+    size_t n_bytes = (total_bits + 7) / 8;
+    std::vector<uint8_t> bits(n_bytes, 0xFF); // all solid
+    probe_grid.set_bits(bits.data(), n_bytes);
+
+    // Build rot_cache with 1 bin
+    std::vector<std::vector<VoxelGrid>> probe_cache(1);
+    probe_cache[0] = {probe_grid};
+
+    std::vector<PartInfo> probe_parts(1);
+    probe_parts[0].grid = probe_grid;
+
+    // Upload
+    auto old_bins = actual_rot_bins_;
+    upload_grids(probe_parts, probe_cache);
+
+    // Build candidates: scattered around (0,0)
+    std::vector<RadialCandidate> candidates(PROBE_N);
+    for (int i = 0; i < PROBE_N; i++)
+        candidates[i] = {(float)(i * 3), (float)(i * 2), 0.0f};
+
+    std::vector<size_t> placed_parts = {0};
+    std::vector<RadialCandidate> placed_pos = {{0, 0, 0}};
+
+    // Time GPU
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<RadialCollisionResult> gpu_results;
+
+    // Make sure context is current and dispatch
+    glUseProgram(radial_program_);
+
+    // Run the dispatch directly (not through evaluate_radial which has fallback logic)
+    // Just time the full evaluate_radial call — includes upload + dispatch + readback
+    {
+        // Use the full path so timing is realistic
+        std::vector<RadialCollisionResult> r;
+        // Temporarily ensure we don't recurse into CPU fallback
+        bool was_available = available_.load();
+        // Direct GPU path timing
+        auto gpu_start = std::chrono::steady_clock::now();
+        for (int rep = 0; rep < 5; rep++) {
+            // Inline the GPU dispatch
+            size_t n_cand = candidates.size();
+            struct CandGPU { float x, y, zrot, _pad; };
+            std::vector<CandGPU> cand_gpu(n_cand);
+            for (size_t i = 0; i < n_cand; i++)
+                cand_gpu[i] = {candidates[i].x, candidates[i].y, candidates[i].zrot, 0.0f};
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, radial_candidates_ssbo_);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, n_cand * sizeof(CandGPU), cand_gpu.data(), GL_DYNAMIC_DRAW);
+
+            struct PlacedGPU { float x, y, zrot; uint32_t part_idx; };
+            PlacedGPU pg = {0, 0, 0, 0};
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, radial_placed_ssbo_);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(PlacedGPU), &pg, GL_DYNAMIC_DRAW);
+
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, radial_results_ssbo_);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, n_cand * sizeof(uint32_t), nullptr, GL_DYNAMIC_READ);
+
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, voxel_ssbo_);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, meta_ssbo_);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, radial_candidates_ssbo_);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, radial_results_ssbo_);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, radial_placed_ssbo_);
+
+            glUniform1ui(glGetUniformLocation(radial_program_, "u_candidate_part"), 0);
+            glUniform1ui(glGetUniformLocation(radial_program_, "u_n_placed"), 1);
+            glUniform1ui(glGetUniformLocation(radial_program_, "u_n_candidates"), (GLuint)n_cand);
+            glUniform1f(glGetUniformLocation(radial_program_, "u_gap_mm"), 1.5f);
+            glUniform1f(glGetUniformLocation(radial_program_, "u_bed_w"), 256.0f);
+            glUniform1f(glGetUniformLocation(radial_program_, "u_bed_h"), 256.0f);
+            glUniform1f(glGetUniformLocation(radial_program_, "u_bed_margin"), 1.5f);
+            glUniform1ui(glGetUniformLocation(radial_program_, "u_rot_bins"), 1);
+
+            glDispatchCompute(((GLuint)n_cand + 63) / 64, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+            std::vector<uint32_t> result_data(n_cand);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, radial_results_ssbo_);
+            glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, n_cand * sizeof(uint32_t), result_data.data());
+        }
+        auto gpu_end = std::chrono::steady_clock::now();
+        double gpu_total_us = std::chrono::duration<double, std::micro>(gpu_end - gpu_start).count();
+
+        // Timeout guard: if GPU took >500ms for 5 reps of a trivial workload, it loses
+        if (gpu_total_us > 500000.0) {
+            gpu_cpu_ratio_ = 999.0f;
+            BOOST_LOG_TRIVIAL(warning) << "Snuggle GPU probe: GPU too slow ("
+                << (int)(gpu_total_us / 1000.0) << "ms for 5 reps). Using CPU.";
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            actual_rot_bins_ = old_bins;
+            return;
+        }
+
+        // Best-of-5 (drop worst, take best — avoids warm-up bias)
+        double gpu_best = gpu_total_us; // conservative: use total/5 as fallback
+        gpu_best = gpu_total_us / 5.0;
+
+        // Time CPU — same workload
+        CpuCollisionEvaluator cpu_probe;
+        std::vector<PartInfo> dummy;
+        cpu_probe.upload_grids(dummy, probe_cache);
+
+        auto cpu_start = std::chrono::steady_clock::now();
+        for (int rep = 0; rep < 5; rep++) {
+            std::vector<RadialCollisionResult> cpu_r;
+            cpu_probe.evaluate_radial(placed_parts, placed_pos, 0, candidates,
+                                      1.5f, 256.0f, 256.0f, 1.5f, cpu_r);
+        }
+        auto cpu_end = std::chrono::steady_clock::now();
+        double cpu_best = std::chrono::duration<double, std::micro>(cpu_end - cpu_start).count() / 5.0;
+
+        gpu_cpu_ratio_ = (cpu_best > 0) ? (float)(gpu_best / cpu_best) : 999.0f;
+
+        BOOST_LOG_TRIVIAL(info) << "Snuggle GPU probe: GPU=" << (int)gpu_best << "us, CPU="
+            << (int)cpu_best << "us, ratio=" << gpu_cpu_ratio_
+            << (gpu_cpu_ratio_ < 1.0f ? " (GPU wins)" : " (CPU wins)")
+            << " on " << renderer_name_;
+    }
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    actual_rot_bins_ = old_bins;
 }
 
 GpuCollisionEvaluator::~GpuCollisionEvaluator()

@@ -16,6 +16,10 @@
 
 #include <boost/log/trivial.hpp>
 
+#ifdef SLIC3R_GUI
+#include <GL/glew.h>
+#endif
+
 namespace Slic3r { namespace arrangement {
 
 void snuggle_arrange(
@@ -305,13 +309,45 @@ void snuggle_arrange(
         if (params.stopcondition && params.stopcondition()) break;
     }
 
-    // Create collision evaluator — GPU if enabled and available, else CPU
+    // Create collision evaluator.
+    // GPU is used only when: user enabled it, >5 parts, AND the GPU micro-benchmark
+    // showed it's actually faster than CPU on this hardware.
     std::unique_ptr<snuggle::CollisionEvaluator> evaluator;
-    if (params.snuggle_use_gpu) {
-        evaluator = snuggle::create_collision_evaluator(); // tries GPU, falls back to CPU
-    } else {
+    bool use_gpu = params.snuggle_use_gpu && parts.size() > 5;
+
+    if (use_gpu) {
+        auto gpu_eval = snuggle::create_collision_evaluator();
+#ifdef SLIC3R_GUI
+        auto* gpu = dynamic_cast<snuggle::GpuCollisionEvaluator*>(gpu_eval.get());
+        if (gpu && gpu->is_available()) {
+            // Check for cached probe result (avoids re-benchmarking every arrange)
+            std::string cached_renderer = params.gpu_probe_renderer;
+            float cached_ratio = params.gpu_probe_ratio;
+            if (!cached_renderer.empty())
+                gpu->set_cached_probe(cached_renderer, cached_ratio);
+
+            // Run probe if no cached result (or renderer changed)
+            if (gpu->gpu_cpu_ratio() <= 0.0f)
+                gpu->probe_gpu_performance();
+
+            if (gpu->is_worthwhile()) {
+                BOOST_LOG_TRIVIAL(warning) << "Snuggle: using GPU evaluator ("
+                    << gpu->renderer() << ", ratio=" << gpu->gpu_cpu_ratio() << ")";
+                evaluator = std::move(gpu_eval);
+            } else {
+                BOOST_LOG_TRIVIAL(warning) << "Snuggle: GPU slower than CPU ("
+                    << gpu->renderer() << ", ratio=" << gpu->gpu_cpu_ratio()
+                    << "). Using CPU.";
+            }
+        }
+#endif
+        if (!evaluator) evaluator = std::move(gpu_eval);
+    }
+
+    if (!evaluator) {
         evaluator = std::make_unique<snuggle::CpuCollisionEvaluator>();
-        BOOST_LOG_TRIVIAL(warning) << "Snuggle: GPU disabled by user, using CPU evaluator";
+        BOOST_LOG_TRIVIAL(warning) << "Snuggle: using CPU evaluator"
+            << (parts.size() <= 5 ? " (<=5 parts)" : "");
     }
     evaluator->upload_grids(parts, rot_cache);
 
