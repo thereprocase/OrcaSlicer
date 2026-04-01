@@ -572,10 +572,13 @@ void ArrangeJob::process(Ctl &ctl)
                                      m_plater->model());
 
         // Persist GPU probe result so we don't re-benchmark next launch
-        if (!params.gpu_probe_renderer.empty() && params.gpu_probe_ratio > 0.0f && appcfg) {
-            appcfg->set("arrange", "gpu_probe_renderer", params.gpu_probe_renderer);
-            appcfg->set("arrange", "gpu_probe_ratio",
+        if (!params.gpu_probe_renderer.empty() && params.gpu_probe_ratio > 0.0f) {
+            auto* ac = wxGetApp().app_config;
+            if (ac) {
+                ac->set("arrange", "gpu_probe_renderer", params.gpu_probe_renderer);
+                ac->set("arrange", "gpu_probe_ratio",
                         std::to_string(params.gpu_probe_ratio));
+            }
         }
 
         // Overflow fallback: if Snuggle left items unarranged, pass them
