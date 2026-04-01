@@ -99,7 +99,11 @@ inline AutoSnuggleConfig compute_auto_config(
     }
 
     cfg.voxel_mm = voxel;
-    cfg.step_mm  = voxel;
+    // Step size for radial search: at least 1mm regardless of voxel resolution.
+    // Sub-mm steps cause 500+ ring checks per part on a 256mm bed.
+    // Voxel resolution handles collision precision; step just controls
+    // how finely we sweep outward.
+    cfg.step_mm  = std::max(1.0f, voxel);
 
     // Direction count: scale inversely with N
     if (n_parts <= 5)       cfg.n_directions = 36;
@@ -118,8 +122,9 @@ inline AutoSnuggleConfig compute_auto_config(
         cfg.n_rotations = std::max(1, base_rots);
     }
 
-    // Timeout: scale with N, guard at 30s
-    cfg.timeout_s = std::clamp(2.0f + 0.3f * (float)n_parts, 2.0f, 30.0f);
+    // Timeout: scale with N, guard at 60s.
+    // 0.5s per part accounts for concave parts needing more ring search.
+    cfg.timeout_s = std::clamp(3.0f + 0.5f * (float)n_parts, 3.0f, 60.0f);
 
     // Quality tier from resolution
     cfg.cells_across = median_dim / voxel;
