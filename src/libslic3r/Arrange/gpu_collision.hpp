@@ -127,6 +127,9 @@ private:
 
     // CPU fallback for evaluate_radial when shader isn't ready
     const std::vector<std::vector<VoxelGrid>>* rot_cache_ptr_ = nullptr;
+    int actual_rot_bins_ = 0;  // actual cache size per part (may differ from ROT_BINS)
+
+    bool compile_radial_shader();
     // Context (platform-specific, stored as opaque pointers)
     void* gl_context_ = nullptr;
     void* gl_dc_ = nullptr;

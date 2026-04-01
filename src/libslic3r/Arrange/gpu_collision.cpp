@@ -283,13 +283,153 @@ void main() {
 }
 )GLSL";
 
+// ── Radial collision shader ─────────────────────────────────
+// One thread per candidate position. Each candidate checks collision
+// against all placed parts with 9-probe gap inflation.
+static const char* const RADIAL_SHADER_SRC = R"GLSL(
+#version 430
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct GridMeta {
+    uint data_offset;
+    uint nx, ny, nz;
+    float voxel_size;
+    float origin_x, origin_y, origin_z;
+    uint _pad0, _pad1, _pad2, _pad3;
+};
+
+struct CandidateData {
+    float x, y, zrot;
+    float _pad;
+};
+
+struct PlacedData {
+    float x, y, zrot;
+    uint  part_idx;
+};
+
+layout(std430, binding = 0) readonly buffer VoxelData  { uint voxel_bits[]; };
+layout(std430, binding = 1) readonly buffer MetaData   { GridMeta metas[];  };
+layout(std430, binding = 2) readonly buffer Candidates { CandidateData candidates[]; };
+layout(std430, binding = 3) writeonly buffer Results   { uint results[];  };
+layout(std430, binding = 4) readonly buffer PlacedParts { PlacedData placed[]; };
+
+uniform uint  u_candidate_part;
+uniform uint  u_n_placed;
+uniform uint  u_n_candidates;
+uniform float u_gap_mm;
+uniform float u_bed_w, u_bed_h, u_bed_margin;
+uniform uint  u_rot_bins;
+
+bool voxel_get(GridMeta m, int gx, int gy, int gz) {
+    if (gx < 0 || gy < 0 || gz < 0) return false;
+    if (uint(gx) >= m.nx || uint(gy) >= m.ny || uint(gz) >= m.nz) return false;
+    uint idx = uint(gx) + uint(gy) * m.nx + uint(gz) * m.nx * m.ny;
+    uint word_idx = m.data_offset / 4u + idx / 32u;
+    uint bit_idx = idx % 32u;
+    return (voxel_bits[word_idx] & (1u << bit_idx)) != 0u;
+}
+
+uint angle_to_bin(float zrot) {
+    int bin = int(floor(zrot * float(u_rot_bins) / 6.2831853));
+    return uint(((bin % int(u_rot_bins)) + int(u_rot_bins)) % int(u_rot_bins));
+}
+
+void main() {
+    uint cand_idx = gl_GlobalInvocationID.x;
+    if (cand_idx >= u_n_candidates) return;
+
+    CandidateData cand = candidates[cand_idx];
+
+    uint cand_rot_bin = angle_to_bin(cand.zrot);
+    uint cand_meta_idx = u_candidate_part * u_rot_bins + cand_rot_bin;
+    GridMeta mc = metas[cand_meta_idx];
+
+    // Bed bounds check
+    float pmin_x = cand.x + mc.origin_x;
+    float pmin_y = cand.y + mc.origin_y;
+    float pmax_x = pmin_x + float(mc.nx) * mc.voxel_size;
+    float pmax_y = pmin_y + float(mc.ny) * mc.voxel_size;
+
+    if (pmin_x < u_bed_margin || pmin_y < u_bed_margin ||
+        pmax_x > u_bed_w - u_bed_margin ||
+        pmax_y > u_bed_h - u_bed_margin) {
+        results[cand_idx] = 1u;
+        return;
+    }
+
+    // Gap probe offsets
+    float gap_probes_x[9] = float[9](0, u_gap_mm, -u_gap_mm, 0, u_gap_mm, -u_gap_mm, 0, u_gap_mm, -u_gap_mm);
+    float gap_probes_y[9] = float[9](0, 0, 0, u_gap_mm, u_gap_mm, u_gap_mm, -u_gap_mm, -u_gap_mm, -u_gap_mm);
+    uint n_probes = (u_gap_mm >= mc.voxel_size * 0.5) ? 9u : 1u;
+
+    // Check against each placed part
+    for (uint pi = 0u; pi < u_n_placed; pi++) {
+        PlacedData pp = placed[pi];
+        uint pp_rot_bin = angle_to_bin(pp.zrot);
+        uint pp_meta_idx = pp.part_idx * u_rot_bins + pp_rot_bin;
+        GridMeta mp = metas[pp_meta_idx];
+
+        for (uint probe = 0u; probe < n_probes; probe++) {
+            float cx = cand.x + gap_probes_x[probe];
+            float cy = cand.y + gap_probes_y[probe];
+
+            // AABB overlap test
+            float ai_min_x = cx + mc.origin_x;
+            float ai_min_y = cy + mc.origin_y;
+            float aj_min_x = pp.x + mp.origin_x;
+            float aj_min_y = pp.y + mp.origin_y;
+
+            float ox_min = max(ai_min_x, aj_min_x);
+            float oy_min = max(ai_min_y, aj_min_y);
+            float ox_max = min(ai_min_x + float(mc.nx) * mc.voxel_size,
+                               aj_min_x + float(mp.nx) * mp.voxel_size);
+            float oy_max = min(ai_min_y + float(mc.ny) * mc.voxel_size,
+                               aj_min_y + float(mp.ny) * mp.voxel_size);
+
+            if (ox_min >= ox_max || oy_min >= oy_max) continue;
+
+            float oz_min = max(mc.origin_z, mp.origin_z);
+            float oz_max = min(mc.origin_z + float(mc.nz) * mc.voxel_size,
+                               mp.origin_z + float(mp.nz) * mp.voxel_size);
+            if (oz_min >= oz_max) continue;
+
+            float vs = max(mc.voxel_size, mp.voxel_size);
+
+            for (float wz = oz_min + vs * 0.5; wz < oz_max; wz += vs) {
+                for (float wy = oy_min + vs * 0.5; wy < oy_max; wy += vs) {
+                    for (float wx = ox_min + vs * 0.5; wx < ox_max; wx += vs) {
+                        int ax = int(floor((wx - (cx + mc.origin_x)) / mc.voxel_size));
+                        int ay = int(floor((wy - (cy + mc.origin_y)) / mc.voxel_size));
+                        int az = int(floor((wz - mc.origin_z) / mc.voxel_size));
+
+                        if (voxel_get(mc, ax, ay, az)) {
+                            int bx = int(floor((wx - aj_min_x) / mp.voxel_size));
+                            int by = int(floor((wy - aj_min_y) / mp.voxel_size));
+                            int bz = int(floor((wz - mp.origin_z) / mp.voxel_size));
+
+                            if (voxel_get(mp, bx, by, bz)) {
+                                results[cand_idx] = 1u;
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    results[cand_idx] = 0u;
+}
+)GLSL";
+
 // ── GL context initialization (Windows) ──────────────────────
 
 GpuCollisionEvaluator::GpuCollisionEvaluator()
 {
-    available_ = init_context() && compile_shader();
+    available_ = init_context() && compile_shader() && compile_radial_shader();
     if (available_) {
-        BOOST_LOG_TRIVIAL(info) << "Snuggle GPU: compute shader backend initialized";
+        BOOST_LOG_TRIVIAL(info) << "Snuggle GPU: compute shader backend initialized (GA + radial)";
     } else {
         BOOST_LOG_TRIVIAL(warning) << "Snuggle GPU: initialization failed, will use CPU fallback";
         cleanup();
@@ -424,7 +564,51 @@ bool GpuCollisionEvaluator::compile_shader()
     }
 
     glDeleteShader(shader);
-    BOOST_LOG_TRIVIAL(info) << "Snuggle GPU: compute shader compiled and linked";
+    BOOST_LOG_TRIVIAL(info) << "Snuggle GPU: GA compute shader compiled and linked";
+    return true;
+}
+
+bool GpuCollisionEvaluator::compile_radial_shader()
+{
+    GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
+    if (!shader) return false;
+
+    glShaderSource(shader, 1, &RADIAL_SHADER_SRC, nullptr);
+    glCompileShader(shader);
+
+    GLint status = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
+    if (status != GL_TRUE) {
+        char log[2048] = {};
+        glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
+        BOOST_LOG_TRIVIAL(warning) << "Snuggle GPU: radial shader compile failed:\n" << log;
+        glDeleteShader(shader);
+        return false;
+    }
+
+    radial_program_ = glCreateProgram();
+    glAttachShader(radial_program_, shader);
+    glLinkProgram(radial_program_);
+
+    glGetProgramiv(radial_program_, GL_LINK_STATUS, &status);
+    if (status != GL_TRUE) {
+        char log[2048] = {};
+        glGetProgramInfoLog(radial_program_, sizeof(log), nullptr, log);
+        BOOST_LOG_TRIVIAL(warning) << "Snuggle GPU: radial program link failed:\n" << log;
+        glDeleteShader(shader);
+        glDeleteProgram(radial_program_);
+        radial_program_ = 0;
+        return false;
+    }
+
+    glDeleteShader(shader);
+
+    // Pre-allocate radial SSBOs
+    glGenBuffers(1, &radial_candidates_ssbo_);
+    glGenBuffers(1, &radial_placed_ssbo_);
+    glGenBuffers(1, &radial_results_ssbo_);
+
+    BOOST_LOG_TRIVIAL(info) << "Snuggle GPU: radial compute shader compiled and linked";
     return true;
 }
 
@@ -436,12 +620,16 @@ void GpuCollisionEvaluator::upload_grids(
     if (!available_) return;
 
     n_parts_ = parts.size();
-    size_t total_metas = n_parts_ * ROT_BINS;
+
+    // Determine actual rotation bins from the cache (may be 1, 24, or 360)
+    actual_rot_bins_ = (n_parts_ > 0 && !rot_cache.empty() && !rot_cache[0].empty())
+                       ? (int)rot_cache[0].size() : 1;
+    size_t total_metas = n_parts_ * actual_rot_bins_;
 
     // Pass 1: compute total voxel data size (repacked to uint32 alignment)
     size_t total_voxel_bytes = 0;
     for (size_t p = 0; p < n_parts_; p++) {
-        for (int r = 0; r < ROT_BINS; r++) {
+        for (int r = 0; r < actual_rot_bins_; r++) {
             const auto& grid = rot_cache[p][r];
             size_t total_bits = grid.nx * grid.ny * grid.nz;
             // Round up to 4-byte boundary for uint32 word alignment
@@ -484,13 +672,13 @@ void GpuCollisionEvaluator::upload_grids(
     // Dest:   bit N is at uint32[N/32], bit (N%32)
     size_t offset = 0;
     for (size_t p = 0; p < n_parts_; p++) {
-        for (int r = 0; r < ROT_BINS; r++) {
+        for (int r = 0; r < actual_rot_bins_; r++) {
             const auto& grid = rot_cache[p][r];
             size_t total_bits = grid.nx * grid.ny * grid.nz;
             size_t grid_bytes = ((total_bits + 31) / 32) * 4;
 
             // Fill metadata
-            size_t meta_idx = p * ROT_BINS + r;
+            size_t meta_idx = p * actual_rot_bins_ + r;
             meta_data[meta_idx].data_offset = (uint32_t)offset;
             meta_data[meta_idx].nx = (uint32_t)grid.nx;
             meta_data[meta_idx].ny = (uint32_t)grid.ny;
@@ -633,19 +821,98 @@ void GpuCollisionEvaluator::evaluate_radial(
     float                                 bed_margin,
     std::vector<RadialCollisionResult>&   results)
 {
-    // TODO: GPU compute shader dispatch for radial candidates.
-    // For now, delegate to CPU evaluation using the stored rot_cache pointer.
-    if (!rot_cache_ptr_) {
-        results.resize(candidates.size());
-        for (auto& r : results) r.collides = true;
+    results.resize(candidates.size());
+
+    // Fall back to CPU if GPU isn't available or radial shader failed
+    if (!available_ || !radial_program_ || !rot_cache_ptr_) {
+        if (rot_cache_ptr_) {
+            CpuCollisionEvaluator cpu_fallback;
+            std::vector<PartInfo> dummy;
+            cpu_fallback.upload_grids(dummy, *rot_cache_ptr_);
+            cpu_fallback.evaluate_radial(placed_parts, placed_positions, candidate_part,
+                                         candidates, gap_mm, bed_w, bed_h, bed_margin, results);
+        } else {
+            for (auto& r : results) r.collides = true;
+        }
         return;
     }
 
-    CpuCollisionEvaluator cpu_fallback;
-    std::vector<PartInfo> dummy;
-    cpu_fallback.upload_grids(dummy, *rot_cache_ptr_);
-    cpu_fallback.evaluate_radial(placed_parts, placed_positions, candidate_part,
-                                 candidates, gap_mm, bed_w, bed_h, bed_margin, results);
+    size_t n_cand = candidates.size();
+    size_t n_placed = placed_parts.size();
+
+    // Upload candidates SSBO (binding 2)
+    struct CandGPU { float x, y, zrot, _pad; };
+    std::vector<CandGPU> cand_gpu(n_cand);
+    for (size_t i = 0; i < n_cand; i++)
+        cand_gpu[i] = {candidates[i].x, candidates[i].y, candidates[i].zrot, 0.0f};
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, radial_candidates_ssbo_);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, n_cand * sizeof(CandGPU), cand_gpu.data(), GL_DYNAMIC_DRAW);
+
+    // Upload placed parts SSBO (binding 4)
+    struct PlacedGPU { float x, y, zrot; uint32_t part_idx; };
+    std::vector<PlacedGPU> placed_gpu(n_placed);
+    for (size_t i = 0; i < n_placed; i++)
+        placed_gpu[i] = {placed_positions[i].x, placed_positions[i].y,
+                         placed_positions[i].zrot, (uint32_t)placed_parts[i]};
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, radial_placed_ssbo_);
+    glBufferData(GL_SHADER_STORAGE_BUFFER,
+                 std::max(n_placed, (size_t)1) * sizeof(PlacedGPU),
+                 placed_gpu.data(), GL_DYNAMIC_DRAW);
+
+    // Results SSBO (binding 3) — one uint per candidate
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, radial_results_ssbo_);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, n_cand * sizeof(uint32_t), nullptr, GL_DYNAMIC_READ);
+    // Zero-initialize results
+    std::vector<uint32_t> zeros(n_cand, 0);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, n_cand * sizeof(uint32_t), zeros.data());
+
+    // Bind SSBOs
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, voxel_ssbo_);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, meta_ssbo_);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, radial_candidates_ssbo_);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, radial_results_ssbo_);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, radial_placed_ssbo_);
+
+    // Set uniforms
+    glUseProgram(radial_program_);
+    glUniform1ui(glGetUniformLocation(radial_program_, "u_candidate_part"), (GLuint)candidate_part);
+    glUniform1ui(glGetUniformLocation(radial_program_, "u_n_placed"), (GLuint)n_placed);
+    glUniform1ui(glGetUniformLocation(radial_program_, "u_n_candidates"), (GLuint)n_cand);
+    glUniform1f(glGetUniformLocation(radial_program_, "u_gap_mm"), gap_mm);
+    glUniform1f(glGetUniformLocation(radial_program_, "u_bed_w"), bed_w);
+    glUniform1f(glGetUniformLocation(radial_program_, "u_bed_h"), bed_h);
+    glUniform1f(glGetUniformLocation(radial_program_, "u_bed_margin"), bed_margin);
+    glUniform1ui(glGetUniformLocation(radial_program_, "u_rot_bins"), (GLuint)actual_rot_bins_);
+
+    // Dispatch: 64 threads per work group
+    GLuint n_groups = ((GLuint)n_cand + 63) / 64;
+    glDispatchCompute(n_groups, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    // Read back results
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, radial_results_ssbo_);
+    std::vector<uint32_t> result_data(n_cand);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, n_cand * sizeof(uint32_t), result_data.data());
+
+    for (size_t i = 0; i < n_cand; i++)
+        results[i].collides = (result_data[i] != 0);
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        BOOST_LOG_TRIVIAL(warning) << "Snuggle GPU: GL error in evaluate_radial: 0x"
+                                   << std::hex << err << std::dec
+                                   << " — falling back to CPU";
+        // Re-evaluate on CPU
+        CpuCollisionEvaluator cpu_fallback;
+        std::vector<PartInfo> dummy;
+        cpu_fallback.upload_grids(dummy, *rot_cache_ptr_);
+        cpu_fallback.evaluate_radial(placed_parts, placed_positions, candidate_part,
+                                     candidates, gap_mm, bed_w, bed_h, bed_margin, results);
+    }
 }
 
 void GpuCollisionEvaluator::cleanup()
