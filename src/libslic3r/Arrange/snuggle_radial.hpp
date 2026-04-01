@@ -254,35 +254,33 @@ inline RadialResult radial_arrange(
             }
         }
 
-        // Bounding-circle skip: the new part can't fit inside the existing
-        // cluster. Estimate the cluster's inner radius and start searching
-        // from there instead of distance 0.
+        // Outside-in search: start from where we definitely fit (far out,
+        // beyond all placed parts) and walk inward until we stop fitting.
+        // The last ring that had any valid candidates is the tightest fit.
         //
-        // For each placed part, its "occupied radius" from bed center is
-        // (distance_to_center + bounding_radius). The cluster occupies at
-        // least as far as the first placed part's radius (the center part).
-        // Start the ring search just inside where the new part's bounding
-        // circle could first clear the innermost placed part.
+        // This is faster than inside-out because:
+        // 1. Far-out rings are cheap (AABB early-exit, nothing overlaps)
+        // 2. We converge on the tight fit from outside, correct direction
+        // 3. No wasted work scanning through the dense cluster interior
+        //
+        // Compute outer start: farthest placed part's edge + our radius
         float new_r = std::sqrt(parts[idx].hull_area_mm2 / PI_F);
-        float start_dist = 0.0f;
-        if (!placed_indices.empty()) {
-            // The center part (first placed, at or near bed_cx/bed_cy)
-            // blocks distance 0. Its occupied radius from center is
-            // approximately its own bounding radius.
-            const auto& center = result.placements[placed_indices[0]];
-            float center_r = std::sqrt(parts[placed_indices[0]].hull_area_mm2 / PI_F);
-            float center_dist = std::sqrt(
-                (bed_cx - center.x) * (bed_cx - center.x) +
-                (bed_cy - center.y) * (bed_cy - center.y));
-            // New part needs to clear the center part: start at
-            // (center_dist + center_r + gap - new_r), but back off
-            // a few steps to catch concave interlocking.
-            start_dist = std::max(0.0f,
-                center_dist + center_r + cfg.min_gap_mm - new_r
-                - cfg.step_mm * 3.0f);
+        float outer_start = 0.0f;
+        for (size_t pi : placed_indices) {
+            const auto& pp = result.placements[pi];
+            float dx = bed_cx - pp.x, dy = bed_cy - pp.y;
+            float pd = std::sqrt(dx * dx + dy * dy);
+            float pr = std::sqrt(parts[pi].hull_area_mm2 / PI_F);
+            outer_start = std::max(outer_start, pd + pr + cfg.min_gap_mm + new_r);
         }
+        // Add a small buffer and cap at max_slide
+        outer_start = std::min(outer_start + cfg.step_mm * 2.0f, max_slide);
 
-        for (float dist = start_dist; dist <= max_slide; dist += cfg.step_mm) {
+        // Walk inward. Track the best (innermost) ring that had candidates.
+        std::vector<Candidate> best_ring;
+        float best_ring_dist = max_slide + 1;
+
+        for (float dist = outer_start; dist >= 0; dist -= cfg.step_mm) {
             ring_candidates.clear();
 
             int dirs_to_try = std::min(active_directions, (int)directions.size());
@@ -334,8 +332,19 @@ inline RadialResult radial_arrange(
                 }
             }
 
-            if (!ring_candidates.empty()) break;
+            if (!ring_candidates.empty()) {
+                // This ring has valid positions — record as best so far
+                best_ring = ring_candidates;
+                best_ring_dist = dist;
+            } else if (best_ring_dist < max_slide) {
+                // Had valid rings but this one failed — we've passed the
+                // tightest fit. Stop searching inward.
+                break;
+            }
         }
+
+        // Use the innermost valid ring
+        ring_candidates = std::move(best_ring);
 
         if (!ring_candidates.empty()) {
             // Pick the candidate closest to existing parts (tight packing).
