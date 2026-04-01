@@ -33,6 +33,11 @@ endif()
 
 target_link_libraries(${_TEST_NAME}_tests test_common libslic3r Catch2::Catch2WithMain)
 target_include_directories(${_TEST_NAME}_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# Force linker to include Catch2Main entry point despite LTCG restart from tbbmalloc
+if (MSVC)
+    target_link_options(${_TEST_NAME}_tests PRIVATE "/WHOLEARCHIVE:Catch2Main")
+endif()
 set_property(TARGET ${_TEST_NAME}_tests PROPERTY FOLDER "tests")
 
 if (WIN32)
