@@ -181,7 +181,7 @@ inline RadialResult radial_arrange(
         // Graceful degradation: if running over budget, reduce search breadth
         // rather than timing out with unplaced parts.
         float remaining_frac = (float)(n - placed_indices.size()) / (float)n;
-        float budget_used = (float)(elapsed / cfg.timeout_s);
+        float budget_used = (cfg.timeout_s > 0.0) ? (float)(elapsed / cfg.timeout_s) : 0.0f;
 
         if (budget_used > 0.8f && remaining_frac > 0.4f && active_directions > 6) {
             active_directions = std::max(6, active_directions / 2);
@@ -282,7 +282,10 @@ inline RadialResult radial_arrange(
                         if (bi < batch_results.size() && !batch_results[bi].collides) {
                             ring_candidates.push_back({batch[bi].x, batch[bi].y,
                                                        batch[bi].zrot, dist});
-                            bi += part_rots.size() - ri - 1;
+                            // Skip remaining rotations for this direction.
+                            // break prevents the loop's ri++/bi++ from firing,
+                            // so we need (remaining - 1) + 1 = remaining entries.
+                            bi += part_rots.size() - ri;
                             break;
                         }
                     }
