@@ -111,12 +111,18 @@ inline AutoSnuggleConfig compute_auto_config(
     else if (n_parts <= 30) cfg.n_directions = 16;
     else                    cfg.n_directions = 12;
 
-    // Rotation count: from user's step preference, scaled for N
+    // Rotation count: from user's step preference, capped for performance.
+    // The rotation step is sacred (user chose 5° for a reason), but the
+    // number of bins we actually TRY is a performance knob. 24 rotations
+    // (15° effective) is the most we ever need — finer steps don't improve
+    // packing quality enough to justify the O(N*dirs*rots) cost.
     if (cfg.lock_rotation) {
         cfg.n_rotations = 1;
     } else {
         int step = std::max(1, cfg.rotation_step);
         int base_rots = 360 / step;
+        // Universal cap: never more than 24 rotation candidates
+        base_rots = std::min(base_rots, 24);
         if (n_parts > 20) base_rots = std::min(base_rots, 12);
         if (n_parts > 35) base_rots = std::min(base_rots, 8);
         cfg.n_rotations = std::max(1, base_rots);
