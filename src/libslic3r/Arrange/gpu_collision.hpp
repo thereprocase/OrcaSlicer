@@ -14,6 +14,8 @@
 #include <vector>
 #include <memory>
 #include <atomic>
+#include <string>
+#include <boost/log/trivial.hpp>
 
 namespace snuggle {
 

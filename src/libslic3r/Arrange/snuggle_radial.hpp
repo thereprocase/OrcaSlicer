@@ -12,8 +12,8 @@
 
 #include "polite_voxelizer.hpp"
 #include "snuggle_constants.hpp"
-#include "snuggle_nester.hpp"
 #include "gpu_collision.hpp"
+#include "snuggle_nester.hpp"
 #include <vector>
 #include <algorithm>
 #include <numeric>

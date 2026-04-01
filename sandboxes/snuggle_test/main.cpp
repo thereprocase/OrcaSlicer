@@ -31,12 +31,9 @@
 
 #include "libslic3r/Arrange/polite_voxelizer.hpp"
 #include "libslic3r/Arrange/auto_snuggle.hpp"
+#include "libslic3r/Arrange/gpu_collision.hpp"
 #include "libslic3r/Arrange/snuggle_nester.hpp"
 #include "libslic3r/Arrange/snuggle_radial.hpp"
-
-#ifdef SLIC3R_GUI
-#include "libslic3r/Arrange/gpu_collision.hpp"
-#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -411,8 +408,8 @@ static void t01_auto_config() {
                                    256, 256, 1.5f, false, 15, false);
     ASSERT_TRUE(cv.voxel_mm >= 200.f / 120.f, "vase trap: min voxel");
 
-    // GPU bonus (only >5 parts)
-    std::vector<float> d10(10, 30.f);
+    // GPU bonus (only >5 parts, needs voxel above clamp floor to see effect)
+    std::vector<float> d10(10, 80.f);  // 80mm parts → base_voxel = 1.33, above 0.5 clamp
     auto cc = compute_auto_config(10, d10, 256, 256, 1.5f, false, 15, false);
     auto cg = compute_auto_config(10, d10, 256, 256, 1.5f, false, 15, true);
     ASSERT_TRUE(cg.voxel_mm < cc.voxel_mm, "GPU: finer voxel");
@@ -420,12 +417,12 @@ static void t01_auto_config() {
 
 static void t02_voxelgrid() {
     VoxelGrid g;
-    ASSERT_EQ(g.allocate(4,4,4), VoxError::OK, "alloc 4x4x4");
+    ASSERT_TRUE(g.allocate(4,4,4) == VoxError::OK, "alloc 4x4x4");
     g.set(0,0,0); g.set(3,3,3);
     ASSERT_TRUE(g.get(0,0,0), "get set voxel");
     ASSERT_TRUE(!g.get(1,0,0), "get unset voxel");
 
-    ASSERT_EQ(VoxelGrid().allocate(513,1,1), VoxError::GRID_TOO_LARGE, "oversize reject");
+    ASSERT_TRUE(VoxelGrid().allocate(513,1,1) == VoxError::GRID_TOO_LARGE, "oversize reject");
 
     // Collision: same grid overlaps itself
     VoxelGrid s; s.allocate(4,4,4); s.voxel_size = 2.0f; s.origin = {0,0,0};
@@ -595,7 +592,7 @@ static void t09_50_cubes(const HarnessConfig& cfg) {
 
 static void t10_vase_trap() {
     auto big = make_box(200, 200, 200);
-    auto small = make_box(15, 15, 5);
+    auto small_mesh = make_box(15, 15, 5);
     std::vector<float> dims = {200.f};
     for (int i = 0; i < 15; i++) dims.push_back(15.f);
 
