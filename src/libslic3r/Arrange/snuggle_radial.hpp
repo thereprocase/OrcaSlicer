@@ -12,6 +12,7 @@
 
 #include "polite_voxelizer.hpp"
 #include "snuggle_constants.hpp"
+#include "snuggle_nester.hpp"
 #include "gpu_collision.hpp"
 #include <vector>
 #include <algorithm>
@@ -20,9 +21,6 @@
 #include <chrono>
 
 namespace snuggle {
-
-// Forward from snuggle_nester.hpp — we reuse PartInfo and Placement
-struct PartInfo;
 
 struct RadialPlacement {
     float x = 0, y = 0;
@@ -95,9 +93,6 @@ inline RadialResult radial_arrange(
         return rot_cache[part_idx][bin];
     };
 
-    // Gap in voxel units — inflate collision offsets to enforce min_gap_mm
-    float gap_voxels = cfg.min_gap_mm / cfg.step_mm;
-
     // Helper: check if a placement is valid (no collision, within bed)
     auto is_valid = [&](size_t part_idx, float px, float py, float rot,
                         const std::vector<size_t>& placed_indices,
@@ -118,21 +113,27 @@ inline RadialResult radial_arrange(
             return false;
 
         // Collision check with gap enforcement.
-        // Test at +/- gap offsets in X and Y — if any overlap, parts are too close.
+        // When gap >= half voxel size, use 9-probe pattern (center + 8 offsets).
+        // When gap < half voxel size, sub-voxel shifts don't change the result —
+        // use center probe only (Legolas optimization: avoids 8x wasted work).
+        bool use_probes = gap >= grid.voxel_size * 0.5f;
         Vec3f off_i = {px, py, 0.0f};
         for (size_t j : placed_indices) {
             const auto& pj = placements[j];
             const VoxelGrid& grid_j = get_rot(j, pj.zrot);
             Vec3f off_j = {pj.x, pj.y, 0.0f};
 
-            // Check collision with gap inflation: shift the candidate part
-            // by +/- gap in each axis to detect if parts are within gap distance
-            for (float dx : {0.0f, gap, -gap}) {
-                for (float dy : {0.0f, gap, -gap}) {
-                    Vec3f off_shifted = {px + dx, py + dy, 0.0f};
-                    if (VoxelGrid::collision_count(grid, off_shifted, grid_j, off_j) > 0)
-                        return false;
+            if (use_probes) {
+                for (float dx : {0.0f, gap, -gap}) {
+                    for (float dy : {0.0f, gap, -gap}) {
+                        Vec3f off_shifted = {px + dx, py + dy, 0.0f};
+                        if (VoxelGrid::collision_count(grid, off_shifted, grid_j, off_j) > 0)
+                            return false;
+                    }
                 }
+            } else {
+                if (VoxelGrid::collision_count(grid, off_i, grid_j, off_j) > 0)
+                    return false;
             }
         }
         return true;
@@ -274,9 +275,11 @@ inline RadialResult radial_arrange(
         }
 
         if (!ring_candidates.empty()) {
-            // Pick the candidate that maximizes minimum distance to placed parts.
+            // Pick the candidate closest to existing parts (tight packing).
+            // For each candidate, compute minimum distance to any placed part.
+            // Pick the candidate with the smallest such distance.
             size_t best_idx = 0;
-            float best_min_dist = -1.0f;
+            float best_min_dist = max_slide + 1.0f;
 
             for (size_t ci = 0; ci < ring_candidates.size(); ci++) {
                 float min_d = max_slide;
@@ -286,7 +289,7 @@ inline RadialResult radial_arrange(
                     float d = std::sqrt(ddx * ddx + ddy * ddy);
                     min_d = std::min(min_d, d);
                 }
-                if (min_d > best_min_dist) {
+                if (min_d < best_min_dist) {
                     best_min_dist = min_d;
                     best_idx = ci;
                 }
@@ -299,7 +302,8 @@ inline RadialResult radial_arrange(
         // else: part doesn't fit, stays unplaced
     }
 
-    // Compute origin_bed positions (same formula as GA nester)
+    // Compute origin_bed: where the instance origin lands on the bed.
+    // Compensates for rotation pivot offset (Gandalf Option B).
     for (size_t i = 0; i < n; i++) {
         auto& pl = result.placements[i];
         if (!pl.placed) continue;

@@ -35,8 +35,12 @@ void CpuCollisionEvaluator::upload_grids(
 
 const VoxelGrid& CpuCollisionEvaluator::get_rotated(size_t part_idx, float angle) const
 {
+    static const VoxelGrid empty;
+    if (part_idx >= rot_cache_->size() || (*rot_cache_)[part_idx].empty())
+        return empty;
     int bin = (int)std::floor(angle * ROT_CACHE_BINS / (2.0f * 3.14159265f));
     bin = ((bin % ROT_CACHE_BINS) + ROT_CACHE_BINS) % ROT_CACHE_BINS;
+    if (bin >= (int)(*rot_cache_)[part_idx].size()) bin = 0;
     return (*rot_cache_)[part_idx][bin];
 }
 
