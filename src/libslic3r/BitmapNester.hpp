@@ -243,7 +243,11 @@ public:
         }
     }
 
+#ifdef BITMAP_NESTER_TESTING
+public:
+#else
 private:
+#endif
     // Collision check: does item bitmap at (px, py) overlap the plate bitmap?
     static bool collides(const std::vector<uint64_t> &plate,
                          int wpr, int bw, int bh,
