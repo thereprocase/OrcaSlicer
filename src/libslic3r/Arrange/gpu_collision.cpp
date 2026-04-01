@@ -795,7 +795,7 @@ void GpuCollisionEvaluator::upload_grids(
     }
 
     BOOST_LOG_TRIVIAL(info) << "Snuggle GPU: uploading " << n_parts_ << " parts x "
-                            << ROT_BINS << " rotations = "
+                            << actual_rot_bins_ << " rotations = "
                             << (total_voxel_bytes / (1024 * 1024)) << " MB voxel data";
 
     // Check GPU SSBO size limit — fall back to CPU if data is too large
@@ -935,7 +935,7 @@ void GpuCollisionEvaluator::evaluate_batch(
     glUniform1f(glGetUniformLocation(program_, "u_bed_w"), bed_w);
     glUniform1f(glGetUniformLocation(program_, "u_bed_h"), bed_h);
     glUniform1f(glGetUniformLocation(program_, "u_bed_margin"), bed_margin);
-    glUniform1ui(glGetUniformLocation(program_, "u_rot_bins"), (GLuint)ROT_BINS);
+    glUniform1ui(glGetUniformLocation(program_, "u_rot_bins"), (GLuint)actual_rot_bins_);
 
     // Dispatch: one invocation per individual
     glDispatchCompute((GLuint)pop_size, 1, 1);

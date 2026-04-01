@@ -83,9 +83,10 @@ inline AutoSnuggleConfig compute_auto_config(
 
     float voxel = base_voxel * n_scale;
 
-    // Vase trap: cap grid at ~120 cells across the largest part
-    float max_voxel_for_largest = max_dim / 120.0f;
-    voxel = std::max(voxel, max_voxel_for_largest);
+    // Vase trap: enforce minimum voxel size so the largest part
+    // doesn't exceed ~120 cells across (prevents grid explosion)
+    float min_voxel_for_largest = max_dim / 120.0f;
+    voxel = std::max(voxel, min_voxel_for_largest);
 
     // Clamp to sane range
     voxel = std::clamp(voxel, 0.5f, 5.0f);
