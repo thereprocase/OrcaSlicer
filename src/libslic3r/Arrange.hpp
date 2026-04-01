@@ -127,6 +127,7 @@ struct ArrangeParams {
     bool  avoid_extrusion_cali_region         = true;
     bool  is_seq_print                        = false;
     bool  align_to_y_axis                     = false;
+    bool  use_concave_shapes                 = false;
     float bed_shrink_x = 1;
     float bed_shrink_y = 1;
     float brim_skirt_distance = 0;
@@ -172,6 +173,7 @@ struct ArrangeParams {
         ret += "\"clearance_height_to_lid\":" + std::to_string(clearance_height_to_lid) + ",";
         ret += "\"clearance_radius\":" + std::to_string(clearance_radius) + ",";
         ret += "\"printable_height\":" + std::to_string(printable_height) + ",";
+        ret += "\"use_concave_shapes\":" + std::to_string(use_concave_shapes) + ",";
         return ret;
     }
 
