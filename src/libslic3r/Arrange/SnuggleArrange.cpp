@@ -8,6 +8,7 @@
 #include "gpu_collision.hpp"
 #include "snuggle_nester.hpp"
 #include "snuggle_radial.hpp"
+#include "auto_snuggle.hpp"
 
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/BoundingBox.hpp"
@@ -94,12 +95,46 @@ void snuggle_arrange(
     BOOST_LOG_TRIVIAL(warning) << "Snuggle: bed " << bed_w << " x " << bed_h
                                << " mm, origin (" << bed_origin_x << ", " << bed_origin_y << ")";
 
+    // ── AutoSnuggle: compute optimal parameters ──────────
+    snuggle::AutoSnuggleConfig auto_cfg;
+    float voxel_size;
+
+    if (params.snuggle_auto_mode) {
+        // Collect part max dimensions from bounding boxes
+        std::vector<float> part_max_dims;
+        for (const auto& item : items) {
+            auto bb = get_extents(item.poly);
+            float w = unscale_(bb.max.x() - bb.min.x());
+            float h = unscale_(bb.max.y() - bb.min.y());
+            part_max_dims.push_back(std::max(w, h));
+        }
+
+        auto_cfg = snuggle::compute_auto_config(
+            items.size(), part_max_dims, bed_w, bed_h,
+            params.snuggle_padding_mm,
+            params.snuggle_lock_rotation,
+            params.snuggle_rotation_step,
+            params.snuggle_use_gpu);
+
+        voxel_size = auto_cfg.voxel_mm;
+
+        BOOST_LOG_TRIVIAL(warning) << "AutoSnuggle: " << auto_cfg.tier_name()
+            << " quality, " << auto_cfg.voxel_mm << "mm voxels ("
+            << (int)auto_cfg.cells_across << " cells), "
+            << auto_cfg.n_directions << " dirs, "
+            << auto_cfg.n_rotations << " rots, "
+            << "est. " << (int)auto_cfg.estimated_time_s << "s";
+
+        if (params.progressind) {
+            std::string msg = " (AutoSnuggle: " + std::string(auto_cfg.tier_name())
+                + " quality, " + std::to_string((int)auto_cfg.cells_across) + " cells)";
+            params.progressind(2, msg);
+        }
+    } else {
+        voxel_size = std::clamp(params.snuggle_voxel_mm, 0.5f, 5.0f);
+    }
+
     // ── Voxelize each part ─────────────────────────────────
-    // At 2mm voxels, a 100mm part is a 50x50 grid — triangle count
-    // doesn't matter much since we iterate the grid, not the mesh.
-    // But high-poly meshes (>10K tris) make the SAT test expensive.
-    // Decimate to ~5K tris max — sufficient for 2mm voxel accuracy.
-    float voxel_size = std::clamp(params.snuggle_voxel_mm, 0.5f, 5.0f);
     constexpr size_t MAX_TRIS_FOR_VOXEL = 5000;
 
     // Walk the model to match items to instances. Build a flat list of
@@ -219,17 +254,29 @@ void snuggle_arrange(
     snuggle::RadialConfig rcfg;
     rcfg.bed_width_mm  = bed_w;
     rcfg.bed_height_mm = bed_h;
-    rcfg.min_gap_mm    = std::max(1.5f, params.snuggle_padding_mm);
-    rcfg.bed_margin_mm = rcfg.min_gap_mm;
     rcfg.step_mm       = voxel_size;
-    rcfg.timeout_s     = std::max(2.0, (double)params.snuggle_timeout_s);
 
-    if (params.snuggle_rotation_step <= 0 || params.snuggle_lock_rotation) {
-        rcfg.lock_rotation = true;
-        rcfg.n_rotations = 1;
+    if (params.snuggle_auto_mode) {
+        // AutoSnuggle computed everything
+        rcfg.min_gap_mm    = auto_cfg.min_gap_mm;
+        rcfg.bed_margin_mm = auto_cfg.bed_margin_mm;
+        rcfg.n_directions  = auto_cfg.n_directions;
+        rcfg.n_rotations   = auto_cfg.n_rotations;
+        rcfg.lock_rotation = auto_cfg.lock_rotation;
+        rcfg.timeout_s     = auto_cfg.timeout_s;
     } else {
-        rcfg.lock_rotation = false;
-        rcfg.n_rotations = std::max(1, 360 / params.snuggle_rotation_step);
+        // Manual mode: use raw params
+        rcfg.min_gap_mm    = std::max(1.5f, params.snuggle_padding_mm);
+        rcfg.bed_margin_mm = rcfg.min_gap_mm;
+        rcfg.timeout_s     = std::max(2.0, (double)params.snuggle_timeout_s);
+
+        if (params.snuggle_rotation_step <= 0 || params.snuggle_lock_rotation) {
+            rcfg.lock_rotation = true;
+            rcfg.n_rotations = 1;
+        } else {
+            rcfg.lock_rotation = false;
+            rcfg.n_rotations = std::max(1, 360 / params.snuggle_rotation_step);
+        }
     }
 
     BOOST_LOG_TRIVIAL(warning) << "Snuggle radial: " << parts.size() << " parts"

@@ -506,6 +506,7 @@ public:
         int   snuggle_rotation_step = 15;
         bool  snuggle_multi_plate   = true;
         bool  snuggle_use_gpu       = true;
+        bool  snuggle_auto_mode     = true;
     };
 
     struct OrientSettings

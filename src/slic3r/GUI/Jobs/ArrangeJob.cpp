@@ -874,6 +874,7 @@ arrangement::ArrangeParams init_arrange_params(Plater *p)
     params.snuggle_rotation_step               = settings.snuggle_rotation_step;
     params.snuggle_multi_plate                 = settings.snuggle_multi_plate;
     params.snuggle_use_gpu                     = settings.snuggle_use_gpu;
+    params.snuggle_auto_mode                   = settings.snuggle_auto_mode;
 
     int state = p->get_prepare_state();
     if (state == Job::JobPrepareState::PREPARE_STATE_MENU) {

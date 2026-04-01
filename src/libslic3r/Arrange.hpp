@@ -133,6 +133,7 @@ struct ArrangeParams {
     int   snuggle_rotation_step  = 15;     // 0=locked, 1/5/15/45/90 deg snaps
     bool  snuggle_multi_plate    = true;
     bool  snuggle_use_gpu        = false;  // GPU shader not yet implemented — default off
+    bool  snuggle_auto_mode      = true;   // AutoSnuggle picks params from part count/size
     // Legacy GA fields (unused by radial nester, kept for config compat)
     int   snuggle_population     = 64;
     int   snuggle_generations    = 30;

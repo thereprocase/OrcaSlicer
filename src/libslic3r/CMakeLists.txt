@@ -81,6 +81,7 @@ set(lisbslic3r_sources
     Arrange/snuggle_nester.hpp
     Arrange/snuggle_radial.hpp
     Arrange/snuggle_constants.hpp
+    Arrange/auto_snuggle.hpp
     BlacklistedLibraryCheck.cpp
     BlacklistedLibraryCheck.hpp
     BoundingBox.cpp

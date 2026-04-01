@@ -1178,6 +1178,10 @@ void GLCanvas3D::load_arrange_settings()
     if (!snuggle_use_gpu_str.empty())
         m_arrange_settings_fff.snuggle_use_gpu = (snuggle_use_gpu_str == "1" || snuggle_use_gpu_str == "true");
 
+    std::string snuggle_auto_str = wxGetApp().app_config->get("arrange", "snuggle_auto_mode");
+    if (!snuggle_auto_str.empty())
+        m_arrange_settings_fff.snuggle_auto_mode = (snuggle_auto_str == "1" || snuggle_auto_str == "true");
+
     // Derive lock_rotation from rotation_step (dropdown is source of truth)
     m_arrange_settings_fff.snuggle_lock_rotation = (m_arrange_settings_fff.snuggle_rotation_step == 0);
 
@@ -5931,11 +5935,27 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
                                       "Produces tighter blob-shaped clusters.\n"
                                       "Best with 2-30 parts. Takes a few seconds.").c_str());
 
-    // When Snuggle is on, explain that it manages rotation differently
+    // Auto/Manual mode toggle
     if (settings_out.use_snuggle) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
         imgui->text(_L("Snuggle overrides auto-rotate \u2014 use Rotation below"));
         ImGui::PopStyleColor();
+
+        // Mode radio buttons
+        bool is_auto = settings.snuggle_auto_mode;
+        if (ImGui::RadioButton(_u8L("Auto").c_str(), is_auto)) {
+            settings.snuggle_auto_mode = true;
+            settings_out.snuggle_auto_mode = true;
+            appcfg->set("arrange", "snuggle_auto_mode", "1");
+            settings_changed = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton(_u8L("Manual").c_str(), !is_auto)) {
+            settings.snuggle_auto_mode = false;
+            settings_out.snuggle_auto_mode = false;
+            appcfg->set("arrange", "snuggle_auto_mode", "0");
+            settings_changed = true;
+        }
     }
 
     {
@@ -5995,6 +6015,18 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
                                           "Locked = parts keep their current rotation.\n"
                                           "90\xC2\xB0 = try 0, 90, 180, 270 from starting position.").c_str());
 
+        // ── Auto breakdown OR Manual controls ───────────────
+        if (settings_out.snuggle_auto_mode && settings_out.use_snuggle) {
+            // Show what Auto would choose (computed from current plate)
+            // For now, show placeholder based on part count from the plater
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+            imgui->text(_L("AutoSnuggle will pick optimal settings"));
+            imgui->text(_L("based on part count, sizes, and hardware."));
+            imgui->text(_L("Details shown during arrange."));
+            ImGui::PopStyleColor();
+        }
+
+        if (!settings_out.snuggle_auto_mode) {
         // Detail level (voxel size)
         ImGui::AlignTextToFramePadding();
         imgui->text(_L("Detail level"));
@@ -6067,6 +6099,8 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
             ImGui::TreePop();
         }
 
+        } // end if (!auto_mode) — manual controls block
+
         if (!settings_out.use_snuggle) { imgui->disabled_end(); }
     }
 
@@ -6114,7 +6148,8 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         settings_out.snuggle_timeout_s = 15.0f;
         settings_out.snuggle_rotation_step = 15;
         settings_out.snuggle_multi_plate = true;
-        settings_out.snuggle_use_gpu = true;
+        settings_out.snuggle_use_gpu = false;
+        settings_out.snuggle_auto_mode = true;
 
         appcfg->set("arrange", dist_key, float_to_string_decimal_point(settings_out.distance));
         appcfg->set("arrange", rot_key, settings_out.enable_rotation ? "1" : "0");
@@ -6127,7 +6162,8 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         appcfg->set("arrange", "snuggle_timeout_s", "15.0");
         appcfg->set("arrange", "snuggle_rotation_step", "15");
         appcfg->set("arrange", "snuggle_multi_plate", "1");
-        appcfg->set("arrange", "snuggle_use_gpu", "1");
+        appcfg->set("arrange", "snuggle_use_gpu", "0");
+        appcfg->set("arrange", "snuggle_auto_mode", "1");
         settings_changed = true;
     }
     ImGui::PopStyleVar(1);
