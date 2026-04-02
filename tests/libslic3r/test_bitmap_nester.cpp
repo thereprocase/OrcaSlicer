@@ -14,7 +14,7 @@
 #include "libslic3r/Polygon.hpp"
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/Point.hpp"
-#include "libslic3r/ClipperUtils.hpp"
+#include "bitmap_test_utils.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -110,28 +110,8 @@ static ArrangePolygon make_ap(const ExPolygon &poly, int priority = 0)
     return ap;
 }
 
-// Verify that no two arranged polygons share a pixel on the bed.
-// Returns true when there is no overlap detected.
-static bool no_overlap(const ArrangePolygons &items)
-{
-    for (size_t i = 0; i < items.size(); ++i) {
-        if (items[i].bed_idx == UNARRANGED) continue;
-        for (size_t j = i + 1; j < items.size(); ++j) {
-            if (items[j].bed_idx != items[i].bed_idx) continue;
-
-            ExPolygon pi = items[i].transformed_poly();
-            ExPolygon pj = items[j].transformed_poly();
-
-            ExPolygons inter = intersection_ex(ExPolygons{pi}, ExPolygons{pj});
-            // Allow a tiny numerical sliver (< 0.01 mm²).
-            for (auto &seg : inter) {
-                if (std::abs(seg.area()) > scaled<double>(0.01) * scaled<double>(0.01))
-                    return false;
-            }
-        }
-    }
-    return true;
-}
+// Use shared no_overlap from bitmap_test_utils.hpp
+using test_utils::no_overlap;
 
 // ---------------------------------------------------------------------------
 // Section 1: Bitmap primitive unit tests
