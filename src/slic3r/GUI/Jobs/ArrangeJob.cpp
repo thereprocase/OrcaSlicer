@@ -557,7 +557,7 @@ void ArrangeJob::process(Ctl &ctl)
         BOOST_LOG_TRIVIAL(warning)<< "Arrange full params: "<< params.to_json();
         BOOST_LOG_TRIVIAL(info) << boost::format("arrange: items selected before arranging: %1%") % m_selected.size();
         for (auto selected : m_selected) {
-            BOOST_LOG_TRIVIAL(debug) << selected.name << ", extruder: " << selected.extrude_ids.back() << ", bed: " << selected.bed_idx << ", filemant_type:" << selected.filament_temp_type
+            BOOST_LOG_TRIVIAL(debug) << selected.name << ", extruder: " << (selected.extrude_ids.empty() ? -1 : (int)selected.extrude_ids.back()) << ", bed: " << selected.bed_idx << ", filemant_type:" << selected.filament_temp_type
                 << ", trans: " << selected.translation.transpose();
         }
         BOOST_LOG_TRIVIAL(debug) << "arrange: items unselected before arrange: " << m_unselected.size();
@@ -572,56 +572,88 @@ void ArrangeJob::process(Ctl &ctl)
     // them as convex blobs.
     if (params.use_concave_shapes) {
         auto &model = m_plater->model();
+
+        // Cache silhouettes per instance. Instances with matching X/Y rotation
+        // share a projection (the expensive part); others get their own.
+        // Z rotation is zeroed — the bitmap nester handles it during placement.
+        std::map<std::pair<ModelObject*, int>, ExPolygon> silhouette_cache;
+
+        for (auto *obj : model.objects) {
+            for (int inst_idx = 0; inst_idx < (int)obj->instances.size(); ++inst_idx) {
+                // Check if this instance shares X/Y rotation with a prior one
+                auto *inst = obj->instances[inst_idx];
+                bool reuse_prior = false;
+                for (int prev = 0; prev < inst_idx; ++prev) {
+                    Vec3d r0 = obj->instances[prev]->get_rotation();
+                    Vec3d r1 = inst->get_rotation();
+                    if (std::abs(r0.x() - r1.x()) < 1e-6 && std::abs(r0.y() - r1.y()) < 1e-6) {
+                        auto it = silhouette_cache.find({obj, prev});
+                        if (it != silhouette_cache.end()) {
+                            silhouette_cache[{obj, inst_idx}] = it->second;
+                            reuse_prior = true;
+                            break;
+                        }
+                    }
+                }
+                if (reuse_prior) continue;
+
+            Geometry::Transformation t;
+            {
+                Vec3d rotation = inst->get_rotation();
+                rotation.z() = 0.;
+                t = Geometry::Transformation(inst->get_transformation());
+                t.set_offset(inst->get_offset().z() * Vec3d::UnitZ());
+                t.set_rotation(rotation);
+            }
+
+            Polygons top_polys, bottom_polys;
+            for (auto *vol : obj->volumes) {
+                if (!vol->is_model_part()) continue;
+                Transform3d full_trafo = t.get_matrix() * vol->get_matrix();
+                Polygons vtop, vbot;
+                project_mesh(vol->mesh().its, full_trafo, &vtop, &vbot, []{});
+                append(top_polys, vtop);
+                append(bottom_polys, vbot);
+            }
+
+            Polygons all_polys;
+            append(all_polys, top_polys);
+            append(all_polys, bottom_polys);
+            ExPolygons silhouette = union_ex(all_polys);
+
+            if (!silhouette.empty()) {
+                auto largest = std::max_element(silhouette.begin(), silhouette.end(),
+                    [](const ExPolygon &a, const ExPolygon &b) {
+                        return std::abs(a.area()) < std::abs(b.area());
+                    });
+                ExPolygons simplified = offset_ex(
+                    offset_ex(*largest, scaled(-0.05)),
+                    scaled(0.05));
+                silhouette_cache[{obj, inst_idx}] = !simplified.empty() ? simplified.front() : *largest;
+            }
+            } // end inst_idx loop
+        }
+
+        // Now assign cached silhouettes to ArrangePolygons by matching instances
         for (auto &ap : m_selected) {
             bool found = false;
-            // Find the ModelInstance this ArrangePolygon corresponds to
             for (auto *obj : model.objects) {
                 if (found) break;
-                for (auto *inst : obj->instances) {
+
+                for (int inst_idx = 0; inst_idx < (int)obj->instances.size(); ++inst_idx) {
+                    auto *inst = obj->instances[inst_idx];
+                    // L4: epsilon comparison — exact Vec2crd equality breaks after
+                    // a scaled->unscaled->set_offset->get_offset->scaled round-trip
+                    // due to floating-point rounding (+-1 coord unit = +-1e-6 mm).
                     Vec2crd inst_pos{scaled(inst->get_offset(X)), scaled(inst->get_offset(Y))};
-                    // Match by translation (the unique identifier set in get_arrange_polygon)
-                    if (inst_pos != ap.translation) continue;
+                    constexpr coord_t POS_EPS = 2;
+                    if (std::abs(inst_pos.x() - ap.translation.x()) > POS_EPS ||
+                        std::abs(inst_pos.y() - ap.translation.y()) > POS_EPS)
+                        continue;
+                    auto cache_it = silhouette_cache.find({obj, inst_idx});
+                    if (cache_it != silhouette_cache.end())
+                        ap.poly = cache_it->second;
                     found = true;
-
-                    // Build the instance transform without XY offset and Z rotation
-                    Vec3d rotation = inst->get_rotation();
-                    rotation.z() = 0.;
-                    Geometry::Transformation t(inst->get_transformation());
-                    t.set_offset(inst->get_offset().z() * Vec3d::UnitZ());
-                    t.set_rotation(rotation);
-
-                    // Project all model-part volumes to 2D using project_mesh
-                    Polygons top_polys, bottom_polys;
-                    for (auto *vol : obj->volumes) {
-                        if (!vol->is_model_part()) continue;
-                        Transform3d full_trafo = t.get_matrix() * vol->get_matrix();
-                        Polygons vtop, vbot;
-                        project_mesh(vol->mesh().its, full_trafo, &vtop, &vbot, []{});
-                        append(top_polys, vtop);
-                        append(bottom_polys, vbot);
-                    }
-
-                    // Union all projected polygons to get concave 2D silhouette
-                    Polygons all_polys;
-                    append(all_polys, top_polys);
-                    append(all_polys, bottom_polys);
-                    ExPolygons silhouette = union_ex(all_polys);
-
-                    if (!silhouette.empty()) {
-                        // Use the largest polygon as the silhouette
-                        auto largest = std::max_element(silhouette.begin(), silhouette.end(),
-                            [](const ExPolygon &a, const ExPolygon &b) {
-                                return std::abs(a.area()) < std::abs(b.area());
-                            });
-                        // Simplify to reduce vertex count (0.1mm tolerance)
-                        ExPolygons simplified = offset_ex(
-                            offset_ex(*largest, scaled(-0.05)),
-                            scaled(0.05));
-                        if (!simplified.empty())
-                            ap.poly = simplified.front();
-                        else
-                            ap.poly = *largest;
-                    }
                     break;
                 }
             }
@@ -638,7 +670,7 @@ void ArrangeJob::process(Ctl &ctl)
     {
         BOOST_LOG_TRIVIAL(info) << boost::format("arrange: items selected after arranging: %1%") % m_selected.size();
         for (auto selected : m_selected)
-            BOOST_LOG_TRIVIAL(debug) << selected.name << ", extruder: " << selected.extrude_ids.back() << ", bed: " << selected.bed_idx
+            BOOST_LOG_TRIVIAL(debug) << selected.name << ", extruder: " << (selected.extrude_ids.empty() ? -1 : (int)selected.extrude_ids.back()) << ", bed: " << selected.bed_idx
                                      << ", bed_temp: " << selected.first_bed_temp << ", print_temp: " << selected.print_temp
                                      << ", trans: " << unscale<double>(selected.translation(X)) << ","<< unscale<double>(selected.translation(Y));
         BOOST_LOG_TRIVIAL(debug) << "arrange: items unselected after arrange: "<< m_unselected.size();

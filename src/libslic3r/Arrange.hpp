@@ -173,7 +173,8 @@ struct ArrangeParams {
         ret += "\"clearance_height_to_lid\":" + std::to_string(clearance_height_to_lid) + ",";
         ret += "\"clearance_radius\":" + std::to_string(clearance_radius) + ",";
         ret += "\"printable_height\":" + std::to_string(printable_height) + ",";
-        ret += "\"use_concave_shapes\":" + std::to_string(use_concave_shapes) + ",";
+        ret += "\"use_concave_shapes\":" + std::to_string(use_concave_shapes);
+        ret += "}";
         return ret;
     }
 
