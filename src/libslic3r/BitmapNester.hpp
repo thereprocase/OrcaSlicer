@@ -342,6 +342,61 @@ public:
                 item.bed_idx = UNARRANGED;
             }
         }
+
+        // Post-placement centering: shift placed items so the cluster
+        // center lands on align_center (default: bed center).
+        // Skip plates that have excludes — centering could shift items
+        // into forbidden zones that placement carefully avoided.
+        if (params.do_final_align) {
+            // Build set of plates that have any exclude
+            std::vector<bool> plate_has_exclude(current_plate + 1, false);
+            for (auto &ex : excludes) {
+                if (ex.bed_idx >= 0 && ex.bed_idx <= current_plate)
+                    plate_has_exclude[ex.bed_idx] = true;
+            }
+            if (!params.excluded_regions.empty()) {
+                for (int p = 0; p <= current_plate; ++p)
+                    plate_has_exclude[p] = true;
+            }
+
+            for (int plate = 0; plate <= current_plate; ++plate) {
+                if (plate_has_exclude[plate]) continue;
+
+                BoundingBox cluster_bb;
+                bool has_item = false;
+                for (auto &item : items) {
+                    if (item.bed_idx != plate) continue;
+                    ExPolygon placed = item.poly;
+                    if (item.rotation != 0.0) placed.rotate(item.rotation);
+                    placed.translate(item.translation.x(), item.translation.y());
+                    BoundingBox ibb = get_extents(placed);
+                    if (!has_item) { cluster_bb = ibb; has_item = true; }
+                    else cluster_bb.merge(ibb);
+                }
+                if (!has_item) continue;
+
+                double tx = bed.min.x() + (bed.max.x() - bed.min.x()) * params.align_center.x();
+                double ty = bed.min.y() + (bed.max.y() - bed.min.y()) * params.align_center.y();
+                double cx = (cluster_bb.min.x() + cluster_bb.max.x()) / 2.0;
+                double cy = (cluster_bb.min.y() + cluster_bb.max.y()) / 2.0;
+                coord_t dx = (coord_t)(tx - cx);
+                coord_t dy = (coord_t)(ty - cy);
+
+                if (cluster_bb.min.x() + dx < bed.min.x())
+                    dx = bed.min.x() - cluster_bb.min.x();
+                if (cluster_bb.max.x() + dx > bed.max.x())
+                    dx = bed.max.x() - cluster_bb.max.x();
+                if (cluster_bb.min.y() + dy < bed.min.y())
+                    dy = bed.min.y() - cluster_bb.min.y();
+                if (cluster_bb.max.y() + dy > bed.max.y())
+                    dy = bed.max.y() - cluster_bb.max.y();
+
+                for (auto &item : items) {
+                    if (item.bed_idx != plate) continue;
+                    item.translation += Vec2crd(dx, dy);
+                }
+            }
+        }
     }
 
 #ifdef BITMAP_NESTER_TESTING
