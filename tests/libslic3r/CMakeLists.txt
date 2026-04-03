@@ -29,6 +29,7 @@ add_executable(${_TEST_NAME}_tests
     test_bitmap_geometry.cpp
     test_bitmap_performance.cpp
     test_bitmap_overlap.cpp
+    test_bitmap_stress.cpp
     ../libnest2d/printer_parts.cpp
     )
 
