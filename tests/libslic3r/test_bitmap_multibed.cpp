@@ -611,3 +611,54 @@ TEST_CASE("edgecase: excluded_regions in ArrangeParams block two zones",
 
     REQUIRE(no_overlap(items));
 }
+
+// ---------------------------------------------------------------------------
+// Gap tests (Yellow audit, msgs #506/#509)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("edgecase: item wider than bed completes without crash",
+          "[BitmapEdgeCase]")
+{
+    // 300×300 mm item on a 250×210 mm bed. The rasterizer clamps the
+    // item bitmap to bed dimensions, so the item may be placed (clipped)
+    // or UNARRANGED. Either outcome is acceptable — the key invariant
+    // is no crash and a valid bed_idx.
+    ArrangePolygon ap = make_ap(make_rect_mm(0.0, 0.0, 300.0, 300.0));
+    ArrangePolygons items{ap};
+    ArrangePolygons excludes;
+    BoundingBox bed = make_bed_mm(250.0, 210.0);
+    ArrangeParams p = no_shrink_params();
+
+    REQUIRE_NOTHROW(BitmapNester::arrange(items, excludes, bed, p));
+    bool valid = (items[0].bed_idx == UNARRANGED) || (items[0].bed_idx >= 0);
+    REQUIRE(valid);
+}
+
+TEST_CASE("multibed: items beyond MAX_PLATES cap become UNARRANGED",
+          "[BitmapMultiBed]")
+{
+    // Bed 12×12 mm. Items 11×11 mm — exactly one per plate.
+    // 40 items exceeds MAX_PLATES (36). First 36 placed, rest UNARRANGED.
+    const int TOTAL = 40;
+    const int MAX_PLATES_CAP = 36;
+
+    ArrangePolygons items;
+    for (int i = 0; i < TOTAL; ++i)
+        items.push_back(make_ap(make_rect_mm(0.0, 0.0, 11.0, 11.0)));
+
+    ArrangePolygons excludes;
+    BoundingBox bed = make_bed_mm(12.0, 12.0);
+    ArrangeParams p = no_shrink_params();
+
+    REQUIRE_NOTHROW(BitmapNester::arrange(items, excludes, bed, p));
+
+    int placed = 0, unarranged = 0;
+    for (auto &it : items) {
+        if (it.bed_idx == UNARRANGED) ++unarranged;
+        else ++placed;
+    }
+
+    REQUIRE(placed <= MAX_PLATES_CAP);
+    REQUIRE(placed + unarranged == TOTAL);
+    REQUIRE(unarranged >= TOTAL - MAX_PLATES_CAP);
+}
