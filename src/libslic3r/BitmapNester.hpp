@@ -336,6 +336,8 @@ public:
                 item.rotation = best_rot;
                 item.bed_idx = best_plate;
                 item.itemid = item_sequence++;
+                if (params.on_packed)
+                    params.on_packed(item);
             } else {
                 item.bed_idx = UNARRANGED;
             }
