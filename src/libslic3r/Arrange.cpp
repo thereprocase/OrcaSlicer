@@ -1123,7 +1123,7 @@ static bool try_bitmap_arrange(ArrangePolygons &arrangables,
                                const BoundingBox &bed,
                                const ArrangeParams &params)
 {
-    if (!params.use_concave_shapes) return false;
+    if (!params.use_concave_shapes || params.is_seq_print) return false;
 
     BitmapNester::arrange(arrangables, excludes, bed, params);
     return true;
