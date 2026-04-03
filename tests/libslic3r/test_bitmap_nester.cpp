@@ -454,10 +454,10 @@ TEST_CASE("arrange: single small item is placed on plate 0", "[BitmapNester][arr
     REQUIRE(items[0].is_arranged());
 }
 
-TEST_CASE("arrange: single item placed near origin", "[BitmapNester][arrange]")
+TEST_CASE("arrange: single item centered on bed", "[BitmapNester][arrange]")
 {
-    // The bottom-left scan starts at (0,0), so a lone item should land close to
-    // the bed origin (within one resolution step = 0.5 mm).
+    // A lone item on an empty plate gets centered by the post-placement
+    // centering pass (do_final_align defaults to true).
     ArrangePolygon ap = make_ap(make_rect_mm(0.0, 0.0, 5.0, 5.0));
     ArrangePolygons items{ap};
     ArrangePolygons excludes;
@@ -471,11 +471,10 @@ TEST_CASE("arrange: single item placed near origin", "[BitmapNester][arrange]")
     double tx_mm = unscaled<double>(items[0].translation.x());
     double ty_mm = unscaled<double>(items[0].translation.y());
 
-    // Translation brings the poly's origin (0,0) to the bed. The poly's bbox.min
-    // is (0,0) in poly-space, so origin_x = best_px * res + pad_mm + bed.min.
-    // With no padding and bed.min = 0 → tx ≈ 0 and ty ≈ 0.
-    REQUIRE_THAT(tx_mm, Catch::Matchers::WithinAbs(0.0, 1.5)); // within 1.5 mm
-    REQUIRE_THAT(ty_mm, Catch::Matchers::WithinAbs(0.0, 1.5));
+    // Centered: 5mm item on 250x210 bed -> center at (125, 105),
+    // item placed so its center lands there -> tx ~ 122.5, ty ~ 102.5
+    REQUIRE_THAT(tx_mm, Catch::Matchers::WithinAbs(122.5, 2.0));
+    REQUIRE_THAT(ty_mm, Catch::Matchers::WithinAbs(102.5, 2.0));
 }
 
 TEST_CASE("arrange: two items placed on same plate without overlap", "[BitmapNester][arrange]")
