@@ -13,7 +13,7 @@ BUILD_CONSENT=yes bash orca/build.sh clean test
 BUILD_CONSENT=yes bash orca/build.sh clean dll --snapshot --note=description
 ```
 
-All commands run from the `D:/ClauDe/` root. Snapshots land in `orca/builds/clean/YYYYMMDD-HHMMSS-commithash-description/`.
+All commands run from the workspace root (`F:/Claude/`). Snapshots land in `orca/builds/clean/YYYYMMDD-HHMMSS-commithash-description/`.
 
 ---
 
@@ -44,7 +44,7 @@ The clean worktree borrows pre-built dependencies from the snuggle worktree:
 orca/snuggle/deps/build/OrcaSlicer_dep/usr/local
 ```
 
-These deps were originally built at `D:/ClauDe/orcaSlicer-snuggle/...` (before the workspace consolidation). Filesystem junctions map old paths to new locations so baked-in cmake references still resolve.
+These deps were originally built at an older path. Filesystem junctions map old paths to new locations so baked-in cmake references still resolve. Run `check-build.sh --fix-junctions` if needed.
 
 ## Pre-flight: `check-build.sh`
 
@@ -111,7 +111,7 @@ bash orca/check-build.sh clean --fix-junctions
 ```bash
 cd orca/clean/build
 rm -rf CMakeCache.txt CMakeFiles/
-cmake .. -DCMAKE_PREFIX_PATH=D:/ClauDe/orca/snuggle/deps/build/OrcaSlicer_dep/usr/local -DBUILD_TESTS=ON
+cmake .. -DCMAKE_PREFIX_PATH=../../snuggle-radial/deps/build/OrcaSlicer_dep/usr/local -DBUILD_TESTS=ON
 ```
 
 Editing `CMakeCache.txt` alone is NOT sufficient — the generated `.vcxproj` files have their own baked-in paths from configure time.
