@@ -373,6 +373,12 @@ TEST_CASE("BitmapOverlap: items do not overlap exclude zones",
 
     // Also verify items don't overlap each other.
     assert_no_overlaps(items);
+
+    // Count placed items so the test registers an assertion.
+    int placed = 0;
+    for (auto &it : items)
+        if (it.bed_idx >= 0) ++placed;
+    REQUIRE(placed > 0);
 }
 
 // ============================================================================
