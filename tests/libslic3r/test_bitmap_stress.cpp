@@ -298,13 +298,18 @@ TEST_CASE("Stress: extreme bed shrinkage — most items UNARRANGED gracefully",
     for (auto &it : items)
         if (it.bed_idx != UNARRANGED) ++placed;
 
-    // Usable area is 16×10mm = 160mm². Each item is 25mm². At most ~6 fit.
-    // Some will be placed, many won't. Multi-plate overflow means more may
-    // place, but the key invariant: no crash and no overlaps.
+    // Usable area per plate is 16×10mm = 160mm². Each item is 25mm². At most ~6 fit
+    // per plate, so all 20 can legitimately pack by overflowing to multiple plates.
+    // Key invariants: no crash, no overlaps, and overflow actually happened (plate
+    // count > 1). The earlier "placed < 20" assertion contradicted the test's own
+    // "unless overflow" acknowledgement and has been removed.
     INFO("placed = " << placed << " / 20");
     CHECK(placed > 0);    // At least some should fit
-    CHECK(placed < 20);   // Can't all fit on a single tiny bed (unless overflow)
     CHECK(no_overlap(items));
+    std::set<int> beds;
+    for (auto &it : items)
+        if (it.bed_idx != UNARRANGED) beds.insert(it.bed_idx);
+    CHECK(beds.size() > 1);   // Tiny usable area forces multi-plate overflow
 }
 
 TEST_CASE("Stress: shrinkage collapses bed to zero — all UNARRANGED, no crash",
