@@ -34,6 +34,7 @@ add_executable(${_TEST_NAME}_tests
     test_tetromino_packing.cpp
     test_real_mix_packing.cpp
     test_consolidation.cpp
+    test_bitmap_nester_c2.cpp
     ../libnest2d/printer_parts.cpp
     )
 
