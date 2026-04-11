@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cassert>
 #include <random>     // smart-shuffle restart driver uses std::mt19937
+#include <tuple>      // score_at returns a lex tuple (area, perim, dist)
 #include <utility>
 
 namespace Slic3r { namespace arrangement {
@@ -618,6 +619,24 @@ public:
                 const ClusterBB &cbb = cluster_bb[plate_idx];
                 const int64_t cbb_area = cbb.area();
                 const bool cbb_empty = cbb.empty();
+                // Current cluster bbox perimeter in pixels. Used as a
+                // lexicographic tiebreaker after area — when multiple
+                // candidate positions produce the same area growth,
+                // prefer the one that keeps the cluster more square.
+                // 4 equal squares packing into a 2x2 is exactly this
+                // case: (0,80) and (60,80) and (80,80) all have the
+                // same delta_area, but (0,80) and (80,80) extend the
+                // perimeter less than the other options would have
+                // otherwise (they're not actually different in this
+                // case; the corner anchor handles that one via BL-fill
+                // tiebreak). This secondary matters more for mixed
+                // non-square items.
+                const int64_t cbb_w = cbb_empty ? 0
+                    : (int64_t)(cbb.maxx - cbb.minx + 1);
+                const int64_t cbb_h = cbb_empty ? 0
+                    : (int64_t)(cbb.maxy - cbb.miny + 1);
+                const int64_t cbb_perim = cbb_empty ? 0
+                    : 2 * (cbb_w + cbb_h);
 
                 // Tall-parts-centered bias. At high layer counts, only tall
                 // parts are still printing. Putting them in a plate corner
@@ -639,42 +658,50 @@ public:
                 const double tall_weight = cbb_empty ? 0.0
                     : std::min(1.0, item_height_mm / 100.0);
 
-                // Score a candidate placement as:
-                //   primary   = growth in cluster bounding box area (int64)
-                //   secondary = squared pixel distance of candidate bbox
+                // Score a candidate placement lexicographically:
+                //   primary   = growth in cluster bbox AREA (int64)
+                //   secondary = growth in cluster bbox PERIMETER (int64)
+                //   tertiary  = squared pixel distance of candidate bbox
                 //               center from resolved anchor + tall-bias
                 //               toward plate center (skipped for first item
                 //               per plate so the anchor seed still lands).
                 //
-                // A rotated L-shape slotted into an existing L's concave notch
-                // has its bbox already inside the cluster bbox, so delta_area
-                // is zero and it wins over any non-interlocking position.
-                // When the cluster is empty, all positions tie on delta_area
-                // and the anchor tiebreaker decides (first item clusters
-                // around the wipe tower; in the default case the anchor is
-                // (0, 0) so first item lands top-left, preserving the old
-                // first-fit baseline pack density).
+                // Primary catches the "does this item fit inside existing
+                // cluster?" test — a rotated L slotting into an L's notch
+                // has delta_area = 0 and wins against any non-interlocking
+                // position. Secondary breaks area ties by preferring the
+                // candidate that keeps the cluster more square (minimizing
+                // perimeter growth = minimizing worst-case print-head XY
+                // travel across the cluster). Tertiary is the position
+                // tiebreaker (anchor + tall bias) that handles the rare
+                // doubly-tied case.
                 //
-                // We return a pair so lexicographic comparison does the right
-                // thing without numerical scaling games.
+                // Returning a tuple instead of a pair so lexicographic
+                // comparison via std::tuple's operator< works directly.
                 auto score_at = [&](const RotCache &rc, int px, int py)
-                    -> std::pair<int64_t, double>
+                    -> std::tuple<int64_t, int64_t, double>
                 {
                     int nminx = px;
                     int nminy = py;
                     int nmaxx = px + rc.iw - 1;
                     int nmaxy = py + rc.ih - 1;
-                    int64_t new_area;
+                    int64_t new_w, new_h;
                     if (cbb_empty) {
-                        new_area = (int64_t)rc.iw * (int64_t)rc.ih;
+                        new_w = (int64_t)rc.iw;
+                        new_h = (int64_t)rc.ih;
                     } else {
                         int mnx = std::min(cbb.minx, nminx);
                         int mny = std::min(cbb.miny, nminy);
                         int mxx = std::max(cbb.maxx, nmaxx);
                         int mxy = std::max(cbb.maxy, nmaxy);
-                        new_area = (int64_t)(mxx - mnx + 1) * (int64_t)(mxy - mny + 1);
+                        new_w = (int64_t)(mxx - mnx + 1);
+                        new_h = (int64_t)(mxy - mny + 1);
                     }
-                    int64_t delta = new_area - cbb_area;
+                    int64_t new_area  = new_w * new_h;
+                    int64_t new_perim = 2 * (new_w + new_h);
+                    int64_t delta_area  = new_area  - cbb_area;
+                    int64_t delta_perim = new_perim - cbb_perim;
+
                     double cx = (double)px + rc.iw * 0.5 - ax;
                     double cy = (double)py + rc.ih * 0.5 - ay;
                     double dist2 = cx * cx + cy * cy;
@@ -686,7 +713,7 @@ public:
                         double dist2_center = cbx * cbx + cby * cby;
                         sec += tall_weight * dist2_center;
                     }
-                    return {delta, sec};
+                    return {delta_area, delta_perim, sec};
                 };
 
                 // Per-rotation coarse winner — NOT a single global winner.
@@ -701,7 +728,8 @@ public:
                 // coarse (px, py) per rotation, then run refine for EVERY
                 // rotation and keep the global best across all refine results.
                 struct CoarseBest {
-                    std::pair<int64_t, double> score{
+                    std::tuple<int64_t, int64_t, double> score{
+                        std::numeric_limits<int64_t>::max(),
                         std::numeric_limits<int64_t>::max(),
                         std::numeric_limits<double>::infinity()};
                     int px = -1;
@@ -765,7 +793,8 @@ public:
                 // score_at and track the GLOBAL best across all rotations.
                 // This is the fix for bug #3 — an interlocking rotation that
                 // lost the coarse lottery still gets a chance at refinement.
-                std::pair<int64_t, double> refine_score{
+                std::tuple<int64_t, int64_t, double> refine_score{
+                    std::numeric_limits<int64_t>::max(),
                     std::numeric_limits<int64_t>::max(),
                     std::numeric_limits<double>::infinity()};
                 int refine_px = -1, refine_py = -1;
