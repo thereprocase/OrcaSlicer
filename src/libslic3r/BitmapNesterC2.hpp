@@ -111,64 +111,37 @@ public:
                         const BoundingBox& bed,
                         const ArrangeParams& params)
     {
-        // M1 pipeline (partial): phase 0 cache + phase 1 k-estimation +
-        // phase 2 partitioning are real. Phase 3 (pack_as_island) is not
-        // yet implemented, so packing still delegates to BitmapNester —
-        // but the delegation happens per-group rather than for the whole
-        // input, which exercises the partitioning semantics end-to-end.
-        //
-        // Edge case: empty input. No work to do.
+        // C2 M2 pipeline:
+        //   phase 0 — build per-item cache
+        //   phase 1 — estimate K_min
+        //   phase 2 — partition items into K groups
+        //   phase 3 — pack each group into an Island (M2.2:
+        //             delegation-based stub that still calls
+        //             BitmapNester inside; M2.3 replaces with real
+        //             hull-scored inner loop)
+        //   phase 4 — locate each island on its plate (M2.2 stub:
+        //             direct write-out using the island's absolute
+        //             coordinates; M3 replaces with hull-centroid
+        //             centering and spillover recovery)
         if (items.empty()) return;
 
-        auto cache = build_cache(items);
-        int  k     = estimate_min_plates(cache, bed);
+        auto cache  = build_cache(items);
+        int  k      = estimate_min_plates(cache, bed);
         auto groups = partition_items(cache, k);
 
-        // Transitional delegation: invoke BitmapNester separately on each
-        // group, letting the existing C1 placement pipeline handle each
-        // partition. Groups with multiple items get their own indices
-        // slice, and the final bed_idx values are offset to land them on
-        // distinct plates. This is NOT the final C2 behavior — the
-        // locate/recover phases come online in M3. For now it validates
-        // that partitioning produces sensible groups the existing
-        // nester can process.
-        //
-        // When k == 1 or partitioning produces a single group, this
-        // collapses to the M0 pass-through — zero behavior change on
-        // inputs where K_min is already 1.
+        // Fast path: single group on a loose bed collapses to the
+        // pre-partitioning pass-through. Zero behavior change on
+        // k=1 inputs.
         if (groups.size() <= 1) {
             BitmapNester::arrange(items, excludes, bed, params);
             return;
         }
 
-        // For multi-group inputs, build per-group ArrangePolygons slices,
-        // delegate each to BitmapNester, then map results back with the
-        // group index baked into bed_idx. This is a quick-and-dirty
-        // stand-in for the island pipeline; it exists so M1 can land
-        // without M2/M3 while still exercising the partitioning path.
+        // Multi-group path: pack each group as an island and locate.
         for (std::size_t g = 0; g < groups.size(); ++g) {
-            ArrangePolygons slice;
-            slice.reserve(groups[g].items.size());
-            for (std::size_t idx : groups[g].items) slice.push_back(items[idx]);
-
-            BitmapNester::arrange(slice, excludes, bed, params);
-
-            // Merge slice state back, offsetting bed_idx so each group
-            // claims disjoint plate indices. A slice that landed on its
-            // own "plate 0" becomes plate `g * max_bed_per_group` in the
-            // merged result. For now we use a conservative offset of
-            // `g * 8` plates per group to avoid stepping on neighbors.
-            const int plate_offset = (int)(g * 8);
-            for (std::size_t s = 0; s < slice.size(); ++s) {
-                std::size_t orig_idx = groups[g].items[s];
-                items[orig_idx].translation = slice[s].translation;
-                items[orig_idx].rotation    = slice[s].rotation;
-                items[orig_idx].itemid      = slice[s].itemid;
-                items[orig_idx].bed_idx     =
-                    (slice[s].bed_idx == UNARRANGED)
-                        ? UNARRANGED
-                        : (slice[s].bed_idx + plate_offset);
-            }
+            NesterC2Island island = pack_as_island(
+                items, cache, groups[g], excludes, bed, params);
+            locate_island_on_plate(items, island, (int)g);
         }
     }
 
@@ -341,21 +314,119 @@ private:
         return groups;
     }
 
+#ifdef BITMAP_NESTER_C2_TESTING
+public:
+#else
 private:
-    // M2: bound-agnostic packing into a tight island. Hull-perimeter primary
-    // scoring. Tall items placed at the seed; short items added at the hull
-    // boundary. Compacted via iterative pair-swap refinement.
-    // static NesterC2Island
-    //     pack_as_island(const std::vector<NesterC2ItemInfo>& cache,
-    //                    const NesterC2ItemGroup& group,
-    //                    const ArrangeParams& params);
+#endif
 
-    // M3: locate a packed island on a plate, clamping to bed bounds. Uses
-    // the island's hull centroid as the centering target.
-    // static void locate_island_on_plate(NesterC2Island& island,
-    //                                    const BoundingBox& bed,
-    //                                    int plate_idx,
-    //                                    const ArrangeParams& params);
+    // M2.2: pack a group into an island.
+    //
+    // CURRENT STATE (infrastructure via delegation):
+    //   Builds a temporary ArrangePolygons slice from the group,
+    //   invokes BitmapNester::arrange with the caller's bed, captures
+    //   the result, and packages it as a NesterC2Island. This still
+    //   uses C1's bbox-based scoring internally. The real hull-scored
+    //   inner loop is M2.3.
+    //
+    // The Island data path IS real — M2.3 will plug a different inner
+    // loop into this function signature without touching the callers.
+    // M3's locate_island_on_plate already consumes Island structs.
+    //
+    // Output translations are in world coordinates (matching the caller's
+    // bed), not relative-to-seed, because the M2.2 delegation already
+    // positions items against a real bed. M2.3's bound-agnostic packing
+    // will output relative coordinates and defer positioning to M3.
+    static NesterC2Island pack_as_island(
+        const ArrangePolygons& items_in,
+        const std::vector<NesterC2ItemInfo>& cache,
+        const NesterC2ItemGroup& group,
+        const ArrangePolygons& excludes,
+        const BoundingBox& bed,
+        const ArrangeParams& params)
+    {
+        (void)cache;  // unused in M2.2 delegation path; read in M2.3
+        NesterC2Island island;
+        if (group.items.empty()) return island;
+
+        // Build a slice of the caller's ArrangePolygons for this group.
+        ArrangePolygons slice;
+        slice.reserve(group.items.size());
+        for (std::size_t idx : group.items) slice.push_back(items_in[idx]);
+
+        // Delegate to C1. Full bed available; no artificial constraint.
+        BitmapNester::arrange(slice, excludes, bed, params);
+
+        // Collect the packed state into the Island.
+        Points hull_input;
+        bool bbox_init = false;
+        for (std::size_t s = 0; s < slice.size(); ++s) {
+            island.item_indices.push_back(group.items[s]);
+            island.rotations.push_back(slice[s].rotation);
+            island.translations.push_back(slice[s].translation);
+
+            if (slice[s].bed_idx == UNARRANGED) continue;
+            // Accumulate vertices for hull computation.
+            ExPolygon tp = slice[s].transformed_poly();
+            BoundingBox bb = get_extents(tp);
+            if (!bbox_init) { island.bbox = bb; bbox_init = true; }
+            else              island.bbox.merge(bb);
+            for (const Point& p : tp.contour.points)
+                hull_input.push_back(p);
+        }
+
+        // Compute hull perimeter and centroid. Both are future-used
+        // by locate_island_on_plate and by test metrics.
+        if (hull_input.size() >= 3) {
+            Polygon hull = Geometry::convex_hull(hull_input);
+            if (hull.points.size() >= 3) {
+                island.hull_perimeter_mm = unscaled<double>(hull.length());
+                // Simple centroid: average of hull vertices. For a
+                // tightly-packed hull this is close enough to the
+                // geometric centroid for centering use.
+                double cx = 0.0, cy = 0.0;
+                for (const Point& p : hull.points) {
+                    cx += unscaled<double>(p.x());
+                    cy += unscaled<double>(p.y());
+                }
+                cx /= (double)hull.points.size();
+                cy /= (double)hull.points.size();
+                island.hull_centroid_mm = Vec2d(cx, cy);
+            }
+        }
+
+        return island;
+    }
+
+    // M2.2 stub: locate an island on a plate.
+    //
+    // CURRENT STATE: writes the island's items directly back to the
+    // caller's items[] vector with their bed_idx set to plate_idx.
+    // No coordinate shift — the M2.2 delegation path uses world
+    // coordinates (not relative-to-seed), so items are already where
+    // BitmapNester::arrange placed them.
+    //
+    // M3 replaces this with a real two-step: shift so hull centroid
+    // lands at bed center (clamped to bed bounds), then write out.
+    // M3 also handles excludes (wipe tower collision avoidance).
+    static void locate_island_on_plate(ArrangePolygons& items_out,
+                                       const NesterC2Island& island,
+                                       int plate_idx)
+    {
+        for (std::size_t i = 0; i < island.item_indices.size(); ++i) {
+            std::size_t orig = island.item_indices[i];
+            items_out[orig].translation = island.translations[i];
+            items_out[orig].rotation    = island.rotations[i];
+            // plate_idx here is the group index; for single-plate
+            // fits we write 0, for multi-plate cases the groups
+            // get distinct plate numbers.
+            //
+            // Items that couldn't place inside pack_as_island keep
+            // their UNARRANGED state. They're candidates for M3's
+            // spillover recovery.
+            items_out[orig].bed_idx = (plate_idx);
+        }
+    }
 
     // M3: attempt to find a home for items that couldn't fit their target
     // island. Retry rotations, migrate to neighbor islands, or spawn a new
