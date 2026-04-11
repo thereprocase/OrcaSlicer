@@ -60,9 +60,12 @@ War Council round 2 (8 agents) found multiple reasons.
   `make_ap({0.0})` default.
 - [ ] **Smoke test: arrange + install + bbox check** (Gimli C2). Catches ship
   regressions that unit tests miss.
-- [ ] **MD5 check BEFORE snapshot copy** (Gimli C3) against
-  `$INSTALL_DIR/OrcaSlicer.dll` — detect stale install before write, not
-  after.
+- [x] **`cmake --install` BEFORE snapshot copy** (Gimli C3, fixed
+  2026-04-11). Inserted into `build.sh` so the install dir is synced
+  with the freshly-built DLL before the snapshot copies anything. The
+  MD5 check at the end of the snapshot block now validates as
+  intended (it was previously a post-mortem on a guaranteed mismatch
+  whenever the install dir lagged behind the build dir).
 - [ ] **Strengthen `no_bed_gaps`** — current helper only checks plate index
   contiguity, not actual density. Rename existing helper to
   `plate_indices_contiguous` and add a real `density_above(items, threshold)`
@@ -94,7 +97,10 @@ the upstream PR target against SoftFever/OrcaSlicer issue #10909.
 - [ ] **Strip `L#` audit markers** from comments (L1, L3, L7, L9, L12, L13, L14, L15 — all 2026-04-03 audit shorthand)
 - [ ] **Name magic numbers**: `BITMAP_PIXEL_LIMIT`, `DEFAULT_RES_MM`, `COARSE_DIVISOR`, `COARSE_MIN`, `COARSE_MAX`
 - [ ] **Fix `sw` shadow** in `dilate_bitmap` (GCC/Clang `-Wshadow`, MSVC C4456)
-- [ ] **Add explicit `#include "ClipperUtils.hpp"`** — currently works via the force-included PCH only
+- [x] **Add explicit `#include "ClipperUtils.hpp"`** — done
+  2026-04-11 alongside the pack-as-best work; the post-centering
+  safety check uses `intersection_ex` directly so the latent PCH
+  dependency became a hard failure.
 - [ ] **Honor `locked_plate`** (fixed obstacle treated as placed on its plate)
 - [ ] **Honor `is_extrusion_cali_object`** (zero-inflation branch)
 - [ ] **Add `bed_temp` as secondary sort key**
@@ -111,7 +117,9 @@ the upstream PR target against SoftFever/OrcaSlicer issue #10909.
 - [ ] **GUI Reset button desync fix** in `GLCanvas3D.cpp` (Frodo)
 - [ ] **GUI log line** distinguishing concave vs default arrange mode (Frodo)
 - [ ] **Purge line avoidance cherry-pick:** new `ConfigOptionPoints purge_line_region` key mirroring upstream `bd066e7f` wrapping-detection pattern. Zero `BitmapNester.hpp` changes.
-- [ ] **Build harness:** patch `build.sh` to run `cmake --install` before snapshot step so install-dir staleness doesn't keep failing MD5 check. Or document the manual workflow in `docs/BUILD.md`.
+- [x] **Build harness:** patched `build.sh` 2026-04-11 to run
+  `cmake --install` before the snapshot copy step. The recurring
+  install-dir-staleness MD5 failure is now structurally impossible.
 
 ### Sprint 2 exit criteria
 
