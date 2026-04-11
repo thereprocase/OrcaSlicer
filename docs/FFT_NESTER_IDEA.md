@@ -168,6 +168,407 @@ Phase 5: decide.
 - If FFT nester wins on density AND is competitive on wall-clock, deprecate
   the scored scan. Otherwise keep both as user-selectable strategies.
 
+## Companion idea: cheap impossibility certificates + plate consolidation
+
+Captured 2026-04-11 from a follow-up design discussion. This is the
+"when not to think" half of the FFT fork — the FFT proposal above
+covers *how* to search the placement space; this section covers *when*
+to call the search and when to declare "obviously done" without
+running it. Both belong in the same fork.
+
+### The core insight
+
+The human isn't optimizing — they're recognizing when optimization is
+pointless. Computers do the opposite: they optimize indiscriminately
+because the framework gives them no cheap "is this worth thinking
+about" test. Add that test, layered cheapest-first, and most
+refinement work is skipped before it starts.
+
+### Start with a bound, not a solution
+
+Compute the theoretical minimum plate count `K_min` before placing
+anything:
+
+```
+K_min = ceil(sum(part_silhouette_area) / plate_area)
+```
+
+That's a hard lower bound — you cannot do better. After the greedy
+pack, if the producer hits exactly `K_min` plates, you are provably
+done. No rearrangement pass, no second guessing, no FFT calls. This
+single check catches both the easy case (lots of small parts) and
+the trivially-hard case (one huge part per plate) for free.
+
+### Pair-level "obviously won't fit" certificate
+
+The "two diagonal rectangles" intuition is a constant-time bounding-
+box test. For each pair of parts on separate plates, check whether
+*any* combination of 90-degree rotations places their bounding boxes
+on a single plate. The check is four inequalities per rotation
+combo (16 total for 4 rotations each):
+
+```
+bbox_cofit(A, B, plate) =
+  any rot_a in {0,90,180,270}, any rot_b in {0,90,180,270} where:
+    (rot(A).w + rot(B).w <= plate.w  AND  max(rot(A).h, rot(B).h) <= plate.h)
+    OR
+    (rot(A).h + rot(B).h <= plate.h  AND  max(rot(A).w, rot(B).w) <= plate.w)
+```
+
+If no rotation combo passes, the exact silhouettes cannot co-fit
+either. This is the "I can see these don't fit together" moment a
+human has instantly. It is constant-time per pair and prunes the
+expensive FFT work before it starts.
+
+### Layered impossibility certificate
+
+Cheapest first. Each layer says either "definitely impossible, skip"
+or "maybe, ask the next layer."
+
+**Layer 0 — area saturation.** If the current plate's utilization is
+above 85-90 percent, no rearrangement gains a meaningful win. Skip
+the plate. Tunable threshold. This is the "I can see this plate is
+basically full" check.
+
+**Layer 1 — bounding-box bin pack.** Ignore silhouette shapes
+entirely. Can the axis-aligned bounding boxes of the parts on the
+*next* plate fit into the free bounding-box of the *current* plate?
+This is 2D bin packing of rectangles, NP-hard in general but for
+2-5 candidate parts it brute-forces in microseconds. If the bboxes
+don't fit, the real shapes can't either.
+
+**Layer 2 — FFT correlation.** Only run this if layers 0 and 1
+return "maybe." Compute the feasible-placement mask for each
+candidate part on the target plate at every rotation. If every mask
+is empty (every pixel is non-zero), the placement is certified
+impossible. Move on.
+
+The point is that layer 2 — the only expensive layer — runs on
+maybe one in twenty pair attempts. The other nineteen are killed by
+layers 0 and 1 in nanoseconds.
+
+### Suspicion-weighted refinement budget
+
+After the greedy pass, compute a "suspicion score" per plate:
+
+```
+suspicion(plate) =
+    plate.utilization is in [50%, 80%]
+  AND
+    next_plate has at least one part whose bbox bbox_cofit_passes(plate)
+```
+
+Plates above 95 percent utilization score zero — they're not worth
+revisiting. Plates between 50 and 80 percent with migratable
+candidates score highest. Spend the refinement time budget
+proportional to suspicion, not uniformly. Plates that already look
+"nearly full" get no thinking time at all.
+
+### Plate consolidation loop
+
+Work backwards from the last plate. Try to empty each plate by
+migrating its parts to earlier plates. The moment a plate empties,
+plate count drops by one — that is the biggest visible win a user
+notices.
+
+```
+for plate_i from K-1 down to 1:
+    if bbox_cofit_test(plate_i.parts, any earlier plate) == IMPOSSIBLE_FOR_ALL:
+        continue        # Layer 1 prune
+    for each part P on plate_i, in descending area order:
+        for each earlier plate_j in [0, i):
+            if layer0(plate_j) returns SATURATED: continue
+            if bbox_cofit_test(P, plate_j) == IMPOSSIBLE: continue
+            mask = fft_correlate(P, plate_j, all_rotations)
+            if mask has any zero pixel:
+                move P to plate_j
+                if plate_i is now empty:
+                    eliminate plate_i; K -= 1
+                    break
+    if time_budget_exceeded: break
+```
+
+The two `continue` lines are the cheap pruning — most iterations
+skip the FFT call entirely. Within-plate density improvements are
+secondary; eliminating an entire plate is the headline metric.
+
+### Termination
+
+Three stopping conditions, whichever hits first:
+
+1. `K == K_min`. Provably can't improve. Area-theoretic optimum.
+2. Every remaining plate pair fails the bbox co-fit test. Provably
+   can't consolidate further. This is the "human glances at the
+   layout and shrugs" condition.
+3. Wall-clock budget exhausted. Default 2-5 seconds for refinement.
+
+Condition 2 is the most important one to mechanize — it is what a
+human does without thinking, and it costs almost nothing
+computationally.
+
+### Near-miss detection (the one place local search pays off)
+
+The FFT correlation map gives you more than a binary "fits / doesn't
+fit." The numerical values are the count of overlapping pixels at
+each candidate position. Near-zero values mean "almost fits, just a
+few pixels of overlap somewhere."
+
+When the best mask value for a candidate placement is small (say
+below a few percent of part area), do *not* give up immediately.
+Instead:
+
+1. Identify the blocking already-placed part (the one whose pixels
+   the candidate would overlap).
+2. Try nudging the blocking part by a small amount in 4-8 directions,
+   each time re-running the candidate's correlation.
+3. Bail after at most 3 nudges per candidate.
+
+This is the "if I just shifted that other one by 5 mm..." reflex.
+Bounded local search, costs almost nothing, occasionally produces
+the move that consolidates a plate.
+
+### Combined complexity profile
+
+- Greedy initial pack: O(N * R * G^2 log G) — linear in parts
+- K_min bound: O(N) — single pass
+- Bbox co-fit certificates: O(K^2 * N) constant-time checks — tiny
+- FFT refinement (only on layer-0+1 survivors): O(M * R * G^2 log G)
+  where M is migration attempts, bounded by time budget
+- Near-miss nudges: at most 3 * R per candidate, capped
+
+**Total wall clock: greedy time + fixed refinement budget (2-5 s).**
+
+Nothing exponential. Nothing combinatorial. The certificate layers
+prune the expensive FFT work so aggressively that *most refinement
+calls return without ever running an FFT*. The cost of asking "is
+this worth thinking about" is negligible compared to the cost of
+one unnecessary correlation.
+
+### Why this matters more than the FFT itself
+
+The FFT proposal in the previous section is about the inner loop
+running faster. This section is about not running the inner loop at
+all when there's nothing to gain. In practice the second win is
+larger — most plates after a reasonable greedy pass are either
+already optimal (catch with K_min and layer 0) or provably
+unfixable (catch with bbox co-fit). The FFT only earns its keep on
+the small middle slice where rearrangement might actually work, and
+even there the certificate stack has already filtered down to the
+moves worth attempting.
+
+The fork's pitch lines up nicely:
+
+- **What is faster:** FFT correlation vs scored brute-force scan.
+- **What is smarter:** layered certificates + plate consolidation
+  vs single greedy pass.
+- **What is the user-visible result:** plate count drops by one
+  more often than the current nester achieves, because rearrangement
+  actually runs on the cases where it can win, and refinement time
+  is spent where it pays off.
+
+## Companion idea (3 of 3): three-tier parallelism strategy
+
+Captured 2026-04-11 from a follow-up discussion. The first two
+companion sections cover the algorithm (FFT correlation) and the
+control flow (certificate-pruned consolidation). This third section
+covers how to schedule all of it onto multiple cores so the
+"refinement budget" is hidden inside the packing wall-clock instead
+of added to it.
+
+### The fundamental tension
+
+Greedy packing is sequential — each placement depends on the
+previous one. You cannot parallelize within a single packing pass
+without changing the algorithm. But you can parallelize *across*
+strategies and *within* the expensive subroutines.
+
+### Tier 1 — FFT parallelism (free, automatic)
+
+Each FFT correlation for a candidate rotation is independent. With
+12 rotations per part, that's 12 independent FFTs. FFTW or PocketFFT
+will thread within a single transform, but the bigger win is
+dispatching all 12 as independent tasks. On an 8-core machine, all
+12 rotations complete in the wall-clock time of 2.
+
+This requires zero algorithm changes — the greedy packer just gets
+its answers faster. Every approach below benefits automatically.
+
+### Tier 2 — parallel permutation search (the big quality win)
+
+The greedy packer's quality depends on placement order. Different
+orderings produce different results. They are completely
+independent — perfect parallel work units, no shared state during
+execution.
+
+**Primary path.** One thread runs the deterministic "smart" ordering
+(area-descending, the best deterministic heuristic). It starts
+immediately and is the guaranteed baseline.
+
+**Speculative paths.** The remaining N-1 threads each run a seeded
+*perturbation* of the smart ordering — swap 2-3 parts, shuffle
+within size-class buckets, randomize ties. These are exploring the
+ordering neighborhood. They are not fully random — the smart
+ordering is the center of mass and the perturbations are nearby.
+
+**No communication during execution.** No locks, no sync, no shared
+state. Each thread has its own bitmap, its own composite plate
+state, its own answer. They only converge at the end.
+
+**Convergence.** When all paths complete, compare results by total
+plate count (primary metric) and within-plate density (tiebreaker).
+Adopt the best. The wall-clock cost is exactly one packing pass —
+because they all ran simultaneously — but you've effectively
+searched N orderings.
+
+### Tier 3 — pipelined packing + certification + consolidation
+
+This is the subtle one. The "is this worth improving" certificate
+work and the actual consolidation work happen *while* the packer is
+still running on later plates. There is no separate refinement
+phase that the user waits for.
+
+```
+Thread A (packer):       plate 1 -> plate 2 -> plate 3 -> plate 4 -> ...
+Thread B (certifier):    idle    -> cert 1   -> cert 2   -> cert 3   -> ...
+Thread C (consolidator): idle    -> idle     -> try 2->1 -> try 3->? -> ...
+```
+
+**Thread A** is the greedy packer, churning through parts plate by
+plate.
+
+**Thread B** trails by one plate. When plate K is "done" (the
+packer has moved on), Thread B computes plate K's utilization, the
+free-region bounding box, and pre-computes the feasible-placement
+mask for the free space at all rotations. This is the certificate
+work from the section above. Each finished plate is fully
+characterized within milliseconds of the packer leaving it.
+
+**Thread C** trails by two plates. It takes Thread B's
+characterization and attempts consolidation — can any part from
+plate K+1 move backwards into an earlier plate? Because Thread B
+has already cached the feasibility data, the migration check is
+just a lookup. If a migration succeeds, the plate count drops.
+
+**The pipeline means consolidation results are ready by the time
+the packer finishes.** The user-perceived wall-clock for "pack +
+refine" equals the wall-clock for "pack" alone. The refinement is
+free in clock time, bounded in cores.
+
+### Handling shared state without locks
+
+The pipeline has one data dependency: if Thread C migrates a part
+from plate K+1 to plate K, that changes plate K's bitmap, which
+invalidates Thread B's characterization of plate K.
+
+Use **versioning, not locks**. Each plate carries a version
+counter. Thread B's characterization is tagged with the version it
+was computed against. If Thread C bumps the version (by mutating
+the plate), Thread B's stale tag tells it to re-characterize on the
+next pass.
+
+In practice, successful migrations are rare (most attempts fail at
+the bounding-box certificate, layer 1 from the previous section),
+so re-characterization runs almost never. The common case is a
+single linear pipeline pass with no rework.
+
+### Launch strategy by core count
+
+Detect at startup. Let `C` be the available core count.
+
+```
+C == 1:    sequential greedy, no parallelism, skip refinement
+C in 2..3: 1 primary + 1-2 speculative permutations
+           refinement runs serially after packing (no pipeline)
+C in 4..7: 1 primary + 1 certifier + remaining cores on speculative
+           consolidator runs sequentially after pipeline drains
+C >= 8:    1 primary + 1 certifier + 1 consolidator pipeline
+           remaining cores on speculative permutations
+```
+
+The progression maps cores to the highest-leverage parallel work
+that's still worth the bookkeeping cost.
+
+### Work unit balancing
+
+The packer for `N` parts takes roughly `N * R * FFT_cost`. A
+speculative permutation takes the same. The certifier per plate is
+much cheaper — one utilization computation plus a few bounding-box
+checks. The consolidator per plate is variable — might be zero work
+(bbox says impossible) or one FFT (try the migration).
+
+**Risk:** the certifier and consolidator starve because they're
+waiting on the packer to finish plates.
+
+**Fix:** the packer emits "plate done" signals into a lock-free
+queue. The certifier pulls from the queue and always has work as
+long as the packer is running. If the certifier runs out of work
+(packer is stalled on a hard plate), it steals a speculative
+permutation task. Work-stealing keeps all cores busy.
+
+### Cross-thread early termination
+
+If the primary packer achieves `K_min` plates (the area-theoretic
+optimum from the previous section), broadcast a cancel to all
+speculative threads. Their work is now waste.
+
+Symmetrically, if a speculative thread finds a `K_min` solution
+before the primary finishes, cancel the primary.
+
+The cancel is a single atomic flag, polled at plate boundaries.
+No complex synchronization, no thread state machine.
+
+### What the user sees
+
+Packing result appears in the same wall-clock time as a single
+greedy pass — because the speculative paths and the pipeline both
+overlap with the primary packer. But the result is the *best of N*
+orderings with consolidation already applied. The "few extra
+seconds for refinement" the user wanted cost zero extra seconds
+because they ran in parallel with the packing they were already
+waiting for.
+
+### Memory footprint caveat
+
+Each 480x480 complex-float bitmap is ~1.8 MB. With `C` threads
+each holding `R` rotation bitmaps and a plate bitmap, total memory
+is roughly `C * R * 2MB`. At 8 cores * 12 rotations = ~200 MB.
+Fine on a desktop, worth watching on constrained environments.
+
+If memory is tight: share the *immutable* part rotation bitmaps
+read-only across speculative threads (each speculative thread
+still needs its own *occupied* plate bitmap because they're
+packing independently), and drop speculative-thread rotation
+candidates from 12 to 4. Speculative threads are already
+exploring a different ordering, so rotation diversity inside each
+thread matters less.
+
+### Combined wall-clock budget
+
+Sequential greedy was: pack_time + refine_time
+This proposal is: max(pack_time, refine_time + pipeline_lag) ≈ pack_time
+
+The refinement is functionally free in clock time. The cost is
+linear in cores (and capped by memory). On any modern desktop the
+nester finishes in the same time it does today but with strictly
+better answers.
+
+### Why this matters relative to the FFT itself
+
+These three companion sections form the actual fork pitch:
+
+| Section | Lever | User-visible win |
+|---|---|---|
+| 1 — FFT inner loop | Algorithm | Independent of part complexity, scales to high resolution |
+| 2 — Certificates + consolidation | Control flow | Plate count drops by one more often, refinement runs only where it pays |
+| 3 — Three-tier parallelism | Scheduling | The whole improvement happens within the existing wall-clock budget |
+
+Section 1 alone does not justify the fork — at our current
+resolution and rotation count it's roughly cost-neutral against the
+scored scan. Section 2 alone helps but is limited by single-threaded
+greedy time. Section 3 is what makes the combination feel
+qualitatively different to the user — the same wait time produces
+visibly tighter plates with provable lower bounds backing them up.
+
 ## Notes from current code that the fork should preserve
 
 - `ArrangePolygon::concave_regions` (multi-island) — required for parts
