@@ -313,11 +313,14 @@ public:
         // each runs the full placement+consolidation+centering pipeline,
         // so the runtime is num_attempts × baseline_time. We cap at 8
         // for very small N (still milliseconds total) and 4 for medium
-        // N. For large N we run once because the order space is too
-        // big to sample meaningfully and the baseline is good enough.
+        // N. For large N we run 3 attempts — the order space is too big
+        // to sample exhaustively, but 3 shuffles is cheap insurance
+        // against a pathological ordering and typically runs in a few
+        // seconds. Short-circuits as soon as a single-plate solution
+        // with all items placed is found (see early-exit below).
         const int num_attempts =
             (items.size() <= 6)  ? 8 :
-            (items.size() <= 16) ? 4 : 1;
+            (items.size() <= 16) ? 4 : 3;
 
         // Snapshot the original `order` for perturbation seeds.
         const std::vector<size_t> base_order = order;
@@ -889,21 +892,97 @@ public:
                                 int max_px = bw - iw;
                                 if (max_py < 0 || max_px < 0) continue;
 
-                                // First-fit scan for any clear position.
-                                int cstride = std::clamp(std::min(iw, ih) / 4, 4, 64);
-                                int found_px = -1, found_py = -1;
-                                for (int py = 0; py <= max_py && found_px < 0; py += cstride) {
-                                    for (int px = 0; px <= max_px; px += cstride) {
-                                        if (collides(plate_items[to_plate], wpr, bw, bh,
-                                                     ibm, iwpr_item, iw, ih, px, py)) continue;
-                                        if (collides(plate_excludes[to_plate], wpr, bw, bh,
-                                                     hbm, iwpr_item, iw, ih, px, py)) continue;
-                                        found_px = px;
-                                        found_py = py;
-                                        break;
+                                // Scored scan for the best clear position.
+                                //
+                                // Mirrors the placement scan's strategy: coarse
+                                // stride (matching placement's /8, not the old
+                                // /4), explicit max-row/max-col boundary
+                                // positions, score by destination cluster-bbox
+                                // growth, then refine ±cstride around the
+                                // coarse winner. The old first-fit scan stamped
+                                // the first open slot it saw — 2× coarser than
+                                // placement's grid and blind to whether a
+                                // neighbor position would compact the cluster
+                                // better. That asymmetry is most of why the
+                                // 125-piece tetris STL spills over on plate 02.
+                                int cstride = std::clamp(std::min(iw, ih) / 8, 4, 64);
+
+                                auto position_clear_dst = [&](int px, int py) -> bool {
+                                    if (collides(plate_items[to_plate], wpr, bw, bh,
+                                                 ibm, iwpr_item, iw, ih, px, py)) return false;
+                                    if (collides(plate_excludes[to_plate], wpr, bw, bh,
+                                                 hbm, iwpr_item, iw, ih, px, py)) return false;
+                                    return true;
+                                };
+
+                                // Destination cluster bbox snapshot for scoring.
+                                const ClusterBB &dst_cbb = cluster_bb[to_plate];
+                                bool dst_empty = dst_cbb.empty();
+                                int64_t dst_area = dst_empty ? 0 :
+                                    (int64_t)(dst_cbb.maxx - dst_cbb.minx + 1) *
+                                    (int64_t)(dst_cbb.maxy - dst_cbb.miny + 1);
+
+                                auto score_dst = [&](int px, int py) -> int64_t {
+                                    int nminx = px;
+                                    int nminy = py;
+                                    int nmaxx = px + iw - 1;
+                                    int nmaxy = py + ih - 1;
+                                    int64_t new_area;
+                                    if (dst_empty) {
+                                        new_area = (int64_t)iw * (int64_t)ih;
+                                    } else {
+                                        int mnx = std::min(dst_cbb.minx, nminx);
+                                        int mny = std::min(dst_cbb.miny, nminy);
+                                        int mxx = std::max(dst_cbb.maxx, nmaxx);
+                                        int mxy = std::max(dst_cbb.maxy, nmaxy);
+                                        new_area = (int64_t)(mxx - mnx + 1) *
+                                                   (int64_t)(mxy - mny + 1);
+                                    }
+                                    return new_area - dst_area;
+                                };
+
+                                // Coarse scan with explicit boundary positions.
+                                std::vector<int> pys;
+                                for (int py = 0; py <= max_py; py += cstride) pys.push_back(py);
+                                if (pys.empty() || pys.back() != max_py) pys.push_back(max_py);
+                                std::vector<int> pxs;
+                                for (int px = 0; px <= max_px; px += cstride) pxs.push_back(px);
+                                if (pxs.empty() || pxs.back() != max_px) pxs.push_back(max_px);
+
+                                int64_t coarse_score = std::numeric_limits<int64_t>::max();
+                                int coarse_px = -1, coarse_py = -1;
+                                for (int py : pys) {
+                                    for (int px : pxs) {
+                                        if (!position_clear_dst(px, py)) continue;
+                                        int64_t s = score_dst(px, py);
+                                        if (s < coarse_score) {
+                                            coarse_score = s;
+                                            coarse_px    = px;
+                                            coarse_py    = py;
+                                        }
                                     }
                                 }
-                                if (found_px < 0) continue;
+                                if (coarse_px < 0) continue;
+
+                                // Refine ±cstride around the coarse winner.
+                                int ry0 = std::max(0, coarse_py - cstride);
+                                int ry1 = std::min(max_py, coarse_py + cstride);
+                                int rx0 = std::max(0, coarse_px - cstride);
+                                int rx1 = std::min(max_px, coarse_px + cstride);
+                                int64_t refine_score = coarse_score;
+                                int found_px = coarse_px;
+                                int found_py = coarse_py;
+                                for (int py = ry0; py <= ry1; ++py) {
+                                    for (int px = rx0; px <= rx1; ++px) {
+                                        if (!position_clear_dst(px, py)) continue;
+                                        int64_t s = score_dst(px, py);
+                                        if (s < refine_score) {
+                                            refine_score = s;
+                                            found_px = px;
+                                            found_py = py;
+                                        }
+                                    }
+                                }
 
                                 // Commit the migration.
                                 stamp(plate_items[to_plate], wpr, bw, bh,
