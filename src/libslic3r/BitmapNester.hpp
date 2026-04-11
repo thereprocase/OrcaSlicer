@@ -667,43 +667,55 @@ public:
                 };
                 std::vector<CoarseBest> per_rot_coarse(rot_cache.size());
 
-                // Coarse scan: every rotation, every coarse-stride position
-                // plus the max-row/max-col boundary positions when the stride
-                // skips them. Score every clear position, keep the best per
-                // rotation.
-                for (size_t rci = 0; rci < rot_cache.size(); ++rci) {
-                    const auto &rc = rot_cache[rci];
-                    int max_py = bh - rc.ih;
-                    int max_px = bw - rc.iw;
-                    if (max_py < 0 || max_px < 0) continue;
+                // Coarse scan wrapped in a lambda so we can invoke it twice:
+                // first with normal stride, and on failure retry once with
+                // halved stride ("desperation pass") before falling through
+                // to the next plate. The halved stride catches items whose
+                // only valid slot falls between normal-stride samples —
+                // typical for narrow gaps in a nearly-full plate where the
+                // consolidation pass lives. Only runs on failure, so the
+                // fast path pays nothing.
+                auto run_coarse_scan = [&](int stride_div) -> bool {
+                    per_rot_coarse.assign(rot_cache.size(), CoarseBest{});
 
-                    std::vector<int> pys;
-                    for (int py = 0; py <= max_py; py += rc.coarse) pys.push_back(py);
-                    if (pys.empty() || pys.back() != max_py) pys.push_back(max_py);
+                    for (size_t rci = 0; rci < rot_cache.size(); ++rci) {
+                        const auto &rc = rot_cache[rci];
+                        int stride = std::max(2, rc.coarse / stride_div);
+                        int max_py = bh - rc.ih;
+                        int max_px = bw - rc.iw;
+                        if (max_py < 0 || max_px < 0) continue;
 
-                    std::vector<int> pxs;
-                    for (int px = 0; px <= max_px; px += rc.coarse) pxs.push_back(px);
-                    if (pxs.empty() || pxs.back() != max_px) pxs.push_back(max_px);
+                        std::vector<int> pys;
+                        for (int py = 0; py <= max_py; py += stride) pys.push_back(py);
+                        if (pys.empty() || pys.back() != max_py) pys.push_back(max_py);
 
-                    CoarseBest &cb = per_rot_coarse[rci];
-                    for (int py : pys) {
-                        for (int px : pxs) {
-                            if (!position_clear(plate_idx, rc, px, py)) continue;
-                            auto s = score_at(rc, px, py);
-                            if (s < cb.score) {
-                                cb.score = s;
-                                cb.px    = px;
-                                cb.py    = py;
+                        std::vector<int> pxs;
+                        for (int px = 0; px <= max_px; px += stride) pxs.push_back(px);
+                        if (pxs.empty() || pxs.back() != max_px) pxs.push_back(max_px);
+
+                        CoarseBest &cb = per_rot_coarse[rci];
+                        for (int py : pys) {
+                            for (int px : pxs) {
+                                if (!position_clear(plate_idx, rc, px, py)) continue;
+                                auto s = score_at(rc, px, py);
+                                if (s < cb.score) {
+                                    cb.score = s;
+                                    cb.px    = px;
+                                    cb.py    = py;
+                                }
                             }
                         }
                     }
-                }
 
-                // Check we found at least one valid position across all rots.
-                bool any_valid = false;
-                for (const auto &cb : per_rot_coarse)
-                    if (cb.px >= 0) { any_valid = true; break; }
-                if (!any_valid) continue;  // no valid position on this plate
+                    for (const auto &cb : per_rot_coarse)
+                        if (cb.px >= 0) return true;
+                    return false;
+                };
+
+                // Normal stride first, then desperation retry on failure.
+                if (!run_coarse_scan(1)) {
+                    if (!run_coarse_scan(2)) continue;  // nothing fits on this plate
+                }
 
                 // Refine: for each rotation that had a coarse winner, scan
                 // every pixel in a ±coarse window around that rotation's best
