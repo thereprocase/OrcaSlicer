@@ -4,6 +4,7 @@
 // Include after ClipperUtils.hpp and BitmapNester.hpp.
 
 #include "libslic3r/Arrange.hpp"
+#include "libslic3r/BitmapNester.hpp"
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/ClipperUtils.hpp"
@@ -14,6 +15,65 @@
 #include <algorithm>
 
 namespace Slic3r { namespace arrangement { namespace test_utils {
+
+// ─── Quality metrics adopted by the Three Seers vote 2026-04-11 ────
+// See docs/PACKING_METRICS.md for the full deliberation. The seers
+// rejected bbox density, convex hull compactness, adjacency, and
+// libnest2d head-to-head. They unanimously adopted plate-count
+// regression and determinism, plus Frodo's overflow piece count.
+//
+// Helpers below are intentionally minimal — they read only the
+// observable output (items[].bed_idx) and never touch internal
+// nester state.
+
+// Highest plate index used by any placed item. Returns -1 if no
+// item is placed (all UNARRANGED). For a single-plate fixture this
+// returns 0; for a fixture that overflowed by one plate, returns 1.
+inline int max_bed_idx(const ArrangePolygons &items)
+{
+    int m = -1;
+    for (const auto &it : items)
+        if (it.bed_idx != UNARRANGED && it.bed_idx > m) m = it.bed_idx;
+    return m;
+}
+
+// Number of items placed on a plate other than plate 0. The "regret"
+// metric: how many pieces wish they were on plate 0. Frodo's pick.
+inline int overflow_piece_count(const ArrangePolygons &items)
+{
+    int n = 0;
+    for (const auto &it : items)
+        if (it.bed_idx != UNARRANGED && it.bed_idx > 0) ++n;
+    return n;
+}
+
+// Run an arrange call twice on a fresh copy of the input items each
+// time, then verify the two outputs are byte-identical on the
+// observable fields (bed_idx, rotation, translation, itemid).
+// Returns true if deterministic, false if any field diverges.
+//
+// Determinism is the cheapest possible defense against state-machine
+// bugs in the consolidation pass — if a read-before-write or
+// uninitialized cell sneaks in, the second run diverges. Cost: one
+// extra arrange call per fixture.
+template <class ArrangeFn>
+inline bool deterministic_rerun(const ArrangePolygons &input,
+                                ArrangeFn &&run)
+{
+    ArrangePolygons a = input;
+    ArrangePolygons b = input;
+    run(a);
+    run(b);
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].bed_idx != b[i].bed_idx) return false;
+        if (a[i].itemid != b[i].itemid) return false;
+        if (std::abs(a[i].rotation - b[i].rotation) > 1e-9) return false;
+        if (a[i].translation.x() != b[i].translation.x()) return false;
+        if (a[i].translation.y() != b[i].translation.y()) return false;
+    }
+    return true;
+}
 
 // Check every placed item's transformed polygon lies inside the bed bounds.
 // Returns false if any placed item protrudes outside the bed.
