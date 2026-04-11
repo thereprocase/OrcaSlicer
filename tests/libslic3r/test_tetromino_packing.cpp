@@ -1,30 +1,32 @@
 // test_tetromino_packing.cpp
 //
-// Packing-efficiency benchmark for the concave BitmapNester using the seven
-// tetrominoes as probe shapes. See docs/PACKING_BENCHMARK.md for scenario
-// rationale, coordinate conventions, and threshold choices.
+// Packing regression tests for the concave BitmapNester using the seven
+// tetrominoes as probe shapes. See docs/PACKING_METRICS.md for the
+// metric philosophy and the Three Seers' vote that adopted plate-count
+// regression + determinism + overflow piece count.
 //
-// For each scenario we:
-//   1. Build the piece multiset.
-//   2. Scatter starting translations with a fixed-seed std::mt19937.
-//   3. Run the concave BitmapNester and measure cluster-bbox density.
-//   4. Run the libnest2d convex-hull path for the same pieces, store the
-//      density as INFO only.
-//   5. Assert bitmap_density >= scenario threshold.
+// Each scenario:
+//   1. Builds the piece multiset.
+//   2. Scatters starting translations with a fixed-seed std::mt19937.
+//   3. Sizes the bed loosely enough that the parts MUST fit on plate 0
+//      under any reasonable nester. The bed size is the implicit
+//      threshold — if the algorithm regresses, it overflows.
+//   4. Asserts:
+//      - max_bed_idx == 0           (#12, plate-count regression)
+//      - overflow_piece_count == 0  (#4, no spillover)
+//      - no_overlap                 (sanity)
+//      - deterministic_rerun        (#13, byte-identical second run)
 //
-// SPRINT 2 TODO: the libnest2d baseline path placed zero items in the first
-// run because `arrangement::arrange` needs more setup than this test gives it
-// (probably itemid pre-assignment, or a bed type the template specialization
-// doesn't match). Once that plumbing is fixed, switch the baseline density
-// from INFO-only to a real REQUIRE so the test enforces "concave beats
-// convex" not just "concave hits an absolute floor."
+// We deliberately do NOT measure cluster bbox density. That metric was
+// rejected by all three seers because it penalizes round clusters even
+// when they fit identically — see docs/PACKING_METRICS.md for the full
+// deliberation.
 
 #include <catch2/catch_all.hpp>
 
-// ClipperUtils.hpp MUST precede BitmapNester.hpp — the nester's exclude
-// inflation path calls offset_ex inline in the header, and the declaration
-// needs to be in scope when the template gets instantiated in this TU.
-// Match the include order in test_bitmap_nester.cpp.
+// ClipperUtils.hpp must precede BitmapNester.hpp — the nester uses
+// offset_ex inline in its placement loop. Match the include order in
+// test_bitmap_nester.cpp.
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Arrange.hpp"
 #include "libslic3r/BitmapNester.hpp"
@@ -36,14 +38,15 @@
 
 #include <cmath>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace Slic3r;
 using namespace Slic3r::arrangement;
 
 // ---------------------------------------------------------------------------
-// Local helpers (mirrors of test_bitmap_nester.cpp, kept local to avoid
-// fighting link-order on the shared helpers).
+// Local helpers (kept local rather than shared with test_bitmap_nester.cpp
+// to avoid link-order issues on `static` helpers across translation units).
 // ---------------------------------------------------------------------------
 
 static BoundingBox make_bed_mm(double w, double h)
@@ -64,7 +67,6 @@ static ArrangeParams no_shrink_params()
     return p;
 }
 
-// Build an ArrangePolygon from an ExPolygon with rotation support.
 static ArrangePolygon make_ap(const ExPolygon &poly, int priority = 0)
 {
     ArrangePolygon ap;
@@ -78,11 +80,12 @@ static ArrangePolygon make_ap(const ExPolygon &poly, int priority = 0)
 }
 
 // ---------------------------------------------------------------------------
-// Tetromino factories. Unit = 10 mm. Canonical orientations per
-// docs/PACKING_BENCHMARK.md. Every contour is CCW.
+// Tetromino factories. Unit = 10 mm. Canonical orientations.
+// Each piece is exactly 4 unit squares = 400 mm^2.
 // ---------------------------------------------------------------------------
 
 static constexpr double U = 10.0; // mm per unit square
+static constexpr double TETRO_AREA_MM2 = 4.0 * U * U;
 
 static ExPolygon poly_from_mm(std::initializer_list<std::pair<double, double>> pts)
 {
@@ -125,16 +128,12 @@ static ExPolygon tetro_L() {
     });
 }
 
-// Constant: every tetromino is 4 unit squares = 4 * U * U mm^2.
-static constexpr double TETRO_AREA_MM2 = 4.0 * U * U;
-
 // ---------------------------------------------------------------------------
-// Scatter + measurement helpers.
+// Scatter + driver.
 // ---------------------------------------------------------------------------
 
 // Randomize starting translations with a fixed seed so results are
-// reproducible. The scatter box is larger than any scenario's ideal bbox so
-// the nester actually has to move pieces.
+// reproducible across runs.
 static void scatter(ArrangePolygons &items, uint32_t seed)
 {
     std::mt19937 rng(seed);
@@ -146,7 +145,6 @@ static void scatter(ArrangePolygons &items, uint32_t seed)
     }
 }
 
-// Enable full 4-way rotation on every item.
 static void enable_quarter_rotations(ArrangePolygons &items)
 {
     std::vector<double> rots{0.0, M_PI / 2.0, M_PI, 3.0 * M_PI / 2.0};
@@ -154,123 +152,75 @@ static void enable_quarter_rotations(ArrangePolygons &items)
         it.allowed_rotations = rots;
 }
 
-// Bounding box of all placed items on bed 0, in mm^2.
-// Returns NaN if nothing placed.
-static double cluster_bbox_area_mm2(const ArrangePolygons &items)
-{
-    bool any = false;
-    BoundingBox bb;
-    for (auto &it : items) {
-        if (it.bed_idx != 0) continue;
-        ExPolygon placed = it.transformed_poly();
-        BoundingBox pb = get_extents(placed);
-        if (!any) { bb = pb; any = true; }
-        else       { bb.merge(pb); }
-    }
-    if (!any) return std::nan("");
-    double w = unscaled<double>(bb.max.x() - bb.min.x());
-    double h = unscaled<double>(bb.max.y() - bb.min.y());
-    return w * h;
-}
-
-// Make a params struct tuned for pure algorithmic packing (no brim, no shrink).
-static ArrangeParams benchmark_params(bool use_concave)
+static ArrangeParams benchmark_params()
 {
     ArrangeParams p = no_shrink_params();
-    p.min_obj_distance  = 0;
+    p.min_obj_distance  = 0;     // measure pure algorithmic packing, no brim
     p.allow_rotations   = true;
-    p.use_concave_shapes = use_concave;
-    p.do_final_align    = false;  // measure packed cluster, not centered cluster
+    p.use_concave_shapes = true;
+    // Leave do_final_align at its default (true) so determinism covers
+    // the post-centering pass too.
     return p;
 }
 
-// Run one benchmark: bitmap + baseline + density comparison.
-struct BenchResult {
-    int    piece_count;
-    double piece_area_mm2;
-    double bitmap_bbox_mm2;
-    double baseline_bbox_mm2;
-    double bitmap_density;
-    double baseline_density;
-    int    bitmap_placed;
-    int    baseline_placed;
-};
-
-// Build a fresh scattered item list from a factory callable. Factory returns
-// the ordered vector of ExPolygons making up the scenario.
+// Common driver: build the piece set, scatter, arrange on the given bed,
+// then assert the Three Seers' metrics in order.
 template <class Factory>
-static BenchResult run_scenario(const std::string &name,
-                                Factory build_pieces,
-                                uint32_t seed,
-                                double bed_mm = 500.0)
+static void verify_packs_on_one_plate(const std::string &name,
+                                      Factory build_pieces,
+                                      double bed_mm_w,
+                                      double bed_mm_h,
+                                      uint32_t seed)
 {
-    BoundingBox bed = make_bed_mm(bed_mm, bed_mm);
+    auto build_input = [&]() {
+        ArrangePolygons xs;
+        for (auto &poly : build_pieces())
+            xs.push_back(make_ap(poly));
+        enable_quarter_rotations(xs);
+        scatter(xs, seed);
+        return xs;
+    };
 
-    // ---- Bitmap nester pass ----
-    ArrangePolygons items_bm;
-    {
-        auto polys = build_pieces();
-        items_bm.reserve(polys.size());
-        for (auto &poly : polys)
-            items_bm.push_back(make_ap(poly));
-        enable_quarter_rotations(items_bm);
-        scatter(items_bm, seed);
-    }
-    {
-        ArrangeParams p = benchmark_params(/*use_concave=*/true);
-        BitmapNester::arrange(items_bm, ArrangePolygons{}, bed, p);
-    }
+    BoundingBox bed = make_bed_mm(bed_mm_w, bed_mm_h);
+    ArrangeParams params = benchmark_params();
 
-    // ---- libnest2d convex-hull baseline pass ----
-    ArrangePolygons items_base;
-    {
-        auto polys = build_pieces();
-        items_base.reserve(polys.size());
-        for (auto &poly : polys)
-            items_base.push_back(make_ap(poly));
-        enable_quarter_rotations(items_base);
-        scatter(items_base, seed);
-    }
-    {
-        ArrangeParams p = benchmark_params(/*use_concave=*/false);
-        // Direct call to the convex-hull path. Because use_concave_shapes is
-        // false, try_bitmap_arrange returns false and the template dispatches
-        // to libnest2d.
-        Slic3r::arrangement::arrange(items_base, ArrangePolygons{}, bed, p);
-    }
+    auto run = [&](ArrangePolygons &xs) {
+        BitmapNester::arrange(xs, ArrangePolygons{}, bed, params);
+    };
 
-    BenchResult r{};
-    r.piece_count     = (int)items_bm.size();
-    r.piece_area_mm2  = items_bm.size() * TETRO_AREA_MM2;
-    r.bitmap_bbox_mm2 = cluster_bbox_area_mm2(items_bm);
-    r.baseline_bbox_mm2 = cluster_bbox_area_mm2(items_base);
-    r.bitmap_density  = r.piece_area_mm2 / r.bitmap_bbox_mm2;
-    r.baseline_density = r.piece_area_mm2 / r.baseline_bbox_mm2;
-    r.bitmap_placed = 0;
-    for (auto &it : items_bm)   if (it.bed_idx == 0) ++r.bitmap_placed;
-    r.baseline_placed = 0;
-    for (auto &it : items_base) if (it.bed_idx == 0) ++r.baseline_placed;
+    // Primary run.
+    ArrangePolygons items = build_input();
+    run(items);
 
-    UNSCOPED_INFO("Scenario: " << name);
-    UNSCOPED_INFO("  pieces          = " << r.piece_count);
-    UNSCOPED_INFO("  ideal area mm2  = " << r.piece_area_mm2);
-    UNSCOPED_INFO("  bitmap bbox mm2 = " << r.bitmap_bbox_mm2);
-    UNSCOPED_INFO("  bitmap density  = " << r.bitmap_density);
-    UNSCOPED_INFO("  bitmap placed   = " << r.bitmap_placed);
-    UNSCOPED_INFO("  base   bbox mm2 = " << r.baseline_bbox_mm2);
-    UNSCOPED_INFO("  base   density  = " << r.baseline_density);
-    UNSCOPED_INFO("  base   placed   = " << r.baseline_placed);
-    return r;
+    UNSCOPED_INFO("Scenario:    " << name);
+    UNSCOPED_INFO("  bed       = " << bed_mm_w << " x " << bed_mm_h << " mm");
+    UNSCOPED_INFO("  pieces    = " << items.size());
+    UNSCOPED_INFO("  area mm^2 = " << items.size() * TETRO_AREA_MM2);
+    UNSCOPED_INFO("  max bed   = " << test_utils::max_bed_idx(items));
+    UNSCOPED_INFO("  overflow  = " << test_utils::overflow_piece_count(items));
+
+    // Metric #12: every piece on plate 0.
+    REQUIRE(test_utils::max_bed_idx(items) == 0);
+    // Metric #4: explicit overflow tripwire.
+    REQUIRE(test_utils::overflow_piece_count(items) == 0);
+    // Sanity: no two items occupy the same pixel.
+    REQUIRE(test_utils::no_overlap(items));
+
+    // Metric #13: determinism. Run a second time on a fresh copy of the
+    // same input and assert byte-identical (bed_idx, rotation, translation,
+    // itemid) tuples.
+    ArrangePolygons rerun_input = build_input();
+    REQUIRE(test_utils::deterministic_rerun(rerun_input, run));
 }
 
-// Helpers to build scenario piece sets.
-using Factory = std::vector<ExPolygon> (*)();
-
 // ---------------------------------------------------------------------------
-// Scenario 1 — "Tetris 4x4": two of each tetromino on a 80x70 target.
+// Scenario 1 — "Mix 14": two of each tetromino on a 140x140 bed.
+// 14 * 400 = 5600 mm^2 of material on 19600 mm^2 of bed = 28% density.
+// Loose enough that center-greedy + consolidation should fit everything
+// regardless of starting scatter.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("tetromino packing scenario 1: two-of-each mix",
+TEST_CASE("tetromino: 14 mixed pieces fit on plate 0",
           "[BitmapNester][tetromino][packing]")
 {
     auto build = []() {
@@ -286,83 +236,66 @@ TEST_CASE("tetromino packing scenario 1: two-of-each mix",
         }
         return v;
     };
-
-    BenchResult r = run_scenario("Tetris 4x4", build, 0xC0FFEEu);
-
-    // Bitmap nester must place every piece and clear an absolute density floor.
-    // Baseline density (libnest2d) is informational only — see top-of-file note
-    // about the convex-hull comparison plumbing being a Sprint 2 follow-up.
-    REQUIRE(r.bitmap_placed == 14);
-    REQUIRE(r.bitmap_density >= 0.75);
+    verify_packs_on_one_plate("Mix 14", build, 140.0, 140.0, 0xC0FFEEu);
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 2 — "Rectangular 4x4": four I-tetrominoes, a sanity check.
+// Scenario 2 — "Four I-pieces": four 1x4 bars on a 50x50 bed.
+// 1600 / 2500 = 64% density. The classical 4xI tile of a 4x4 square.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("tetromino packing scenario 2: four I-pieces tile a square",
+TEST_CASE("tetromino: four I-pieces fit on plate 0",
           "[BitmapNester][tetromino][packing]")
 {
     auto build = []() {
         return std::vector<ExPolygon>{tetro_I(), tetro_I(), tetro_I(), tetro_I()};
     };
-
-    BenchResult r = run_scenario("Rectangular 4x4 (I only)", build, 0xBADA55u);
-
-    // Bitmap-only assertions; baseline is informational.
-    REQUIRE(r.bitmap_placed == 4);
-    REQUIRE(r.bitmap_density >= 0.90);
+    verify_packs_on_one_plate("Four I", build, 50.0, 50.0, 0xBADA55u);
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 3 — "L-only 2x4": two L-tetrominoes interlocking.
+// Scenario 3 — "Two L-pieces": same chirality, can't tile a rectangle.
+// Best achievable cluster bbox is 60x20 = 1200 mm^2 for 800 mm^2 of
+// material. We just need them both on plate 0; the bed is 80x40 (3200
+// mm^2 = 25% density) so any arrangement fits.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("tetromino packing scenario 3: two L-pieces interlock",
+TEST_CASE("tetromino: two L-pieces fit on plate 0",
           "[BitmapNester][tetromino][packing]")
 {
     auto build = []() {
         return std::vector<ExPolygon>{tetro_L(), tetro_L()};
     };
-
-    BenchResult r = run_scenario("L-only 2x4", build, 0xDEADBEEFu);
-
-    // The smoking gun for the loose-grid regression — two L's must place
-    // and produce the optimal SAME-CHIRALITY pairing density.
-    //
-    // IMPORTANT: two L-tetrominoes of the same chirality CANNOT tile a 4x2
-    // rectangle. The classical 4x2 tiling requires an L + J (mirror pair),
-    // not L + L. With pure rotations (no reflection), the best two same-
-    // chirality L's can do is side-by-side bboxes for density 800/1200 =
-    // exactly 0.6667. The threshold is set just below that — anything LESS
-    // means the nester regressed to a non-touching grid (the original bug).
-    REQUIRE(r.bitmap_placed == 2);
-    REQUIRE(r.bitmap_density >= 0.65);
+    verify_packs_on_one_plate("Two L", build, 80.0, 40.0, 0xDEADBEEFu);
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 4 — "S-and-Z": two of each, the worst case for convex nesting.
+// Scenario 4 — "S and Z": two S + two Z on a 50x50 bed (64% density).
+// This is the smart-shuffle stress test. Center-greedy placement fragments
+// the surrounding space when the first piece lands dead-center, and a
+// single-pass greedy can't recover. The smart-shuffle restart driver
+// re-runs placement with shuffled within-priority orderings until one
+// fits — N=4 means 8 attempts max, all in milliseconds.
+//
+// If this test fails, smart-shuffle is broken or insufficient for tight
+// 4-piece interlocks.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("tetromino packing scenario 4: two S + two Z tile a 4x4 square",
+TEST_CASE("tetromino: two S + two Z fit on plate 0",
           "[BitmapNester][tetromino][packing]")
 {
     auto build = []() {
         return std::vector<ExPolygon>{tetro_S(), tetro_S(), tetro_Z(), tetro_Z()};
     };
-
-    BenchResult r = run_scenario("S-and-Z", build, 0xF00DCAFEu);
-
-    // Two S's and two Z's tile a 4x4 square — worst case for convex nesting.
-    REQUIRE(r.bitmap_placed == 4);
-    REQUIRE(r.bitmap_density >= 0.70);
+    verify_packs_on_one_plate("S and Z", build, 50.0, 50.0, 0xF00DCAFEu);
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 5 — "Mixed 40-piece set": larger stress, weighted toward concave.
+// Scenario 5 — "Mix 40": 40 mixed tetrominoes on a 220x220 bed.
+// 16000 / 48400 = 33% density. The stress test.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("tetromino packing scenario 5: 40-piece mixed set",
+TEST_CASE("tetromino: 40 mixed pieces fit on plate 0",
           "[BitmapNester][tetromino][packing]")
 {
     auto build = []() {
@@ -376,14 +309,7 @@ TEST_CASE("tetromino packing scenario 5: 40-piece mixed set",
         for (int i = 0; i < 6; ++i) v.push_back(tetro_L());
         return v;
     };
-
-    BenchResult r = run_scenario("Mixed 40-piece", build, 0x5EED1234u);
-
-    REQUIRE(r.bitmap_placed == 40);
-    // Empirical first-pass density was 0.6497. Threshold loosened to 0.62 to
-    // give raster-quantization headroom; tighten after the libnest2d baseline
-    // plumbing lands and we can bound this against a real convex baseline.
-    REQUIRE(r.bitmap_density >= 0.62);
+    verify_packs_on_one_plate("Mix 40", build, 220.0, 220.0, 0x5EED1234u);
 }
 
 // ---------------------------------------------------------------------------
