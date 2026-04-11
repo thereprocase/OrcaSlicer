@@ -54,7 +54,15 @@ static ArrangeParams benchmark_params()
     p.bed_shrink_x = 0.0f;
     p.bed_shrink_y = 0.0f;
     p.allow_rotations = true;
-    p.min_obj_distance = 0;
+    // Small brim so the nester pads items by ~0.5 mm. Real concave
+    // polygon edges fall off the 0.5 mm pixel grid, introducing
+    // sub-pixel rasterization rounding. A zero-brim arrangement can
+    // produce items that are non-overlapping in the bitmap (which is
+    // what the nester checks) but overlap each other in the exact
+    // polygon representation by a few mm^2 — above the no_overlap
+    // helper's 0.0001 mm^2 threshold. One pixel of padding gives the
+    // nester guaranteed bitmap separation that dominates the noise.
+    p.min_obj_distance = scaled<coord_t>(1.0);
     p.use_concave_shapes = true;
     p.progressind = nullptr;
     return p;
