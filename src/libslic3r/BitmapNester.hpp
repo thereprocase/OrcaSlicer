@@ -607,10 +607,32 @@ public:
                 const int64_t cbb_area = cbb.area();
                 const bool cbb_empty = cbb.empty();
 
+                // Tall-parts-centered bias. At high layer counts, only tall
+                // parts are still printing. Putting them in a plate corner
+                // forces the head to reach that corner on every high-Z
+                // move. Putting them near the plate GEOMETRIC CENTER bounds
+                // the head's late-phase travel envelope to the tall
+                // parts' extent rather than the full plate. So: tall items
+                // get a score penalty proportional to their distance from
+                // bed center, scaled by their height. Short items are
+                // ~unbiased. First item per plate is exempt because it
+                // follows the (possibly corner-seed) anchor by design.
+                //
+                // Normalization: items >= 100 mm tall get full weight,
+                // shorter items scale linearly. Tuned for typical FDM
+                // prints where 100mm is already a "tall" object.
+                const double bed_center_px_x = bw * 0.5;
+                const double bed_center_px_y = bh * 0.5;
+                const double item_height_mm  = item.height;
+                const double tall_weight = cbb_empty ? 0.0
+                    : std::min(1.0, item_height_mm / 100.0);
+
                 // Score a candidate placement as:
                 //   primary   = growth in cluster bounding box area (int64)
                 //   secondary = squared pixel distance of candidate bbox
-                //               center from resolved anchor
+                //               center from resolved anchor + tall-bias
+                //               toward plate center (skipped for first item
+                //               per plate so the anchor seed still lands).
                 //
                 // A rotated L-shape slotted into an existing L's concave notch
                 // has its bbox already inside the cluster bbox, so delta_area
@@ -644,7 +666,15 @@ public:
                     double cx = (double)px + rc.iw * 0.5 - ax;
                     double cy = (double)py + rc.ih * 0.5 - ay;
                     double dist2 = cx * cx + cy * cy;
-                    return {delta, dist2};
+
+                    double sec = dist2;
+                    if (tall_weight > 0.0) {
+                        double cbx = (double)px + rc.iw * 0.5 - bed_center_px_x;
+                        double cby = (double)py + rc.ih * 0.5 - bed_center_px_y;
+                        double dist2_center = cbx * cbx + cby * cby;
+                        sec += tall_weight * dist2_center;
+                    }
+                    return {delta, sec};
                 };
 
                 // Per-rotation coarse winner — NOT a single global winner.
