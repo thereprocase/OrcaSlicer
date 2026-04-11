@@ -579,7 +579,19 @@ public:
                 bool center_default =
                     std::abs(params.align_center.x() - 0.5) < ALIGN_DEFAULT_EPS &&
                     std::abs(params.align_center.y() - 0.5) < ALIGN_DEFAULT_EPS;
-                if (center_default && cluster_bb[plate_idx].empty()) {
+                // Pure corner anchor for ALL items in default-align case.
+                // Placement now builds a tight corner-aligned cluster and
+                // post-centering shifts it to bed center as a second pass.
+                // Rationale: the old hybrid (corner first, bed-center
+                // after) over-pulled later items into gaps near the bed
+                // center when multiple candidate positions tied on area
+                // delta, producing off-grid layouts (e.g. 4 equal squares
+                // don't 2x2 — item 2 landed at (60,80) instead of (0,80)
+                // because the bed-center tiebreaker preferred center-x).
+                // Corner anchor + post-centering produces grid-aligned
+                // placement plus the same visual centering the user sees,
+                // better of both worlds. See task #56 for the diagnosis.
+                if (center_default) {
                     return {0.0, 0.0};
                 }
                 return {bw_mm * params.align_center.x() / res,

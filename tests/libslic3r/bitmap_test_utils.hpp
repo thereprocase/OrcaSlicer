@@ -11,6 +11,7 @@
 
 #include <vector>
 #include <set>
+#include <map>
 #include <cmath>
 #include <algorithm>
 
@@ -45,6 +46,94 @@ inline int overflow_piece_count(const ArrangePolygons &items)
     for (const auto &it : items)
         if (it.bed_idx != UNARRANGED && it.bed_idx > 0) ++n;
     return n;
+}
+
+// Sum of cluster bounding-box PERIMETER across all plates, in mm.
+// A direct proxy for worst-case print-head XY travel: a compact
+// cluster has shorter perimeter, so the head's coverage envelope is
+// smaller per plate. Two layouts with the same plate count and zero
+// overflow can have very different perimeters (a 100x100 cluster has
+// perimeter 400 mm; a 400x25 cluster of the same area has perimeter
+// 850 mm). The cluster-bbox-growth primary scorer already optimizes
+// for perimeter implicitly; this helper lets tests assert bounds
+// directly so an algorithm change that trades off tighter-but-longer
+// layouts can be detected.
+//
+// UNARRANGED items are skipped. Perimeter is computed per-plate from
+// the axis-aligned bounding box of all placed items' transformed_poly.
+// Returns 0.0 for an empty arrangement.
+inline double cluster_bbox_perimeter_mm(const ArrangePolygons &items)
+{
+    // Gather items per plate, compute per-plate union bbox, sum perimeters.
+    std::map<int, BoundingBox> per_plate;
+    for (const auto &it : items) {
+        if (it.bed_idx == UNARRANGED) continue;
+        ExPolygon tp = it.transformed_poly();
+        BoundingBox bb = get_extents(tp);
+        auto it_map = per_plate.find(it.bed_idx);
+        if (it_map == per_plate.end()) {
+            per_plate.emplace(it.bed_idx, bb);
+        } else {
+            it_map->second.merge(bb);
+        }
+    }
+    double total = 0.0;
+    for (const auto &kv : per_plate) {
+        const BoundingBox &bb = kv.second;
+        double w = unscaled<double>(bb.size().x());
+        double h = unscaled<double>(bb.size().y());
+        total += 2.0 * (w + h);
+    }
+    return total;
+}
+
+// Compactness ratio: actual cluster area divided by the minimum
+// enclosing axis-aligned rectangle area. 1.0 = cluster fills its
+// bbox exactly; 0.5 = cluster wastes half its bbox. Higher is better
+// for tight packing. Computed per-plate and averaged by placed-item
+// count so a plate with a few tight items and a plate with many
+// tight items both score near 1.
+//
+// "Actual area" here is the sum of item transformed_poly areas (sum
+// of per-item footprints), NOT the unioned area. For non-overlapping
+// items these are the same; for overlapping-by-rounding items it's
+// a slight overcount but still comparable between layouts.
+inline double cluster_compactness(const ArrangePolygons &items)
+{
+    struct PlateAgg {
+        double area_mm2 = 0.0;
+        BoundingBox bb;
+        bool bb_init = false;
+        int count = 0;
+    };
+    std::map<int, PlateAgg> per_plate;
+    for (const auto &it : items) {
+        if (it.bed_idx == UNARRANGED) continue;
+        ExPolygon tp = it.transformed_poly();
+        BoundingBox bb = get_extents(tp);
+        double a = unscaled<double>(unscaled<double>(std::abs(tp.area())));
+        auto &agg = per_plate[it.bed_idx];
+        agg.area_mm2 += a;
+        if (!agg.bb_init) { agg.bb = bb; agg.bb_init = true; }
+        else               agg.bb.merge(bb);
+        agg.count++;
+    }
+    if (per_plate.empty()) return 0.0;
+    double weighted_sum = 0.0;
+    int total_count = 0;
+    for (const auto &kv : per_plate) {
+        const PlateAgg &agg = kv.second;
+        double w = unscaled<double>(agg.bb.size().x());
+        double h = unscaled<double>(agg.bb.size().y());
+        double bbox_area = w * h;
+        if (bbox_area <= 0.0) continue;
+        double ratio = agg.area_mm2 / bbox_area;
+        if (ratio > 1.0) ratio = 1.0;  // clamp rounding overcounts
+        weighted_sum += ratio * agg.count;
+        total_count  += agg.count;
+    }
+    if (total_count == 0) return 0.0;
+    return weighted_sum / (double)total_count;
 }
 
 // Run an arrange call twice on a fresh copy of the input items each
