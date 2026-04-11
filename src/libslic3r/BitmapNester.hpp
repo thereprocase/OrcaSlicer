@@ -74,33 +74,12 @@ public:
 
         int wpr = (bw + 63) / 64;
 
-        // Sort items by priority (descending), then longest-dimension
-        // (descending), then area (descending) as a tiebreaker.
-        //
-        // FFD (First-Fit-Decreasing) heuristic: place the items whose
-        // bounding box has the largest max dimension first. For mixed
-        // real-world plates this puts tall/long parts down while the
-        // bed is empty, anchoring the cluster outline. Small parts then
-        // tuck around them. This is also what the user noticed matters
-        // for print-head travel: the big parts dominate head motion, so
-        // committing their positions first (where they fit tightest)
-        // matters more than committing a small part's position first.
-        //
-        // Max dim is invariant under 90/180/270 rotation (which is all
-        // we support), so the ordering is stable against allowed_rotations.
-        auto max_dim_of = [](const ArrangePolygon &it) -> double {
-            BoundingBox bb = get_extents(it.poly);
-            return std::max(unscaled<double>(bb.size().x()),
-                            unscaled<double>(bb.size().y()));
-        };
+        // Sort items by priority (descending), then by area (descending)
         std::vector<size_t> order(items.size());
         std::iota(order.begin(), order.end(), 0);
         std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
             if (items[a].priority != items[b].priority)
                 return items[a].priority > items[b].priority;
-            double da = max_dim_of(items[a]);
-            double db = max_dim_of(items[b]);
-            if (da != db) return da > db;
             return std::abs(items[a].poly.area()) > std::abs(items[b].poly.area());
         });
 
