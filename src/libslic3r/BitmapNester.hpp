@@ -106,10 +106,29 @@ public:
         //                       intersection. See war-council-report.md C15.
         std::vector<std::vector<uint64_t>> plate_items;
         std::vector<std::vector<uint64_t>> plate_excludes;
+        // Per-plate running cluster bounding box in pixel coordinates.
+        // Empty plates hold an inverted-range sentinel (minx > maxx) so the
+        // first placement computes a zero-area starting cluster. Used by the
+        // bottom-left-fill scoring function: a candidate placement's cost is
+        // the increase in cluster-bbox area it would cause, with anchor
+        // distance as a tiebreaker. This is what lets concave shapes
+        // interlock — a rotated L slotted into another L's notch has zero
+        // delta-area and beats any non-interlocking position.
+        struct ClusterBB {
+            int minx, miny, maxx, maxy; // inclusive, pixel space; empty if minx > maxx
+            bool empty() const { return minx > maxx || miny > maxy; }
+            int64_t area() const {
+                if (empty()) return 0;
+                return (int64_t)(maxx - minx + 1) * (int64_t)(maxy - miny + 1);
+            }
+        };
+        std::vector<ClusterBB> cluster_bb;
         auto ensure_plate = [&](int idx) {
             while ((int)plate_items.size() <= idx) {
                 plate_items.emplace_back((size_t)wpr * bh, uint64_t(0));
                 plate_excludes.emplace_back((size_t)wpr * bh, uint64_t(0));
+                cluster_bb.push_back(ClusterBB{std::numeric_limits<int>::max(), std::numeric_limits<int>::max(),
+                                       std::numeric_limits<int>::min(), std::numeric_limits<int>::min()});
             }
         };
         ensure_plate(0);
@@ -414,27 +433,80 @@ public:
                 const double ax = anchor.first;
                 const double ay = anchor.second;
 
-                auto score_at = [&](const RotCache &rc, int px, int py) -> double {
+                const ClusterBB &cbb = cluster_bb[plate_idx];
+                const int64_t cbb_area = cbb.area();
+                const bool cbb_empty = cbb.empty();
+
+                // Score a candidate placement as:
+                //   primary   = growth in cluster bounding box area (int64)
+                //   secondary = squared pixel distance of candidate bbox
+                //               center from resolved anchor
+                //
+                // A rotated L-shape slotted into an existing L's concave notch
+                // has its bbox already inside the cluster bbox, so delta_area
+                // is zero and it wins over any non-interlocking position.
+                // When the cluster is empty, all positions tie on delta_area
+                // and the anchor tiebreaker decides (first item clusters
+                // around the wipe tower; in the default case the anchor is
+                // (0, 0) so first item lands top-left, preserving the old
+                // first-fit baseline pack density).
+                //
+                // We return a pair so lexicographic comparison does the right
+                // thing without numerical scaling games.
+                auto score_at = [&](const RotCache &rc, int px, int py)
+                    -> std::pair<int64_t, double>
+                {
+                    int nminx = px;
+                    int nminy = py;
+                    int nmaxx = px + rc.iw - 1;
+                    int nmaxy = py + rc.ih - 1;
+                    int64_t new_area;
+                    if (cbb_empty) {
+                        new_area = (int64_t)rc.iw * (int64_t)rc.ih;
+                    } else {
+                        int mnx = std::min(cbb.minx, nminx);
+                        int mny = std::min(cbb.miny, nminy);
+                        int mxx = std::max(cbb.maxx, nmaxx);
+                        int mxy = std::max(cbb.maxy, nmaxy);
+                        new_area = (int64_t)(mxx - mnx + 1) * (int64_t)(mxy - mny + 1);
+                    }
+                    int64_t delta = new_area - cbb_area;
                     double cx = (double)px + rc.iw * 0.5 - ax;
                     double cy = (double)py + rc.ih * 0.5 - ay;
-                    return cx * cx + cy * cy;
+                    double dist2 = cx * cx + cy * cy;
+                    return {delta, dist2};
                 };
 
-                double best_coarse_score = std::numeric_limits<double>::infinity();
-                int coarse_px = -1, coarse_py = -1;
-                int coarse_rc_idx = -1;
+                // Per-rotation coarse winner — NOT a single global winner.
+                // The old code kept only the global coarse best, then refined
+                // that rotation alone. That structurally prevented the refine
+                // pass from discovering interlocking positions in rotations
+                // that lost the coarse-grid lottery by a hair to a
+                // non-interlocking rotation. For concave shapes where bbox is
+                // insensitive to rotation (any L), the coarse winner is
+                // effectively random across rotations and the single-rotation
+                // refine misses obvious interlocks. Fix: remember the best
+                // coarse (px, py) per rotation, then run refine for EVERY
+                // rotation and keep the global best across all refine results.
+                struct CoarseBest {
+                    std::pair<int64_t, double> score{
+                        std::numeric_limits<int64_t>::max(),
+                        std::numeric_limits<double>::infinity()};
+                    int px = -1;
+                    int py = -1;
+                };
+                std::vector<CoarseBest> per_rot_coarse(rot_cache.size());
 
                 // Coarse scan: every rotation, every coarse-stride position
                 // plus the max-row/max-col boundary positions when the stride
-                // skips them. Score every clear position, keep the best.
+                // skips them. Score every clear position, keep the best per
+                // rotation.
                 for (size_t rci = 0; rci < rot_cache.size(); ++rci) {
                     const auto &rc = rot_cache[rci];
                     int max_py = bh - rc.ih;
                     int max_px = bw - rc.iw;
                     if (max_py < 0 || max_px < 0) continue;
 
-                    // Build the set of unique py/px candidates once (includes
-                    // boundary row/col without the nested pass-counter).
                     std::vector<int> pys;
                     for (int py = 0; py <= max_py; py += rc.coarse) pys.push_back(py);
                     if (pys.empty() || pys.back() != max_py) pys.push_back(max_py);
@@ -443,52 +515,68 @@ public:
                     for (int px = 0; px <= max_px; px += rc.coarse) pxs.push_back(px);
                     if (pxs.empty() || pxs.back() != max_px) pxs.push_back(max_px);
 
+                    CoarseBest &cb = per_rot_coarse[rci];
                     for (int py : pys) {
                         for (int px : pxs) {
                             if (!position_clear(plate_idx, rc, px, py)) continue;
-                            double s = score_at(rc, px, py);
-                            if (s < best_coarse_score) {
-                                best_coarse_score = s;
-                                coarse_px = px;
-                                coarse_py = py;
-                                coarse_rc_idx = (int)rci;
+                            auto s = score_at(rc, px, py);
+                            if (s < cb.score) {
+                                cb.score = s;
+                                cb.px    = px;
+                                cb.py    = py;
                             }
                         }
                     }
                 }
 
-                if (coarse_rc_idx < 0) continue;  // no valid position on this plate
+                // Check we found at least one valid position across all rots.
+                bool any_valid = false;
+                for (const auto &cb : per_rot_coarse)
+                    if (cb.px >= 0) { any_valid = true; break; }
+                if (!any_valid) continue;  // no valid position on this plate
 
-                // Refine: scored fine scan within ±coarse of the coarse winner.
-                // Score-monotonic in the neighborhood so the pixel-precise
-                // answer lives near the coarse winner; we still score every
-                // clear position in the window to get the exact minimum.
-                const auto &rc = rot_cache[coarse_rc_idx];
-                int ry0 = std::max(0, coarse_py - rc.coarse);
-                int ry1 = std::min(bh - rc.ih, coarse_py + rc.coarse);
-                int rx0 = std::max(0, coarse_px - rc.coarse);
-                int rx1 = std::min(bw - rc.iw, coarse_px + rc.coarse);
+                // Refine: for each rotation that had a coarse winner, scan
+                // every pixel in a ±coarse window around that rotation's best
+                // coarse position. Score every clear position with the same
+                // score_at and track the GLOBAL best across all rotations.
+                // This is the fix for bug #3 — an interlocking rotation that
+                // lost the coarse lottery still gets a chance at refinement.
+                std::pair<int64_t, double> refine_score{
+                    std::numeric_limits<int64_t>::max(),
+                    std::numeric_limits<double>::infinity()};
+                int refine_px = -1, refine_py = -1;
+                int refine_rc_idx = -1;
 
-                double refine_score = best_coarse_score;
-                int refine_px = coarse_px, refine_py = coarse_py;
-                for (int py = ry0; py <= ry1; ++py) {
-                    for (int px = rx0; px <= rx1; ++px) {
-                        if (!position_clear(plate_idx, rc, px, py)) continue;
-                        double s = score_at(rc, px, py);
-                        if (s < refine_score) {
-                            refine_score = s;
-                            refine_px = px;
-                            refine_py = py;
+                for (size_t rci = 0; rci < rot_cache.size(); ++rci) {
+                    const CoarseBest &cb = per_rot_coarse[rci];
+                    if (cb.px < 0) continue;
+                    const auto &rc = rot_cache[rci];
+                    int ry0 = std::max(0, cb.py - rc.coarse);
+                    int ry1 = std::min(bh - rc.ih, cb.py + rc.coarse);
+                    int rx0 = std::max(0, cb.px - rc.coarse);
+                    int rx1 = std::min(bw - rc.iw, cb.px + rc.coarse);
+
+                    for (int py = ry0; py <= ry1; ++py) {
+                        for (int px = rx0; px <= rx1; ++px) {
+                            if (!position_clear(plate_idx, rc, px, py)) continue;
+                            auto s = score_at(rc, px, py);
+                            if (s < refine_score) {
+                                refine_score = s;
+                                refine_px    = px;
+                                refine_py    = py;
+                                refine_rc_idx = (int)rci;
+                            }
                         }
                     }
                 }
 
-                best_px = refine_px;
-                best_py = refine_py;
-                best_rot = rc.rot;
-                best_plate = plate_idx;
-                best_rc_idx = coarse_rc_idx;
-                placed = true;
+                if (refine_rc_idx < 0) continue;  // shouldn't happen but guard
+                best_px     = refine_px;
+                best_py     = refine_py;
+                best_rot    = rot_cache[refine_rc_idx].rot;
+                best_plate  = plate_idx;
+                best_rc_idx = refine_rc_idx;
+                placed      = true;
             }
 
             if (placed) {
@@ -504,6 +592,30 @@ public:
                 stamp(plate_items[best_plate], wpr, bw, bh,
                       best_rc.bm, best_rc.iwpr, best_rc.iw, best_rc.ih,
                       best_px, best_py);
+
+                // Extend the running cluster bbox with this placement's
+                // pixel footprint so the next item's score_at sees the
+                // updated obstacle extent. Uses the rotation cache bbox
+                // dimensions, not the raw polygon bbox, so dilation is
+                // included.
+                {
+                    ClusterBB &c = cluster_bb[best_plate];
+                    int nminx = best_px;
+                    int nminy = best_py;
+                    int nmaxx = best_px + best_rc.iw - 1;
+                    int nmaxy = best_py + best_rc.ih - 1;
+                    if (c.empty()) {
+                        c.minx = nminx;
+                        c.miny = nminy;
+                        c.maxx = nmaxx;
+                        c.maxy = nmaxy;
+                    } else {
+                        c.minx = std::min(c.minx, nminx);
+                        c.miny = std::min(c.miny, nminy);
+                        c.maxx = std::max(c.maxx, nmaxx);
+                        c.maxy = std::max(c.maxy, nmaxy);
+                    }
+                }
 
                 // L12: use inflated polygon's actual bbox for translation.
                 // The rasterizer places inflated_bb.min at pixel (best_px, best_py).
@@ -865,8 +977,15 @@ private:
             std::sort(xs.begin(), xs.end());
 
             for (size_t k = 0; k + 1 < xs.size(); k += 2) {
-                int x_start = std::max(0, (int)std::floor((xs[k] - ox) / res_mm));
-                int x_end = std::min(iw - 1, (int)std::floor((xs[k + 1] - ox) / res_mm));
+                // Conservative floor/floor fill rule: pixel i is filled when
+                // i <= floor((xs[k+1]-ox)/res_mm). When xs[k+1] lands exactly
+                // on a pixel boundary this includes one extra pixel at that
+                // boundary — a deliberate off-by-one toward MORE material,
+                // consistent with the rasterizer being fuzzy at sub-pixel
+                // scales anyway. Fine for concave nesting because the cost
+                // is a ~res_mm fringe on one edge, not a closed notch.
+                int x_start = std::max(0,      (int)std::floor((xs[k]     - ox) / res_mm));
+                int x_end   = std::min(iw - 1, (int)std::floor((xs[k + 1] - ox) / res_mm));
 
                 if (x_start > x_end) continue;
 
