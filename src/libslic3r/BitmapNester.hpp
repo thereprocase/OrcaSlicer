@@ -183,6 +183,13 @@ public:
             const auto &rots = !item.allowed_rotations.empty()
                                ? item.allowed_rotations : default_rotations;
 
+            // Capture any pre-arrange rotation the caller placed on item.rotation
+            // (e.g. from update_selected_items_axis_align). The nester's own
+            // allowed_rotations are ADDITIONAL rotations tried on top of this.
+            // We apply base_rot to the shapes once before the inner loop so the
+            // rot_cache entries each represent base_rot + rot, not rot alone.
+            const double base_rot = item.rotation;
+
             // L14: pre-rasterize all rotations for this item so we don't
             // re-rasterize on every plate retry. For 75 items × 4 rotations × 6
             // plates, this cuts rasterize calls from ~1000 to ~300.
@@ -195,20 +202,42 @@ public:
             std::vector<RotCache> rot_cache;
             rot_cache.reserve(rots.size());
 
-            for (double rot : rots) {
-                ExPolygon rpoly = item.poly;
-                if (rot != 0.0) rpoly.rotate(rot);
+            // Build the silhouette input for this item. If the caller populated
+            // item.concave_regions (ArrangeJob does this when use_concave_shapes
+            // is on), use every island — multi-volume parts, dumbbells, and
+            // shapes whose top/bottom projections diverge have legitimately
+            // disconnected footprints that must all be collision-checked.
+            // Otherwise fall back to the single-region item.poly (libnest2d-
+            // compatible convex hull or simple silhouette).
+            ExPolygons base_shapes;
+            if (!item.concave_regions.empty()) {
+                base_shapes = item.concave_regions;
+            } else {
+                base_shapes.push_back(item.poly);
+            }
 
-                // Rasterize the un-inflated polygon, then dilate the bitmap.
+            // Apply the caller's pre-rotation once so that every subsequent
+            // per-rot iteration composes on top of it rather than ignoring it.
+            if (base_rot != 0.0) {
+                for (ExPolygon &s : base_shapes) s.rotate(base_rot);
+            }
+
+            for (double rot : rots) {
+                ExPolygons rshapes = base_shapes;
+                if (rot != 0.0) {
+                    for (ExPolygon &s : rshapes) s.rotate(rot);
+                }
+
+                // Rasterize the un-inflated polygon(s), then dilate the bitmap.
                 // This avoids Clipper's offset_ex entirely in the hot path.
                 int raw_iw, raw_ih, raw_iwpr;
-                auto raw_bm = rasterize(rpoly, res, bw, bh, raw_iw, raw_ih, raw_iwpr);
+                auto raw_bm = rasterize(rshapes, res, bw, bh, raw_iw, raw_ih, raw_iwpr);
                 if (raw_bm.empty()) continue;
 
                 // Dilate bitmap by pad_px in all directions
                 int iw = raw_iw, ih = raw_ih, iwpr_item = raw_iwpr;
                 std::vector<uint64_t> ibm;
-                BoundingBox inflated_bb = get_extents(rpoly);
+                BoundingBox inflated_bb = get_extents(rshapes);
 
                 if (pad_px > 0) {
                     iw = raw_iw + 2 * pad_px;
@@ -333,7 +362,9 @@ public:
                                   + unscaled<double>(ebed.min.y());
 
                 item.translation = Vec2crd{scaled(origin_x), scaled(origin_y)};
-                item.rotation = best_rot;
+                // Compose the nester's chosen rotation on top of the caller's
+                // pre-rotation so the axis-align angle is not discarded.
+                item.rotation = base_rot + best_rot;
                 item.bed_idx = best_plate;
                 item.itemid = item_sequence++;
                 if (params.on_packed)
@@ -347,7 +378,14 @@ public:
         // center lands on align_center (default: bed center).
         // Skip plates that have excludes — centering could shift items
         // into forbidden zones that placement carefully avoided.
-        if (params.do_final_align) {
+        //
+        // Honor stopcondition here as well: when the user cancels mid-arrange,
+        // the placement loop breaks out of its own scan, but the centering
+        // pass would otherwise keep moving items that were already written
+        // with their pre-center coordinates. Bail out cleanly so cancellation
+        // leaves placed items at their raw scan positions instead of a
+        // half-shifted cluster.
+        if (params.do_final_align && !(params.stopcondition && params.stopcondition())) {
             // Build set of plates that have any exclude
             std::vector<bool> plate_has_exclude(current_plate + 1, false);
             for (auto &ex : excludes) {
@@ -360,6 +398,7 @@ public:
             }
 
             for (int plate = 0; plate <= current_plate; ++plate) {
+                if (params.stopcondition && params.stopcondition()) break;
                 if (plate_has_exclude[plate]) continue;
 
                 BoundingBox cluster_bb;
@@ -594,6 +633,41 @@ private:
 
         for (auto &hole : poly.holes)
             scanline_fill(hole, bb, res_mm, iw, ih, iwpr, bm, false);
+
+        return bm;
+    }
+
+    // Rasterize multiple ExPolygons into a single bitmap covering their union
+    // bbox. Each region's contour is filled; each region's holes are cleared.
+    // Disconnected islands pack into one bitmap so downstream collision and
+    // dilation code can treat the whole silhouette as a single stamp.
+    static std::vector<uint64_t> rasterize(const ExPolygons &polys,
+                                           double res_mm,
+                                           int max_w, int max_h,
+                                           int &iw, int &ih, int &iwpr)
+    {
+        if (polys.empty()) {
+            iw = ih = iwpr = 0;
+            return {};
+        }
+
+        BoundingBox bb = get_extents(polys);
+        if (bb.min.x() >= bb.max.x() || bb.min.y() >= bb.max.y()) {
+            iw = ih = iwpr = 0;
+            return {};
+        }
+
+        iw = std::min(max_w, std::max(1, (int)std::ceil(unscaled<double>(bb.size().x()) / res_mm)));
+        ih = std::min(max_h, std::max(1, (int)std::ceil(unscaled<double>(bb.size().y()) / res_mm)));
+        iwpr = (iw + 63) / 64;
+
+        std::vector<uint64_t> bm((size_t)iwpr * ih, 0);
+
+        for (const ExPolygon &poly : polys) {
+            scanline_fill(poly.contour, bb, res_mm, iw, ih, iwpr, bm, true);
+            for (auto &hole : poly.holes)
+                scanline_fill(hole, bb, res_mm, iw, ih, iwpr, bm, false);
+        }
 
         return bm;
     }
