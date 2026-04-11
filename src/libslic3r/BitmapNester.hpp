@@ -19,6 +19,7 @@
 #include "ExPolygon.hpp"
 #include "Arrange.hpp"
 #include "BoundingBox.hpp"
+#include "ClipperUtils.hpp"   // intersection_ex used by post-centering safety check
 #include "Geometry/ConvexHull.hpp"
 #include <vector>
 #include <cstdint>
@@ -27,6 +28,7 @@
 #include <numeric>
 #include <cmath>
 #include <cassert>
+#include <random>     // smart-shuffle restart driver uses std::mt19937
 #include <utility>
 
 namespace Slic3r { namespace arrangement {
@@ -80,6 +82,19 @@ public:
                 return items[a].priority > items[b].priority;
             return std::abs(items[a].poly.area()) > std::abs(items[b].poly.area());
         });
+
+        // Snapshot each item's caller-supplied rotation BEFORE the placement
+        // loop touches it. The greedy placement loop overwrites
+        // `item.rotation` with `base_rot + best_rot` at commit time, which
+        // means by the time consolidation runs, `item.rotation` is no
+        // longer the caller's pre-rotation — it's that plus whatever the
+        // greedy chose. The consolidation pass needs the original value to
+        // compose new rotations against (otherwise it would discard the
+        // caller's `align_to_y_axis` pre-rotation when migrating). Save
+        // them up front in a parallel vector indexed by items[].
+        std::vector<double> base_rotations(items.size(), 0.0);
+        for (size_t i = 0; i < items.size(); ++i)
+            base_rotations[i] = items[i].rotation;
 
         // Build rotation list for items that allow any rotation
         std::vector<double> default_rotations;
@@ -197,6 +212,121 @@ public:
             if (ex.bed_idx > 0)
                 current_plate = std::max(current_plate, ex.bed_idx);
         }
+
+        // ── Smart-shuffle restart driver ─────────────────────────────
+        // For low part counts the placement order has a large effect
+        // on whether everything fits. Center-greedy in particular can
+        // trap the second item when the first lands at the bed center
+        // and fragments the surrounding space. Random-permutation
+        // restarts is the standard fix (see docs/FFT_NESTER_IDEA.md
+        // Section 3 for the parallelism design that scales this up).
+        // Here we run them sequentially and only when N is small
+        // enough that 4-8 retries are cheap. The first attempt always
+        // uses the priority+area-desc baseline; subsequent attempts
+        // shuffle within priority buckets using deterministic seeds.
+        struct InputState { Vec2crd t; double r; int b; int id; };
+        std::vector<InputState> input_state(items.size());
+        for (size_t i = 0; i < items.size(); ++i)
+            input_state[i] = {items[i].translation, base_rotations[i],
+                              items[i].bed_idx, items[i].itemid};
+
+        // Snapshot the post-bed-setup plate state so each restart can
+        // rebuild from this point without re-running the setup phase.
+        const int initial_plate_count    = (int)plate_items.size();
+        const int initial_current_plate  = current_plate;
+        const auto initial_plate_excludes = plate_excludes;
+
+        // Best result tracking. Score = (placed_count descending,
+        // max_bed_idx ascending, total_cluster_area ascending). The
+        // placed-count primary is critical for stopcondition-aware
+        // correctness: an attempt where the user's stopcondition
+        // halted placement early must NEVER beat an earlier attempt
+        // that placed more items, even if its max_bed_idx looks
+        // numerically better.
+        struct BestState {
+            bool    valid      = false;
+            int     placed     = -1;
+            int     max_bed    = std::numeric_limits<int>::max();
+            int64_t total_area = std::numeric_limits<int64_t>::max();
+            std::vector<Vec2crd> trans;
+            std::vector<double>  rots;
+            std::vector<int>     beds;
+            std::vector<int>     iids;
+        };
+        BestState best;
+
+        auto reset_for_restart = [&]() {
+            for (size_t i = 0; i < items.size(); ++i) {
+                items[i].translation = input_state[i].t;
+                items[i].rotation    = input_state[i].r;
+                items[i].bed_idx     = input_state[i].b;
+                items[i].itemid      = input_state[i].id;
+            }
+            plate_items.assign(initial_plate_count,
+                               std::vector<uint64_t>((size_t)wpr * bh, 0));
+            plate_excludes = initial_plate_excludes;
+            cluster_bb.assign(initial_plate_count, ClusterBB{
+                std::numeric_limits<int>::max(),
+                std::numeric_limits<int>::max(),
+                std::numeric_limits<int>::min(),
+                std::numeric_limits<int>::min()});
+            current_plate = initial_current_plate;
+        };
+
+        // Returns (placed_count, max_bed_idx, total_cluster_area).
+        // Lex order with placed_count flipped to descending (more is
+        // better) for the comparator below.
+        struct AttemptScore { int placed; int max_bed; int64_t area; };
+        auto score_current = [&]() -> AttemptScore {
+            int placed = 0;
+            int max_bed = -1;
+            for (const auto &it : items) {
+                if (it.bed_idx != UNARRANGED) {
+                    ++placed;
+                    if (it.bed_idx > max_bed) max_bed = it.bed_idx;
+                }
+            }
+            int64_t area = 0;
+            for (const auto &c : cluster_bb)
+                if (!c.empty()) area += c.area();
+            return {placed, max_bed, area};
+        };
+
+        auto save_best = [&](const AttemptScore &s) {
+            best.valid      = true;
+            best.placed     = s.placed;
+            best.max_bed    = s.max_bed;
+            best.total_area = s.area;
+            best.trans.resize(items.size());
+            best.rots.resize(items.size());
+            best.beds.resize(items.size());
+            best.iids.resize(items.size());
+            for (size_t i = 0; i < items.size(); ++i) {
+                best.trans[i] = items[i].translation;
+                best.rots[i]  = items[i].rotation;
+                best.beds[i]  = items[i].bed_idx;
+                best.iids[i]  = items[i].itemid;
+            }
+        };
+
+        // Number of attempts based on N. Restarts are sequential and
+        // each runs the full placement+consolidation+centering pipeline,
+        // so the runtime is num_attempts × baseline_time. We cap at 8
+        // for very small N (still milliseconds total) and 4 for medium
+        // N. For large N we run once because the order space is too
+        // big to sample meaningfully and the baseline is good enough.
+        const int num_attempts =
+            (items.size() <= 6)  ? 8 :
+            (items.size() <= 16) ? 4 : 1;
+
+        // Snapshot the original `order` for perturbation seeds.
+        const std::vector<size_t> base_order = order;
+
+        // Lambda wrapping the placement+consolidation+post-centering
+        // pipeline. Captures everything by reference. Each invocation
+        // mutates items[], plate_items[], cluster_bb[], current_plate.
+        // Reset between calls via reset_for_restart().
+        auto do_one_pass = [&]() {
 
         int item_sequence = 0;
 
@@ -402,16 +532,32 @@ public:
                                     + unscaled<double>(wbb.max.y())) / 2.0;
                     return {cx_mm / res, cy_mm / res};
                 }
+                // Hybrid anchor (default-align case only): corner seed
+                // for the first item on a plate, bed center for items
+                // 2..N. The corner seed avoids the central-trap
+                // failure mode where center anchoring puts the first
+                // item dead-center and fragments the surrounding
+                // space into strips too thin for any subsequent item.
+                // Subsequent items grow toward the bed center, which
+                // gives a visually balanced cluster without sacrificing
+                // tight packing.
+                //
+                // For non-default align_center, the user has explicitly
+                // chosen a target position and the hybrid does not
+                // apply — every item anchors at the chosen target so
+                // the user's intent is honored. The scored scan is the
+                // only code path that respects off-center alignment
+                // (post-centering can't accurately re-target a rigid
+                // cluster shift).
+                double bw_mm = unscaled<double>(ebed.max.x() - ebed.min.x());
+                double bh_mm = unscaled<double>(ebed.max.y() - ebed.min.y());
                 constexpr double ALIGN_DEFAULT_EPS = 1e-9;
                 bool center_default =
                     std::abs(params.align_center.x() - 0.5) < ALIGN_DEFAULT_EPS &&
                     std::abs(params.align_center.y() - 0.5) < ALIGN_DEFAULT_EPS;
-                if (center_default) {
-                    // First-fit equivalent: smallest-px/py score wins.
+                if (center_default && cluster_bb[plate_idx].empty()) {
                     return {0.0, 0.0};
                 }
-                double bw_mm = unscaled<double>(ebed.max.x() - ebed.min.x());
-                double bh_mm = unscaled<double>(ebed.max.y() - ebed.min.y());
                 return {bw_mm * params.align_center.x() / res,
                         bh_mm * params.align_center.y() / res};
             };
@@ -640,10 +786,262 @@ public:
             }
         }
 
+        // ── Plate consolidation (backwards pass) ─────────────────────
+        // After greedy placement, walk plates last-to-first and try to
+        // migrate each item from a later plate back to an earlier plate
+        // by finding any clear position there. Most plates after a
+        // reasonable greedy pass have small holes that can swallow one
+        // or two pieces from the next plate, eliminating the overflow.
+        // The single-pass greedy can't see these holes because it only
+        // visits each plate once and never revisits after later items
+        // change the cluster shape.
+        //
+        // Cost: each successful migration triggers a re-stamp of the
+        // source plate (rebuild plate_items[from_plate] by re-rasterizing
+        // every surviving item). Most attempts fail at the cheap bbox
+        // check or first position scan; the expensive case (a real
+        // migration) is exactly when a plate is about to be eliminated.
+        if (current_plate > 0 && !(params.stopcondition && params.stopcondition())) {
+            int safety_iter = 0;
+            bool any_migration = true;
+            while (any_migration && safety_iter++ < 4) {
+                any_migration = false;
+                for (int from_plate = current_plate; from_plate > 0; --from_plate) {
+                    if (params.stopcondition && params.stopcondition()) break;
+
+                    std::vector<size_t> from_indices;
+                    for (size_t i = 0; i < items.size(); ++i)
+                        if (items[i].bed_idx == from_plate)
+                            from_indices.push_back(i);
+                    if (from_indices.empty()) continue;
+
+                    bool plate_dirty = false;
+
+                    for (size_t item_idx : from_indices) {
+                        if (params.stopcondition && params.stopcondition()) break;
+                        auto &it = items[item_idx];
+
+                        const auto &rots = !it.allowed_rotations.empty()
+                                           ? it.allowed_rotations : default_rotations;
+
+                        // Caller's original pre-rotation, captured before the
+                        // greedy loop ran. Mirror the greedy code path: pre-
+                        // rotate base_shapes by base_rot, then compose
+                        // rotations from `rots` ON TOP, and at commit write
+                        // `item.rotation = base_rot + chosen_rot` so the
+                        // caller's axis-align angle survives migration.
+                        const double base_rot = base_rotations[item_idx];
+
+                        ExPolygons base_shapes;
+                        if (!it.concave_regions.empty())
+                            base_shapes = it.concave_regions;
+                        else
+                            base_shapes.push_back(it.poly);
+                        if (base_rot != 0.0)
+                            for (ExPolygon &s : base_shapes) s.rotate(base_rot);
+
+                        int pad_px = 0;
+                        if (it.inflation > 0)
+                            pad_px = std::max(1, (int)std::ceil(unscaled<double>(it.inflation) / res));
+                        else if (params.min_obj_distance > 0)
+                            pad_px = std::max(1, (int)std::ceil(unscaled<double>(params.min_obj_distance / 2) / res));
+
+                        bool migrated = false;
+                        for (int to_plate = 0; to_plate < from_plate && !migrated; ++to_plate) {
+                            for (double rot : rots) {
+                                ExPolygons rshapes = base_shapes;
+                                if (rot != 0.0)
+                                    for (ExPolygon &s : rshapes) s.rotate(rot);
+
+                                int raw_iw, raw_ih, raw_iwpr;
+                                auto raw_bm = rasterize(rshapes, res, bw, bh, raw_iw, raw_ih, raw_iwpr);
+                                if (raw_bm.empty()) continue;
+
+                                ExPolygon hull_expoly;
+                                hull_expoly.contour = Geometry::convex_hull(rshapes);
+                                if (hull_expoly.contour.empty()) continue;
+                                int h_iw, h_ih, h_iwpr;
+                                auto h_raw = rasterize(hull_expoly, res, bw, bh, h_iw, h_ih, h_iwpr);
+                                if (h_raw.empty() || h_iw != raw_iw || h_ih != raw_ih) continue;
+
+                                int iw = raw_iw, ih = raw_ih, iwpr_item = raw_iwpr;
+                                std::vector<uint64_t> ibm, hbm;
+                                BoundingBox inflated_bb = get_extents(rshapes);
+                                if (pad_px > 0) {
+                                    iw = raw_iw + 2 * pad_px;
+                                    ih = raw_ih + 2 * pad_px;
+                                    if (iw > bw || ih > bh) continue;
+                                    iwpr_item = (iw + 63) / 64;
+                                    ibm = dilate_bitmap(raw_bm, raw_iwpr, raw_iw, raw_ih,
+                                                        pad_px, iwpr_item, iw, ih);
+                                    hbm = dilate_bitmap(h_raw, raw_iwpr, raw_iw, raw_ih,
+                                                        pad_px, iwpr_item, iw, ih);
+                                    coord_t pad_sc = scaled(pad_px * res);
+                                    inflated_bb.min -= Vec2crd(pad_sc, pad_sc);
+                                    inflated_bb.max += Vec2crd(pad_sc, pad_sc);
+                                } else {
+                                    ibm = std::move(raw_bm);
+                                    hbm = std::move(h_raw);
+                                    if (iw > bw || ih > bh) continue;
+                                }
+
+                                int max_py = bh - ih;
+                                int max_px = bw - iw;
+                                if (max_py < 0 || max_px < 0) continue;
+
+                                // First-fit scan for any clear position.
+                                int cstride = std::clamp(std::min(iw, ih) / 4, 4, 64);
+                                int found_px = -1, found_py = -1;
+                                for (int py = 0; py <= max_py && found_px < 0; py += cstride) {
+                                    for (int px = 0; px <= max_px; px += cstride) {
+                                        if (collides(plate_items[to_plate], wpr, bw, bh,
+                                                     ibm, iwpr_item, iw, ih, px, py)) continue;
+                                        if (collides(plate_excludes[to_plate], wpr, bw, bh,
+                                                     hbm, iwpr_item, iw, ih, px, py)) continue;
+                                        found_px = px;
+                                        found_py = py;
+                                        break;
+                                    }
+                                }
+                                if (found_px < 0) continue;
+
+                                // Commit the migration.
+                                stamp(plate_items[to_plate], wpr, bw, bh,
+                                      ibm, iwpr_item, iw, ih, found_px, found_py);
+
+                                // Update destination cluster bbox.
+                                {
+                                    ClusterBB &c = cluster_bb[to_plate];
+                                    int nminx = found_px, nminy = found_py;
+                                    int nmaxx = found_px + iw - 1;
+                                    int nmaxy = found_py + ih - 1;
+                                    if (c.empty()) {
+                                        c.minx = nminx; c.miny = nminy;
+                                        c.maxx = nmaxx; c.maxy = nmaxy;
+                                    } else {
+                                        c.minx = std::min(c.minx, nminx);
+                                        c.miny = std::min(c.miny, nminy);
+                                        c.maxx = std::max(c.maxx, nmaxx);
+                                        c.maxy = std::max(c.maxy, nmaxy);
+                                    }
+                                }
+
+                                // Update item state.
+                                double origin_x = found_px * res
+                                                  - unscaled<double>(inflated_bb.min.x())
+                                                  + unscaled<double>(ebed.min.x());
+                                double origin_y = found_py * res
+                                                  - unscaled<double>(inflated_bb.min.y())
+                                                  + unscaled<double>(ebed.min.y());
+                                it.translation = Vec2crd{scaled(origin_x), scaled(origin_y)};
+                                // Compose: base_rot is the caller's original
+                                // pre-rotation; rot is the consolidation pass's
+                                // chosen alternative orientation. Mirrors the
+                                // greedy commit at line ~638.
+                                it.rotation    = base_rot + rot;
+                                it.bed_idx     = to_plate;
+
+                                migrated = true;
+                                any_migration = true;
+                                plate_dirty = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Rebuild the source plate's bitmap by re-stamping
+                    // every surviving item. We can't selectively un-stamp
+                    // because the composite is OR'd (no per-item ownership).
+                    if (plate_dirty) {
+                        std::fill(plate_items[from_plate].begin(),
+                                  plate_items[from_plate].end(), 0);
+                        cluster_bb[from_plate] = ClusterBB{
+                            std::numeric_limits<int>::max(),
+                            std::numeric_limits<int>::max(),
+                            std::numeric_limits<int>::min(),
+                            std::numeric_limits<int>::min()};
+                        for (auto &it2 : items) {
+                            if (it2.bed_idx != from_plate) continue;
+                            ExPolygons base = !it2.concave_regions.empty()
+                                               ? it2.concave_regions
+                                               : ExPolygons{it2.poly};
+                            if (it2.rotation != 0.0)
+                                for (ExPolygon &s : base) s.rotate(it2.rotation);
+
+                            int pad2 = 0;
+                            if (it2.inflation > 0)
+                                pad2 = std::max(1, (int)std::ceil(unscaled<double>(it2.inflation) / res));
+                            else if (params.min_obj_distance > 0)
+                                pad2 = std::max(1, (int)std::ceil(unscaled<double>(params.min_obj_distance / 2) / res));
+
+                            int r_iw, r_ih, r_iwpr;
+                            auto r_bm = rasterize(base, res, bw, bh, r_iw, r_ih, r_iwpr);
+                            if (r_bm.empty()) continue;
+
+                            int s_iw = r_iw, s_ih = r_ih, s_iwpr = r_iwpr;
+                            std::vector<uint64_t> s_bm;
+                            BoundingBox sbb = get_extents(base);
+                            if (pad2 > 0) {
+                                s_iw = r_iw + 2 * pad2;
+                                s_ih = r_ih + 2 * pad2;
+                                s_iwpr = (s_iw + 63) / 64;
+                                s_bm = dilate_bitmap(r_bm, r_iwpr, r_iw, r_ih,
+                                                     pad2, s_iwpr, s_iw, s_ih);
+                                coord_t pad_sc2 = scaled(pad2 * res);
+                                sbb.min -= Vec2crd(pad_sc2, pad_sc2);
+                                sbb.max += Vec2crd(pad_sc2, pad_sc2);
+                            } else {
+                                s_bm = std::move(r_bm);
+                            }
+
+                            // Recover the pixel position from the world
+                            // translation: invert the placement commit math.
+                            double ox = unscaled<double>(it2.translation.x())
+                                        + unscaled<double>(sbb.min.x())
+                                        - unscaled<double>(ebed.min.x());
+                            double oy = unscaled<double>(it2.translation.y())
+                                        + unscaled<double>(sbb.min.y())
+                                        - unscaled<double>(ebed.min.y());
+                            int spx = (int)std::round(ox / res);
+                            int spy = (int)std::round(oy / res);
+                            if (spx < 0 || spy < 0) continue;
+                            if (spx + s_iw > bw || spy + s_ih > bh) continue;
+
+                            stamp(plate_items[from_plate], wpr, bw, bh,
+                                  s_bm, s_iwpr, s_iw, s_ih, spx, spy);
+
+                            ClusterBB &c = cluster_bb[from_plate];
+                            int nminx = spx, nminy = spy;
+                            int nmaxx = spx + s_iw - 1, nmaxy = spy + s_ih - 1;
+                            if (c.empty()) {
+                                c.minx = nminx; c.miny = nminy;
+                                c.maxx = nmaxx; c.maxy = nmaxy;
+                            } else {
+                                c.minx = std::min(c.minx, nminx);
+                                c.miny = std::min(c.miny, nminy);
+                                c.maxx = std::max(c.maxx, nmaxx);
+                                c.maxy = std::max(c.maxy, nmaxy);
+                            }
+                        }
+                    }
+
+                    // Shrink current_plate if from_plate emptied out.
+                    bool plate_empty = true;
+                    for (auto &it3 : items) {
+                        if (it3.bed_idx == from_plate) { plate_empty = false; break; }
+                    }
+                    if (plate_empty && from_plate == current_plate)
+                        current_plate--;
+                }
+            }
+        }
+
         // Post-placement centering: shift placed items so the cluster
         // center lands on align_center (default: bed center).
-        // Skip plates that have excludes — centering could shift items
-        // into forbidden zones that placement carefully avoided.
+        // Now runs on every plate including those with excludes — the
+        // safety check inside the loop validates the shift before
+        // committing it (refuses the move if any item would collide
+        // with an exclude after the shift).
         //
         // Honor stopcondition here as well: when the user cancels mid-arrange,
         // the placement loop breaks out of its own scan, but the centering
@@ -665,7 +1063,6 @@ public:
 
             for (int plate = 0; plate <= current_plate; ++plate) {
                 if (params.stopcondition && params.stopcondition()) break;
-                if (plate_has_exclude[plate]) continue;
 
                 BoundingBox cluster_bb;
                 bool has_item = false;
@@ -696,10 +1093,98 @@ public:
                 if (cluster_bb.max.y() + dy > bed.max.y())
                     dy = bed.max.y() - cluster_bb.max.y();
 
+                // Safety check on exclude-bearing plates: would the shift
+                // cause any item to collide with an exclude? If so, refuse
+                // to move (dx=dy=0). Previously this whole branch was
+                // skipped on exclude plates; now we attempt the centering
+                // and only abort if the result would actually overlap.
+                if (plate_has_exclude[plate] && (dx != 0 || dy != 0)) {
+                    bool collision_after_shift = false;
+                    for (const auto &ex : excludes) {
+                        if (ex.bed_idx != plate) continue;
+                        ExPolygon ex_poly = ex.poly;
+                        if (ex.rotation != 0.0) ex_poly.rotate(ex.rotation);
+                        ex_poly.translate(ex.translation.x(), ex.translation.y());
+                        for (const auto &item : items) {
+                            if (item.bed_idx != plate) continue;
+                            ExPolygon shifted = item.poly;
+                            if (item.rotation != 0.0) shifted.rotate(item.rotation);
+                            shifted.translate(item.translation.x() + dx,
+                                              item.translation.y() + dy);
+                            if (!intersection_ex(ExPolygons{ex_poly},
+                                                 ExPolygons{shifted}).empty()) {
+                                collision_after_shift = true;
+                                break;
+                            }
+                        }
+                        if (collision_after_shift) break;
+                    }
+                    if (collision_after_shift) { dx = 0; dy = 0; }
+                }
+
                 for (auto &item : items) {
                     if (item.bed_idx != plate) continue;
                     item.translation += Vec2crd(dx, dy);
                 }
+            }
+        }
+
+        }; // end of do_one_pass lambda
+
+        // ── Run attempts ─────────────────────────────────────────────
+        for (int attempt = 0; attempt < num_attempts; ++attempt) {
+            // Stopcondition check is gated on `attempt > 0`. Calling
+            // params.stopcondition() may have side effects (the test
+            // suite uses a counter-based predicate, and the user's
+            // GUI cancel button increments a token). The first attempt
+            // must always run untouched so its placement loop's own
+            // internal stopcondition checks have the budget the
+            // caller intended.
+            if (attempt > 0 && params.stopcondition && params.stopcondition()) break;
+
+            if (attempt > 0) {
+                reset_for_restart();
+                // Perturb: shuffle within priority buckets so the
+                // priority contract is preserved (high priority items
+                // still placed first) but the within-bucket order
+                // varies between attempts.
+                order = base_order;
+                std::mt19937 rng(0x5EED1234u + (uint32_t)attempt);
+                for (size_t i = 0; i < order.size();) {
+                    size_t j = i + 1;
+                    while (j < order.size() &&
+                           items[order[j]].priority == items[order[i]].priority)
+                        ++j;
+                    std::shuffle(order.begin() + i, order.begin() + j, rng);
+                    i = j;
+                }
+            }
+
+            do_one_pass();
+
+            AttemptScore sc = score_current();
+            // Lex order: more placed > fewer placed; then fewer plates
+            // > more plates; then smaller cluster area > larger.
+            bool is_better = !best.valid ||
+                             sc.placed > best.placed ||
+                             (sc.placed == best.placed && sc.max_bed < best.max_bed) ||
+                             (sc.placed == best.placed && sc.max_bed == best.max_bed
+                              && sc.area < best.total_area);
+            if (is_better) save_best(sc);
+
+            // Early termination: a fully-placed result on a single
+            // plate is the optimum we'd nominally try to improve.
+            // Save the rest of the budget.
+            if (best.placed == (int)items.size() && best.max_bed == 0) break;
+        }
+
+        // Restore the best result into items[].
+        if (best.valid) {
+            for (size_t i = 0; i < items.size(); ++i) {
+                items[i].translation = best.trans[i];
+                items[i].rotation    = best.rots[i];
+                items[i].bed_idx     = best.beds[i];
+                items[i].itemid      = best.iids[i];
             }
         }
     }
