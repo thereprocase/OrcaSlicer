@@ -196,3 +196,78 @@ TEST_CASE("real mix: concave OBJ fixtures fit on 256x256 plate",
     ArrangePolygons rerun = build_input();
     REQUIRE(test_utils::deterministic_rerun(rerun, run));
 }
+
+// ---------------------------------------------------------------------------
+// Pressure scenario: more parts, tighter bed. Where the first scenario is
+// the "does it work" gate, this one is the "does it pack tightly" gate.
+// 38 pieces spread across the same 5 concave fixtures on a 200x200 bed.
+// Tuned so total footprint area is well under the bed area but part count
+// is high enough that lazy placement leaves noticeable spillover. A
+// conservative floor (max_bed <= 1, overflow <= 5) lets healthy tight
+// packing pass while catching any genuine regression.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("real mix: pressure pack on 200x200 plate",
+          "[BitmapNester][real-mix][packing][BitmapRegression]")
+{
+    static constexpr int MIX_PRESSURE_MAX_OVERFLOW = 5;
+    static constexpr int MIX_PRESSURE_MAX_BED_IDX  = 1;
+
+    struct Entry { const char *name; int copies; };
+    const Entry entries[] = {
+        {"ipadstand.obj",              6},
+        {"extruder_idler.obj",         6},
+        {"frog_legs.obj",              6},
+        {"cube_with_concave_hole.obj", 10},
+        {"small_dorito.obj",           10},
+    };
+
+    std::vector<ExPolygon> shapes;
+    std::vector<int>       copies;
+    for (const auto &e : entries) {
+        ExPolygon fp = load_fixture_footprint(e.name);
+        if (fp.contour.points.empty()) {
+            WARN("real mix pressure: fixture not loadable: " << e.name);
+            return;
+        }
+        shapes.push_back(std::move(fp));
+        copies.push_back(e.copies);
+    }
+
+    auto build_input = [&]() {
+        ArrangePolygons xs;
+        for (size_t i = 0; i < shapes.size(); ++i)
+            for (int c = 0; c < copies[i]; ++c)
+                xs.push_back(make_ap(shapes[i]));
+        scatter(xs, 0x9EE52222u, 400.0);
+        return xs;
+    };
+
+    BoundingBox bed = make_bed_mm(200.0, 200.0);
+    ArrangeParams params = benchmark_params();
+    auto run = [&](ArrangePolygons &xs) {
+        BitmapNester::arrange(xs, ArrangePolygons{}, bed, params);
+    };
+
+    ArrangePolygons items = build_input();
+    run(items);
+
+    int max_bed  = test_utils::max_bed_idx(items);
+    int overflow = test_utils::overflow_piece_count(items);
+    int total    = (int)items.size();
+
+    UNSCOPED_INFO("Scenario:  real mix pressure");
+    UNSCOPED_INFO("  bed    = 200 x 200 mm");
+    UNSCOPED_INFO("  pieces = " << total);
+    UNSCOPED_INFO("  max bed  = " << max_bed);
+    UNSCOPED_INFO("  overflow = " << overflow);
+    UNSCOPED_INFO("  floor    = max_bed<=" << MIX_PRESSURE_MAX_BED_IDX
+                  << " overflow<=" << MIX_PRESSURE_MAX_OVERFLOW);
+
+    REQUIRE(max_bed  <= MIX_PRESSURE_MAX_BED_IDX);
+    REQUIRE(overflow <= MIX_PRESSURE_MAX_OVERFLOW);
+    REQUIRE(test_utils::no_overlap(items));
+
+    ArrangePolygons rerun = build_input();
+    REQUIRE(test_utils::deterministic_rerun(rerun, run));
+}
