@@ -344,9 +344,11 @@ TEST_CASE("Category 6.4: identical convex hulls produce different packings",
           "[BitmapNesterC2][c2-corpus][c2-m1][Cat6.4]")
 {
     struct Measurement {
-        double max_bed;
-        double cluster_perim;
-        double cluster_compactness;
+        int    max_bed;
+        double bbox_perim;
+        double hull_perim;
+        double bbox_compactness;
+        double hull_compactness;
     };
 
     auto pack_and_measure = [](const ExPolygon& shape) -> Measurement {
@@ -363,43 +365,65 @@ TEST_CASE("Category 6.4: identical convex hulls produce different packings",
         BitmapNesterC2::arrange(items, ArrangePolygons{}, bed, params);
 
         Measurement m;
-        m.max_bed             = test_utils::max_bed_idx(items);
-        m.cluster_perim       = test_utils::cluster_bbox_perimeter_mm(items);
-        m.cluster_compactness = test_utils::cluster_compactness(items);
+        m.max_bed          = test_utils::max_bed_idx(items);
+        m.bbox_perim       = test_utils::cluster_bbox_perimeter_mm(items);
+        m.hull_perim       = test_utils::cluster_hull_perimeter_mm(items);
+        m.bbox_compactness = test_utils::cluster_compactness(items);
+        m.hull_compactness = test_utils::cluster_hull_compactness(items);
         return m;
     };
 
     Measurement solid   = pack_and_measure(c2_solid_square_mm());
     Measurement notched = pack_and_measure(c2_notched_square_mm());
 
-    UNSCOPED_INFO("solid:   max_bed=" << solid.max_bed
-                  << " perim=" << solid.cluster_perim
-                  << " compact=" << solid.cluster_compactness);
-    UNSCOPED_INFO("notched: max_bed=" << notched.max_bed
-                  << " perim=" << notched.cluster_perim
-                  << " compact=" << notched.cluster_compactness);
+    UNSCOPED_INFO("solid:   max_bed="  << solid.max_bed
+                  << " bbox_perim="    << solid.bbox_perim
+                  << " hull_perim="    << solid.hull_perim
+                  << " bbox_compact="  << solid.bbox_compactness
+                  << " hull_compact="  << solid.hull_compactness);
+    UNSCOPED_INFO("notched: max_bed="  << notched.max_bed
+                  << " bbox_perim="    << notched.bbox_perim
+                  << " hull_perim="    << notched.hull_perim
+                  << " bbox_compact="  << notched.bbox_compactness
+                  << " hull_compact="  << notched.hull_compactness);
 
     // Both shapes should land valid single-plate packings — 6 items
     // of ≤ 1600 mm² each on a 300x300 bed is trivially loose.
     REQUIRE(solid.max_bed == 0);
     REQUIRE(notched.max_bed == 0);
 
-    // THE LITMUS: compactness (filled silhouette area / cluster bbox
-    // area) must differ between the two shapes. If C2/C1 is secretly
-    // convex-hull based, the two shapes (same hull) produce identical
-    // bbox AND identical silhouette area = identical compactness.
-    // If it's genuinely concave, the notched shape has less silhouette
-    // area filling the same cluster bbox, so compactness differs.
+    // THE LITMUS: the two shapes have the SAME convex hull (40x40
+    // square) but different silhouettes (solid=1600 mm², notched=
+    // 1200 mm² due to the 20x20 notch). A genuinely concave-aware
+    // solver produces different packings — measurable via the
+    // compactness metric which uses silhouette area.
     //
-    // NOTE on the M1 pass-through state: at this writing C2 still
-    // delegates to BitmapNester::arrange for actual packing. C1
-    // rasterizes concave silhouettes (not hulls), so the two shapes
-    // already produce different measurements. The test PASSES right
-    // now as a confirmation that C1's existing work is concave-aware.
-    // When C2's real pack_as_island lands in M2, this assertion must
-    // continue passing AND the gap should tighten — the hull metric
-    // should widen the delta further.
+    // We check BOTH bbox compactness AND hull compactness. The hull
+    // variant is strictly more honest: for two packed 3x2 grids,
+    // the bbox is 40x40 regardless of shape and may match exactly,
+    // but the hull of the union of all placed items may differ
+    // subtly between the two (solid squares tile exactly into a
+    // 120x80 rectangle; notched squares leave little gaps that
+    // the hull doesn't care about but compactness does).
     //
-    // The 0.05 absolute delta is a loose floor. Tighten after M2.
-    REQUIRE(std::abs(solid.cluster_compactness - notched.cluster_compactness) > 0.05);
+    // The expected failure mode of a bbox-hidden solver is:
+    // solid.bbox_compactness == notched.bbox_compactness AND
+    // solid.hull_compactness == notched.hull_compactness.
+    // A concave solver produces a nonzero delta in at least one.
+    //
+    // CURRENT STATE (M1 pass-through): C2 delegates to C1 which
+    // rasterizes silhouettes, so the two shapes already produce
+    // different SILHOUETTE AREAS per plate → different compactness.
+    // Test passes by virtue of C1's existing concave awareness.
+    // M2's pack_as_island will tighten this further by making the
+    // solver's INTERNAL scoring also hull-based.
+    double bbox_delta = std::abs(solid.bbox_compactness - notched.bbox_compactness);
+    double hull_delta = std::abs(solid.hull_compactness - notched.hull_compactness);
+    UNSCOPED_INFO("bbox_compactness delta = " << bbox_delta);
+    UNSCOPED_INFO("hull_compactness delta = " << hull_delta);
+
+    // At least ONE of the two metrics must detect the difference.
+    // Loose 0.05 threshold — tighten when C2 M2 lands real hull
+    // scoring.
+    REQUIRE((bbox_delta > 0.05 || hull_delta > 0.05));
 }

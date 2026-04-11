@@ -8,6 +8,7 @@
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/ClipperUtils.hpp"
+#include "libslic3r/Geometry/ConvexHull.hpp"
 
 #include <vector>
 #include <set>
@@ -129,6 +130,114 @@ inline double cluster_compactness(const ArrangePolygons &items)
         if (bbox_area <= 0.0) continue;
         double ratio = agg.area_mm2 / bbox_area;
         if (ratio > 1.0) ratio = 1.0;  // clamp rounding overcounts
+        weighted_sum += ratio * agg.count;
+        total_count  += agg.count;
+    }
+    if (total_count == 0) return 0.0;
+    return weighted_sum / (double)total_count;
+}
+
+// ─── Hull-based cluster metrics (C2 M2.1) ─────────────────────────────
+//
+// The bbox-based helpers above treat every cluster as its axis-
+// aligned bounding rectangle. That's convenient but loses information
+// whenever the actual pack is more compact than its bbox — a diagonal
+// strip, a round cluster, or any interlocked concave layout. These
+// helpers compute the convex HULL of all placed item vertices per
+// plate, then measure the hull instead of the bbox. Hull perimeter
+// is a much better proxy for print-head travel than bbox perimeter
+// because it hugs the actual cluster outline.
+//
+// Policy: hull is computed across ALL vertices of ALL placed items
+// on a given plate. Holes are ignored (the hull of a shape with a
+// hole is the hull of its outer contour). For items rotated at an
+// angle, the transformed_poly() is used so the hull reflects the
+// actual placed geometry.
+//
+// Returns 0.0 for empty arrangements.
+
+// Convex hull perimeter across all placed items, summed per-plate.
+inline double cluster_hull_perimeter_mm(const ArrangePolygons &items)
+{
+    std::map<int, Points> per_plate_pts;
+    for (const auto &it : items) {
+        if (it.bed_idx == UNARRANGED) continue;
+        ExPolygon tp = it.transformed_poly();
+        auto &bucket = per_plate_pts[it.bed_idx];
+        for (const Point &p : tp.contour.points) bucket.push_back(p);
+    }
+    double total = 0.0;
+    for (auto &kv : per_plate_pts) {
+        Points &pts = kv.second;
+        if (pts.size() < 3) continue;
+        Polygon hull = Geometry::convex_hull(pts);
+        if (hull.points.size() < 3) continue;
+        total += unscaled<double>(hull.length());
+    }
+    return total;
+}
+
+// Convex hull area across all placed items, summed per-plate. Useful
+// as a denominator in "packing efficiency vs hull" ratios — the
+// inverse of "how much air is inside the cluster's tightest
+// wrapping". Differs from cluster bbox area whenever the cluster
+// shape is not a rectangle (almost always).
+inline double cluster_hull_area_mm2(const ArrangePolygons &items)
+{
+    std::map<int, Points> per_plate_pts;
+    for (const auto &it : items) {
+        if (it.bed_idx == UNARRANGED) continue;
+        ExPolygon tp = it.transformed_poly();
+        auto &bucket = per_plate_pts[it.bed_idx];
+        for (const Point &p : tp.contour.points) bucket.push_back(p);
+    }
+    double total = 0.0;
+    for (auto &kv : per_plate_pts) {
+        Points &pts = kv.second;
+        if (pts.size() < 3) continue;
+        Polygon hull = Geometry::convex_hull(pts);
+        if (hull.points.size() < 3) continue;
+        total += unscaled<double>(unscaled<double>(std::abs(hull.area())));
+    }
+    return total;
+}
+
+// Hull-based compactness ratio: sum of placed silhouette areas
+// divided by hull area, per plate, weighted by item count.
+// Equals 1.0 when the cluster's outline IS the union of its items
+// (impossible in practice — hull always >= union area). For
+// concave shapes the hull is typically 5-20% larger than the
+// silhouette union, so this ratio lands around 0.8-0.95 for tight
+// packs. Lower = air trapped inside the hull. Higher = tight pack.
+inline double cluster_hull_compactness(const ArrangePolygons &items)
+{
+    struct PlateAgg {
+        double silhouette_area_mm2 = 0.0;
+        Points hull_pts;
+        int count = 0;
+    };
+    std::map<int, PlateAgg> per_plate;
+    for (const auto &it : items) {
+        if (it.bed_idx == UNARRANGED) continue;
+        ExPolygon tp = it.transformed_poly();
+        double a = unscaled<double>(unscaled<double>(std::abs(tp.area())));
+        auto &agg = per_plate[it.bed_idx];
+        agg.silhouette_area_mm2 += a;
+        for (const Point &p : tp.contour.points) agg.hull_pts.push_back(p);
+        agg.count++;
+    }
+    if (per_plate.empty()) return 0.0;
+    double weighted_sum = 0.0;
+    int total_count = 0;
+    for (auto &kv : per_plate) {
+        PlateAgg &agg = kv.second;
+        if (agg.hull_pts.size() < 3) continue;
+        Polygon hull = Geometry::convex_hull(agg.hull_pts);
+        if (hull.points.size() < 3) continue;
+        double hull_area = unscaled<double>(unscaled<double>(std::abs(hull.area())));
+        if (hull_area <= 0.0) continue;
+        double ratio = agg.silhouette_area_mm2 / hull_area;
+        if (ratio > 1.0) ratio = 1.0;  // clamp rounding overcount
         weighted_sum += ratio * agg.count;
         total_count  += agg.count;
     }
