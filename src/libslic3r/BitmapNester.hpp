@@ -19,6 +19,7 @@
 #include "ExPolygon.hpp"
 #include "Arrange.hpp"
 #include "BoundingBox.hpp"
+#include "Geometry/ConvexHull.hpp"
 #include <vector>
 #include <cstdint>
 #include <algorithm>
@@ -89,17 +90,33 @@ public:
 
         constexpr int MAX_PLATES = 36;
 
-        // Per-plate forbidden bitmaps
-        std::vector<std::vector<uint64_t>> plates;
+        // Per-plate forbidden bitmaps. Two parallel vectors, one plate entry per
+        // index:
+        //   plate_items[p]    — stamps of placed item footprints (CONCAVE). Items
+        //                       test their concave bitmap against this so they
+        //                       can legitimately interlock into each other's
+        //                       concave cavities (the whole point of the branch).
+        //   plate_excludes[p] — stamps of exclude regions (wipe tower, cali
+        //                       zones, fixed unselected items). Items test their
+        //                       CONVEX HULL bitmap against this so placements
+        //                       agree with PartPlate::check_outside, which uses
+        //                       instance->convex_hull_2d() for exclude
+        //                       intersection. See war-council-report.md C15.
+        std::vector<std::vector<uint64_t>> plate_items;
+        std::vector<std::vector<uint64_t>> plate_excludes;
         auto ensure_plate = [&](int idx) {
-            while ((int)plates.size() <= idx) {
-                plates.emplace_back((size_t)wpr * bh, uint64_t(0));
+            while ((int)plate_items.size() <= idx) {
+                plate_items.emplace_back((size_t)wpr * bh, uint64_t(0));
+                plate_excludes.emplace_back((size_t)wpr * bh, uint64_t(0));
             }
         };
         ensure_plate(0);
 
-        // Stamp an ExPolygon (in scaled bed-relative coords) onto a plate bitmap
-        auto stamp_poly = [&](int plate_idx, const ExPolygon &poly_bed_rel) {
+        // Stamp an ExPolygon (in scaled bed-relative coords) onto a plate's
+        // exclude bitmap. Only used during setup to register static obstacles
+        // (wipe tower, unselected items on a specific plate, etc.). Item
+        // stamps at placement time go into plate_items directly.
+        auto stamp_exclude_poly = [&](int plate_idx, const ExPolygon &poly_bed_rel) {
             ensure_plate(plate_idx);
             int iw, ih, iwpr;
             auto bm = rasterize(poly_bed_rel, res, bw, bh, iw, ih, iwpr);
@@ -107,7 +124,7 @@ public:
             BoundingBox pbb = get_extents(poly_bed_rel);
             int px = std::max(0, (int)(unscaled<double>(pbb.min.x()) / res));
             int py = std::max(0, (int)(unscaled<double>(pbb.min.y()) / res));
-            stamp(plates[plate_idx], wpr, bw, bh, bm, iwpr, iw, ih, px, py);
+            stamp(plate_excludes[plate_idx], wpr, bw, bh, bm, iwpr, iw, ih, px, py);
         };
 
         // Stamp excludes onto their respective plates (L7: skip UNARRANGED excludes)
@@ -122,7 +139,7 @@ public:
                 ExPolygons infl = offset_ex(epoly, ex.inflation);
                 if (!infl.empty()) epoly = infl.front();
             }
-            stamp_poly(plate, epoly);
+            stamp_exclude_poly(plate, epoly);
         }
 
         // Pre-rasterize bed exclusion zones (calibration areas, etc.) so they
@@ -140,17 +157,17 @@ public:
             BoundingBox zbb = get_extents(epoly);
             int zpx = std::max(0, (int)(unscaled<double>(zbb.min.x()) / res));
             int zpy = std::max(0, (int)(unscaled<double>(zbb.min.y()) / res));
-            stamp(plates[0], wpr, bw, bh, zbm, ziwpr, ziw, zih, zpx, zpy);
+            stamp(plate_excludes[0], wpr, bw, bh, zbm, ziwpr, ziw, zih, zpx, zpy);
             bed_zones.push_back({std::move(zbm), ziw, zih, ziwpr, zpx, zpy});
         }
 
         // Patch ensure_plate to stamp bed exclusion zones onto new plates
         auto ensure_plate_with_zones = [&](int idx) {
-            int old_count = (int)plates.size();
+            int old_count = (int)plate_items.size();
             ensure_plate(idx);
             for (int p = old_count; p <= idx; ++p) {
                 for (auto &z : bed_zones)
-                    stamp(plates[p], wpr, bw, bh, z.bm, z.iwpr, z.iw, z.ih, z.px, z.py);
+                    stamp(plate_excludes[p], wpr, bw, bh, z.bm, z.iwpr, z.iw, z.ih, z.px, z.py);
             }
         };
 
@@ -193,9 +210,18 @@ public:
             // L14: pre-rasterize all rotations for this item so we don't
             // re-rasterize on every plate retry. For 75 items × 4 rotations × 6
             // plates, this cuts rasterize calls from ~1000 to ~300.
+            //
+            // bm          — concave silhouette bitmap, tested against plate_items.
+            // convex_bm   — convex hull of the same silhouette, tested against
+            //               plate_excludes so that placements agree with Orca's
+            //               PartPlate::check_outside validation (which uses
+            //               instance->convex_hull_2d() for exclude intersection).
+            //               Both bitmaps share iw/ih/iwpr because the convex
+            //               hull of a polygon shares its bounding box.
             struct RotCache {
                 double rot;
                 std::vector<uint64_t> bm;
+                std::vector<uint64_t> convex_bm;
                 BoundingBox inflated_bb;
                 int iw, ih, iwpr, coarse;
             };
@@ -234,9 +260,36 @@ public:
                 auto raw_bm = rasterize(rshapes, res, bw, bh, raw_iw, raw_ih, raw_iwpr);
                 if (raw_bm.empty()) continue;
 
-                // Dilate bitmap by pad_px in all directions
+                // Build the convex hull of the same rotated silhouette and
+                // rasterize it at the same bbox so the two bitmaps share
+                // iw/ih/iwpr. Geometry::convex_hull on ExPolygons returns a
+                // Polygon; we wrap it as an ExPolygon (no holes) to feed the
+                // rasterizer. The hull's bbox is identical to rshapes' bbox
+                // (extreme points are shared), so dimensions match.
+                ExPolygon hull_expoly;
+                hull_expoly.contour = Geometry::convex_hull(rshapes);
+                if (hull_expoly.contour.empty()) continue;
+                int hull_raw_iw, hull_raw_ih, hull_raw_iwpr;
+                auto hull_raw_bm = rasterize(hull_expoly, res, bw, bh,
+                                             hull_raw_iw, hull_raw_ih, hull_raw_iwpr);
+                if (hull_raw_bm.empty()) continue;
+
+                // The hull share bbox with rshapes so raw dimensions should
+                // agree. If they don't (one-pixel rounding at the edge), take
+                // the MAX so the hull mask is guaranteed to cover the concave
+                // one — being slightly more conservative for the exclude check
+                // is safe; being slightly less conservative would be a bug.
+                if (hull_raw_iw != raw_iw || hull_raw_ih != raw_ih) {
+                    continue;  // mismatched bbox: skip this rotation rather
+                               // than feed inconsistent bitmaps to the scan.
+                }
+
+                // Dilate both bitmaps by pad_px in all directions. Same
+                // dilation geometry so the convex mask stays aligned with
+                // the concave mask at the same (px, py) placement position.
                 int iw = raw_iw, ih = raw_ih, iwpr_item = raw_iwpr;
                 std::vector<uint64_t> ibm;
+                std::vector<uint64_t> hull_ibm;
                 BoundingBox inflated_bb = get_extents(rshapes);
 
                 if (pad_px > 0) {
@@ -246,34 +299,55 @@ public:
                     iwpr_item = (iw + 63) / 64;
                     ibm = dilate_bitmap(raw_bm, raw_iwpr, raw_iw, raw_ih,
                                         pad_px, iwpr_item, iw, ih);
+                    hull_ibm = dilate_bitmap(hull_raw_bm, raw_iwpr, raw_iw, raw_ih,
+                                             pad_px, iwpr_item, iw, ih);
                     // Adjust inflated bbox to account for dilation
                     coord_t pad_sc = scaled(pad_px * res);
                     inflated_bb.min -= Vec2crd(pad_sc, pad_sc);
                     inflated_bb.max += Vec2crd(pad_sc, pad_sc);
                 } else {
                     ibm = std::move(raw_bm);
+                    hull_ibm = std::move(hull_raw_bm);
                     if (iw > bw || ih > bh) continue;
                 }
 
                 int coarse = std::clamp(std::min(iw, ih) / 8, 8, 128);
-                rot_cache.push_back({rot, std::move(ibm), inflated_bb,
-                                     iw, ih, iwpr_item, coarse});
+                rot_cache.push_back({rot, std::move(ibm), std::move(hull_ibm),
+                                     inflated_bb, iw, ih, iwpr_item, coarse});
             }
+
+            // Dual-bitmap collision check: a candidate position is valid only
+            // when BOTH the concave bitmap clears plate_items AND the convex
+            // hull bitmap clears plate_excludes at the same (px, py).
+            auto position_clear = [&](int plate_idx, const RotCache &rc,
+                                      int px, int py) -> bool {
+                if (collides(plate_items[plate_idx], wpr, bw, bh,
+                             rc.bm, rc.iwpr, rc.iw, rc.ih, px, py))
+                    return false;
+                if (collides(plate_excludes[plate_idx], wpr, bw, bh,
+                             rc.convex_bm, rc.iwpr, rc.iw, rc.ih, px, py))
+                    return false;
+                return true;
+            };
 
             bool placed = false;
             int best_px = 0, best_py = 0;
             double best_rot = 0.0;
             int best_plate = -1;
-            int best_iw = 0, best_ih = 0, best_iwpr = 0;
-            std::vector<uint64_t> best_bm;
-            BoundingBox best_inflated_bb;
+            // Index into rot_cache rather than copying the bitmap — the cache
+            // lives for the lifetime of the placement scan and this avoids a
+            // full bitmap copy on every successful placement (which becomes a
+            // hot-loop allocation once Sprint 1 Task 8 converts this to a
+            // scored scan with best-fit selection).
+            int best_rc_idx = -1;
 
             // Try each existing plate, then overflow to a new one
             int max_plate = std::min(current_plate + 1, MAX_PLATES - 1);
             for (int plate_idx = 0; plate_idx <= max_plate && !placed; ++plate_idx) {
                 ensure_plate_with_zones(plate_idx);
 
-                for (auto &rc : rot_cache) {
+                for (size_t rci = 0; rci < rot_cache.size(); ++rci) {
+                    auto &rc = rot_cache[rci];
                     int found_px = -1, found_py = -1;
 
                     // Phase 1: coarse scan (always includes boundary positions)
@@ -290,16 +364,14 @@ public:
                                     else break;
                                 }
                                 for (int px = 0; px <= max_px; px += rc.coarse) {
-                                    if (!collides(plates[plate_idx], wpr, bw, bh,
-                                                 rc.bm, rc.iwpr, rc.iw, rc.ih, px, test_py)) {
+                                    if (position_clear(plate_idx, rc, px, test_py)) {
                                         found_px = px;
                                         found_py = test_py;
                                         goto coarse_hit;
                                     }
                                     // Also test boundary column if stride skips it
                                     if (px + rc.coarse > max_px && px < max_px) {
-                                        if (!collides(plates[plate_idx], wpr, bw, bh,
-                                                     rc.bm, rc.iwpr, rc.iw, rc.ih, max_px, test_py)) {
+                                        if (position_clear(plate_idx, rc, max_px, test_py)) {
                                             found_px = max_px;
                                             found_py = test_py;
                                             goto coarse_hit;
@@ -320,17 +392,12 @@ public:
                         int rx1 = std::min(bw - rc.iw, found_px + rc.coarse);
                         for (int py = ry0; py <= ry1; ++py) {
                             for (int px = rx0; px <= rx1; ++px) {
-                                if (!collides(plates[plate_idx], wpr, bw, bh,
-                                             rc.bm, rc.iwpr, rc.iw, rc.ih, px, py)) {
+                                if (position_clear(plate_idx, rc, px, py)) {
                                     best_px = px;
                                     best_py = py;
                                     best_rot = rc.rot;
                                     best_plate = plate_idx;
-                                    best_iw = rc.iw;
-                                    best_ih = rc.ih;
-                                    best_iwpr = rc.iwpr;
-                                    best_bm = rc.bm;
-                                    best_inflated_bb = rc.inflated_bb;
+                                    best_rc_idx = (int)rci;
                                     placed = true;
                                     goto done_searching;
                                 }
@@ -346,9 +413,14 @@ public:
                 if (best_plate > current_plate)
                     current_plate = best_plate;
 
-                // Stamp the inflated shape to block future items
-                stamp(plates[best_plate], wpr, bw, bh,
-                      best_bm, best_iwpr, best_iw, best_ih,
+                const RotCache &best_rc = rot_cache[best_rc_idx];
+                const BoundingBox &best_inflated_bb = best_rc.inflated_bb;
+
+                // Stamp the concave bitmap into plate_items only. plate_excludes
+                // is immutable after setup — items contribute to the items
+                // obstacle map, not to the exclude map.
+                stamp(plate_items[best_plate], wpr, bw, bh,
+                      best_rc.bm, best_rc.iwpr, best_rc.iw, best_rc.ih,
                       best_px, best_py);
 
                 // L12: use inflated polygon's actual bbox for translation.

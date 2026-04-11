@@ -620,3 +620,91 @@ TEST_CASE("Mesh: silhouette convex hull is strictly larger than concave silhouet
         REQUIRE(hull_area > sil_area);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sprint 1 Task 7: C15 dual-bitmap regression test.
+//
+// Scenario: a concave part (crescent) is placed next to an exclude zone such
+// that its concave cavity faces the exclude. Without the dual-bitmap fix, the
+// bitmap nester would happily place the crescent so that its concave cavity
+// wraps around the exclude — the raw pixel check succeeds because the concave
+// shape doesn't touch the exclude. But Orca's downstream PartPlate::check_outside
+// uses instance->convex_hull_2d() to test against exclude regions, and the
+// crescent's convex hull DOES overlap the exclude. Result: user sees "part
+// outside build plate" even though the arrange claimed success.
+//
+// With the dual-bitmap fix, the nester rasterizes both the concave silhouette
+// AND its convex hull, tests item-to-item collisions against plate_items (with
+// the concave bitmap, preserving interlocking) and item-to-exclude collisions
+// against plate_excludes (with the convex bitmap, matching check_outside).
+// The placement must avoid any position where the convex hull overlaps the
+// exclude, even if the concave shape would not.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Mesh: crescent avoids exclude with its convex hull, not just concave shape",
+          "[BitmapMesh][C15]")
+{
+    // Build a crescent silhouette from the mesh projection pipeline.
+    auto its = its_crescent_mm(/*outer*/ 10.0, /*inner*/ 7.0, /*offset*/ 4.0, /*height*/ 2.0);
+    ExPolygons sil = project_to_silhouette(its);
+    REQUIRE(!sil.empty());
+
+    // Pick the single-region result (crescent is simply connected).
+    REQUIRE(sil.size() == 1);
+
+    // Build a bed with a small exclude placed so that a naive concave
+    // placement could nest the crescent's cavity around it.
+    BoundingBox bed;
+    bed.min = Point(scaled<coord_t>(0.0),  scaled<coord_t>(0.0));
+    bed.max = Point(scaled<coord_t>(60.0), scaled<coord_t>(60.0));
+
+    ArrangePolygon item;
+    item.poly = sil.front();
+    item.concave_regions = sil;
+    item.allowed_rotations = {0.0};  // lock rotation so the test is deterministic
+
+    // Create an exclude that sits in the path of the crescent's cavity.
+    // A 6x6 mm square near the center of the bed. The crescent's convex
+    // hull must not overlap this square in the final placement.
+    ArrangePolygon exclude;
+    exclude.poly = ExPolygon(Points{
+        Point(scaled<coord_t>(25.0), scaled<coord_t>(25.0)),
+        Point(scaled<coord_t>(31.0), scaled<coord_t>(25.0)),
+        Point(scaled<coord_t>(31.0), scaled<coord_t>(31.0)),
+        Point(scaled<coord_t>(25.0), scaled<coord_t>(31.0)),
+    });
+    exclude.bed_idx = 0;
+    exclude.is_virt_object = true;
+
+    ArrangePolygons items{item};
+    ArrangePolygons excludes{exclude};
+
+    ArrangeParams params;
+    params.min_obj_distance = 0;
+    params.do_final_align = false;
+
+    REQUIRE_NOTHROW(BitmapNester::arrange(items, excludes, bed, params));
+    REQUIRE(items[0].bed_idx == 0);
+
+    // Verify the placement's CONVEX HULL does not intersect the exclude.
+    // This is the exact check PartPlate::check_outside performs, so if this
+    // passes the user will not see a phantom "part outside build plate" warning.
+    ExPolygon placed = items[0].poly;
+    if (items[0].rotation != 0.0) placed.rotate(items[0].rotation);
+    placed.translate(items[0].translation.x(), items[0].translation.y());
+    Polygon placed_hull = Geometry::convex_hull(placed.contour.points);
+
+    ExPolygons hull_expolys{ExPolygon(placed_hull)};
+    ExPolygons exclude_expolys{exclude.poly};
+    ExPolygons overlap = intersection_ex(hull_expolys, exclude_expolys);
+
+    // Allow 0.5 mm^2 of sliver from rasterization quantization at 0.5mm/px.
+    double overlap_area = 0.0;
+    for (const auto &seg : overlap)
+        overlap_area += std::abs(unscaled<double>(unscaled<double>(seg.area())));
+
+    INFO("placed bbox min=(" << unscaled<double>(placed.contour.bounding_box().min.x())
+         << "," << unscaled<double>(placed.contour.bounding_box().min.y()) << ")");
+    INFO("overlap area = " << overlap_area << " mm^2");
+    REQUIRE(overlap_area < 0.5);
+}
