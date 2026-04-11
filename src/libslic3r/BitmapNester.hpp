@@ -23,9 +23,11 @@
 #include <vector>
 #include <cstdint>
 #include <algorithm>
+#include <limits>
 #include <numeric>
 #include <cmath>
 #include <cassert>
+#include <utility>
 
 namespace Slic3r { namespace arrangement {
 
@@ -341,73 +343,153 @@ public:
             // scored scan with best-fit selection).
             int best_rc_idx = -1;
 
-            // Try each existing plate, then overflow to a new one
+            // Anchor resolution per plate. Default arranger clusters items
+            // around the wipe tower (libnest2d::on_preload shifts the starting
+            // point to itm.boundingBox().center()). We reproduce that effect
+            // by anchoring the scoring function on the wipe tower center when
+            // one exists on the plate — items score best when their bbox
+            // center is near the anchor, and collisions keep them from
+            // actually overlapping the tower.
+            //
+            // When no wipe tower is present AND align_center is the default
+            // (0.5, 0.5), the anchor falls back to (0, 0) in pixel space.
+            // A squared-distance score against a (0, 0) anchor is minimized
+            // by the smallest-px+py placement, which is the classical
+            // first-fit top-left scan. Post-placement centering (still run
+            // unchanged) shifts the packed cluster to the bed center when
+            // permitted. This preserves the old first-fit pack density for
+            // the common case while giving wipe-tower-bearing plates the
+            // clustering behavior the War Council audit identified as
+            // defining parity failure #1 (C1).
+            //
+            // When the user has explicitly set align_center != (0.5, 0.5)
+            // the anchor goes straight to their requested target — post-
+            // centering cannot accurately re-target off-center alignment
+            // because it moves the whole cluster as a rigid block and is
+            // disabled on exclude-bearing plates; the scored scan is the
+            // only code path that actually honors off-center alignment in
+            // that case.
+            auto resolve_anchor_px = [&](int plate_idx) -> std::pair<double, double> {
+                for (const auto &ex : excludes) {
+                    if (!ex.is_wipe_tower || ex.bed_idx != plate_idx) continue;
+                    ExPolygon wt = ex.poly;
+                    if (ex.rotation != 0.0) wt.rotate(ex.rotation);
+                    wt.translate(ex.translation.x() - ebed.min.x(),
+                                 ex.translation.y() - ebed.min.y());
+                    BoundingBox wbb = get_extents(wt);
+                    double cx_mm = (unscaled<double>(wbb.min.x())
+                                    + unscaled<double>(wbb.max.x())) / 2.0;
+                    double cy_mm = (unscaled<double>(wbb.min.y())
+                                    + unscaled<double>(wbb.max.y())) / 2.0;
+                    return {cx_mm / res, cy_mm / res};
+                }
+                constexpr double ALIGN_DEFAULT_EPS = 1e-9;
+                bool center_default =
+                    std::abs(params.align_center.x() - 0.5) < ALIGN_DEFAULT_EPS &&
+                    std::abs(params.align_center.y() - 0.5) < ALIGN_DEFAULT_EPS;
+                if (center_default) {
+                    // First-fit equivalent: smallest-px/py score wins.
+                    return {0.0, 0.0};
+                }
+                double bw_mm = unscaled<double>(ebed.max.x() - ebed.min.x());
+                double bh_mm = unscaled<double>(ebed.max.y() - ebed.min.y());
+                return {bw_mm * params.align_center.x() / res,
+                        bh_mm * params.align_center.y() / res};
+            };
+
+            // Try each existing plate, then overflow to a new one. For each
+            // plate we run a SCORED scan: enumerate every coarse-stride
+            // position across every rotation that passes position_clear,
+            // score each by squared distance from the item bbox center to the
+            // resolved anchor, keep the winner. Then refine within ±coarse of
+            // the winner (also scored) to pick the pixel-precise position.
+            // Items naturally cluster around the anchor, giving the default
+            // arranger's wipe-tower-centric behavior (Sprint 1 Task 8 / the
+            // defining wipe-tower-invisibility fix from the War Council).
             int max_plate = std::min(current_plate + 1, MAX_PLATES - 1);
             for (int plate_idx = 0; plate_idx <= max_plate && !placed; ++plate_idx) {
                 ensure_plate_with_zones(plate_idx);
 
+                auto anchor = resolve_anchor_px(plate_idx);
+                const double ax = anchor.first;
+                const double ay = anchor.second;
+
+                auto score_at = [&](const RotCache &rc, int px, int py) -> double {
+                    double cx = (double)px + rc.iw * 0.5 - ax;
+                    double cy = (double)py + rc.ih * 0.5 - ay;
+                    return cx * cx + cy * cy;
+                };
+
+                double best_coarse_score = std::numeric_limits<double>::infinity();
+                int coarse_px = -1, coarse_py = -1;
+                int coarse_rc_idx = -1;
+
+                // Coarse scan: every rotation, every coarse-stride position
+                // plus the max-row/max-col boundary positions when the stride
+                // skips them. Score every clear position, keep the best.
                 for (size_t rci = 0; rci < rot_cache.size(); ++rci) {
-                    auto &rc = rot_cache[rci];
-                    int found_px = -1, found_py = -1;
+                    const auto &rc = rot_cache[rci];
+                    int max_py = bh - rc.ih;
+                    int max_px = bw - rc.iw;
+                    if (max_py < 0 || max_px < 0) continue;
 
-                    // Phase 1: coarse scan (always includes boundary positions)
-                    {
-                        int max_py = bh - rc.ih;
-                        int max_px = bw - rc.iw;
-                        for (int py = 0; py <= max_py; py += rc.coarse) {
-                            int test_py = py;
-                            for (int pass_y = 0; pass_y < 2; ++pass_y) {
-                                if (pass_y == 1) {
-                                    // On second pass, test the boundary row if stride skipped it
-                                    if (py + rc.coarse > max_py && py < max_py)
-                                        test_py = max_py;
-                                    else break;
-                                }
-                                for (int px = 0; px <= max_px; px += rc.coarse) {
-                                    if (position_clear(plate_idx, rc, px, test_py)) {
-                                        found_px = px;
-                                        found_py = test_py;
-                                        goto coarse_hit;
-                                    }
-                                    // Also test boundary column if stride skips it
-                                    if (px + rc.coarse > max_px && px < max_px) {
-                                        if (position_clear(plate_idx, rc, max_px, test_py)) {
-                                            found_px = max_px;
-                                            found_py = test_py;
-                                            goto coarse_hit;
-                                        }
-                                    }
-                                }
+                    // Build the set of unique py/px candidates once (includes
+                    // boundary row/col without the nested pass-counter).
+                    std::vector<int> pys;
+                    for (int py = 0; py <= max_py; py += rc.coarse) pys.push_back(py);
+                    if (pys.empty() || pys.back() != max_py) pys.push_back(max_py);
+
+                    std::vector<int> pxs;
+                    for (int px = 0; px <= max_px; px += rc.coarse) pxs.push_back(px);
+                    if (pxs.empty() || pxs.back() != max_px) pxs.push_back(max_px);
+
+                    for (int py : pys) {
+                        for (int px : pxs) {
+                            if (!position_clear(plate_idx, rc, px, py)) continue;
+                            double s = score_at(rc, px, py);
+                            if (s < best_coarse_score) {
+                                best_coarse_score = s;
+                                coarse_px = px;
+                                coarse_py = py;
+                                coarse_rc_idx = (int)rci;
                             }
                         }
                     }
-                    goto no_fit_this_rotation;
-                    coarse_hit:
-
-                    // Phase 2: refine within ±coarse of the coarse hit
-                    {
-                        int ry0 = std::max(0, found_py - rc.coarse);
-                        int ry1 = std::min(bh - rc.ih, found_py + rc.coarse);
-                        int rx0 = std::max(0, found_px - rc.coarse);
-                        int rx1 = std::min(bw - rc.iw, found_px + rc.coarse);
-                        for (int py = ry0; py <= ry1; ++py) {
-                            for (int px = rx0; px <= rx1; ++px) {
-                                if (position_clear(plate_idx, rc, px, py)) {
-                                    best_px = px;
-                                    best_py = py;
-                                    best_rot = rc.rot;
-                                    best_plate = plate_idx;
-                                    best_rc_idx = (int)rci;
-                                    placed = true;
-                                    goto done_searching;
-                                }
-                            }
-                        }
-                    }
-                    no_fit_this_rotation:;
                 }
+
+                if (coarse_rc_idx < 0) continue;  // no valid position on this plate
+
+                // Refine: scored fine scan within ±coarse of the coarse winner.
+                // Score-monotonic in the neighborhood so the pixel-precise
+                // answer lives near the coarse winner; we still score every
+                // clear position in the window to get the exact minimum.
+                const auto &rc = rot_cache[coarse_rc_idx];
+                int ry0 = std::max(0, coarse_py - rc.coarse);
+                int ry1 = std::min(bh - rc.ih, coarse_py + rc.coarse);
+                int rx0 = std::max(0, coarse_px - rc.coarse);
+                int rx1 = std::min(bw - rc.iw, coarse_px + rc.coarse);
+
+                double refine_score = best_coarse_score;
+                int refine_px = coarse_px, refine_py = coarse_py;
+                for (int py = ry0; py <= ry1; ++py) {
+                    for (int px = rx0; px <= rx1; ++px) {
+                        if (!position_clear(plate_idx, rc, px, py)) continue;
+                        double s = score_at(rc, px, py);
+                        if (s < refine_score) {
+                            refine_score = s;
+                            refine_px = px;
+                            refine_py = py;
+                        }
+                    }
+                }
+
+                best_px = refine_px;
+                best_py = refine_py;
+                best_rot = rc.rot;
+                best_plate = plate_idx;
+                best_rc_idx = coarse_rc_idx;
+                placed = true;
             }
-            done_searching:
 
             if (placed) {
                 if (best_plate > current_plate)

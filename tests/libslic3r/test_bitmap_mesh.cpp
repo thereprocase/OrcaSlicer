@@ -708,3 +708,137 @@ TEST_CASE("Mesh: crescent avoids exclude with its convex hull, not just concave 
     INFO("overlap area = " << overlap_area << " mm^2");
     REQUIRE(overlap_area < 0.5);
 }
+
+// ---------------------------------------------------------------------------
+// Sprint 1 Task 8: anchor-biased placement regression tests.
+//
+// The defining parity win of the War Council audit: the bitmap nester used
+// to pack items with a first-fit top-left raster scan and then post-center
+// the cluster. Post-centering was disabled on any plate with an exclude,
+// which meant the common multi-material case (plate with a wipe tower) saw
+// items pile up in the top-left corner while the wipe tower sat alone in
+// the middle. These tests assert the new scored scan clusters items around
+// the wipe tower anchor instead.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Helper: build a small square ExPolygon centered at origin with given width.
+ExPolygon square_mm(double width_mm)
+{
+    double h = width_mm / 2.0;
+    return ExPolygon(Points{
+        Point(scaled<coord_t>(-h), scaled<coord_t>(-h)),
+        Point(scaled<coord_t>( h), scaled<coord_t>(-h)),
+        Point(scaled<coord_t>( h), scaled<coord_t>( h)),
+        Point(scaled<coord_t>(-h), scaled<coord_t>( h)),
+    });
+}
+
+ArrangePolygon ap_square(double width_mm)
+{
+    ArrangePolygon ap;
+    ap.poly = square_mm(width_mm);
+    ap.allowed_rotations = {0.0};
+    return ap;
+}
+
+} // namespace
+
+TEST_CASE("Arrange: items cluster around wipe tower anchor in concave mode",
+          "[BitmapMesh][AnchorBias][Sprint1T8]")
+{
+    // 200x200 bed with a wipe tower near the center.
+    BoundingBox bed;
+    bed.min = Point(scaled<coord_t>(0.0),   scaled<coord_t>(0.0));
+    bed.max = Point(scaled<coord_t>(200.0), scaled<coord_t>(200.0));
+
+    // Wipe tower is a 20x20 mm virt object sitting at the bed center.
+    ArrangePolygon wt;
+    wt.poly = square_mm(20.0);
+    wt.translation = Vec2crd{scaled<coord_t>(100.0), scaled<coord_t>(100.0)};
+    wt.bed_idx = 0;
+    wt.is_wipe_tower = true;
+    wt.is_virt_object = true;
+
+    ArrangePolygons excludes{wt};
+
+    // 8 identical small squares to place.
+    ArrangePolygons items;
+    for (int i = 0; i < 8; ++i) items.push_back(ap_square(15.0));
+
+    ArrangeParams params;
+    params.min_obj_distance = scaled<coord_t>(1.0);
+
+    REQUIRE_NOTHROW(BitmapNester::arrange(items, excludes, bed, params));
+
+    // Every item must be placed on plate 0 (fits comfortably).
+    for (const auto &it : items) {
+        REQUIRE(it.bed_idx == 0);
+    }
+
+    // Compute the average bbox center of placed items and assert it is near
+    // the wipe tower center (100, 100). Under the old first-fit top-left
+    // scan, the average would be near the top-left quadrant of the bed; with
+    // anchor bias active it should cluster around the tower.
+    double sum_cx = 0.0, sum_cy = 0.0;
+    int    count  = 0;
+    for (const auto &it : items) {
+        ExPolygon placed = it.poly;
+        if (it.rotation != 0.0) placed.rotate(it.rotation);
+        placed.translate(it.translation.x(), it.translation.y());
+        BoundingBox bb = get_extents(placed);
+        sum_cx += (unscaled<double>(bb.min.x()) + unscaled<double>(bb.max.x())) / 2.0;
+        sum_cy += (unscaled<double>(bb.min.y()) + unscaled<double>(bb.max.y())) / 2.0;
+        ++count;
+    }
+    double avg_cx = sum_cx / count;
+    double avg_cy = sum_cy / count;
+
+    INFO("avg cluster center = (" << avg_cx << ", " << avg_cy << ")");
+    // Wipe tower is centered at (100, 100). Items cluster AROUND it, not on
+    // it, so the average center should land within ~40mm of the tower center
+    // on both axes. A first-fit top-left scan would land near (15, 15) — way
+    // outside this tolerance — so the bound is load-bearing for the T8 fix.
+    REQUIRE(std::abs(avg_cx - 100.0) < 40.0);
+    REQUIRE(std::abs(avg_cy - 100.0) < 40.0);
+}
+
+TEST_CASE("Arrange: align_center = (0.2, 0.8) clusters items in lower-left quadrant",
+          "[BitmapMesh][AnchorBias][Sprint1T8]")
+{
+    // No wipe tower — anchor falls back to params.align_center.
+    BoundingBox bed;
+    bed.min = Point(scaled<coord_t>(0.0),   scaled<coord_t>(0.0));
+    bed.max = Point(scaled<coord_t>(200.0), scaled<coord_t>(200.0));
+
+    ArrangePolygons items;
+    for (int i = 0; i < 5; ++i) items.push_back(ap_square(15.0));
+
+    ArrangeParams params;
+    params.min_obj_distance = scaled<coord_t>(1.0);
+    params.align_center = Vec2d(0.2, 0.8);  // target = (40, 160)
+    params.do_final_align = false;           // prove it's the SCAN that biases, not the post-center
+
+    REQUIRE_NOTHROW(BitmapNester::arrange(items, {}, bed, params));
+
+    double sum_cx = 0.0, sum_cy = 0.0;
+    int    count  = 0;
+    for (const auto &it : items) {
+        REQUIRE(it.bed_idx == 0);
+        ExPolygon placed = it.poly;
+        if (it.rotation != 0.0) placed.rotate(it.rotation);
+        placed.translate(it.translation.x(), it.translation.y());
+        BoundingBox bb = get_extents(placed);
+        sum_cx += (unscaled<double>(bb.min.x()) + unscaled<double>(bb.max.x())) / 2.0;
+        sum_cy += (unscaled<double>(bb.min.y()) + unscaled<double>(bb.max.y())) / 2.0;
+        ++count;
+    }
+    double avg_cx = sum_cx / count;
+    double avg_cy = sum_cy / count;
+
+    INFO("avg cluster center = (" << avg_cx << ", " << avg_cy << ")");
+    // Target is (40, 160). Cluster should be within ~30mm of the target.
+    REQUIRE(std::abs(avg_cx - 40.0)  < 30.0);
+    REQUIRE(std::abs(avg_cy - 160.0) < 30.0);
+}
