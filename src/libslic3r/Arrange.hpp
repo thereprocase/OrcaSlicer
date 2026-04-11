@@ -47,7 +47,8 @@ static const constexpr int UNARRANGED = -1;
 /// (also the initial state before arrange), 0..N means the index of the bed.
 /// Zero is the physical bed, larger than zero means a virtual bed.
 struct ArrangePolygon {
-    ExPolygon poly;                 /// The 2D silhouette to be arranged
+    ExPolygon poly;                 /// The 2D silhouette to be arranged (legacy single-region view — set to the largest connected region when concave_regions is populated)
+    ExPolygons concave_regions;     /// All disconnected silhouette islands when concave mode is active. Empty for the libnest2d convex-hull path; populated by ArrangeJob when use_concave_shapes is on. When non-empty, the bitmap nester rasterizes every region so multi-volume / disconnected parts are correctly collision-checked.
     Vec2crd   translation{0, 0};    /// The translation of the poly
     double    rotation{0.0};        /// The rotation of the poly in radians
     coord_t   inflation = 0;        /// Arrange with inflated polygon

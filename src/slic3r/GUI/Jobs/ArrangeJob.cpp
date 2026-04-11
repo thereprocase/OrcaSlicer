@@ -569,24 +569,41 @@ void ArrangeJob::process(Ctl &ctl)
     // When concave shapes are enabled, replace convex hull silhouettes with
     // actual 2D outlines projected from the mesh. This allows the bitmap nester
     // to interlock concave parts (crescents, L-brackets, etc.) instead of treating
-    // them as convex blobs.
+    // them as convex blobs. Multi-volume parts and shapes whose top/bottom
+    // projections diverge correctly keep ALL disconnected islands — see
+    // ArrangePolygon::concave_regions in Arrange.hpp.
     if (params.use_concave_shapes) {
         auto &model = m_plater->model();
 
-        // Cache silhouettes per instance. Instances with matching X/Y rotation
-        // share a projection (the expensive part); others get their own.
-        // Z rotation is zeroed — the bitmap nester handles it during placement.
-        std::map<std::pair<ModelObject*, int>, ExPolygon> silhouette_cache;
+        // Cache silhouettes per instance. Two instances share a projection only
+        // when their full transform (X/Y rotation + scale + mirror) matches —
+        // matching rotation alone misses 2x scale and mirror reflections that
+        // would otherwise reuse a wrong silhouette.
+        std::map<std::pair<ModelObject*, int>, ExPolygons> silhouette_cache;
 
         for (auto *obj : model.objects) {
             for (int inst_idx = 0; inst_idx < (int)obj->instances.size(); ++inst_idx) {
-                // Check if this instance shares X/Y rotation with a prior one
                 auto *inst = obj->instances[inst_idx];
+                // Reuse check: match X/Y rotation, scale, and mirror. Z rotation
+                // is zeroed before projection (bitmap nester applies Z itself).
                 bool reuse_prior = false;
                 for (int prev = 0; prev < inst_idx; ++prev) {
-                    Vec3d r0 = obj->instances[prev]->get_rotation();
+                    auto *prev_inst = obj->instances[prev];
+                    Vec3d r0 = prev_inst->get_rotation();
                     Vec3d r1 = inst->get_rotation();
-                    if (std::abs(r0.x() - r1.x()) < 1e-6 && std::abs(r0.y() - r1.y()) < 1e-6) {
+                    Vec3d s0 = prev_inst->get_scaling_factor();
+                    Vec3d s1 = inst->get_scaling_factor();
+                    Vec3d m0 = prev_inst->get_mirror();
+                    Vec3d m1 = inst->get_mirror();
+                    constexpr double REUSE_EPS = 1e-6;
+                    if (std::abs(r0.x() - r1.x()) < REUSE_EPS &&
+                        std::abs(r0.y() - r1.y()) < REUSE_EPS &&
+                        std::abs(s0.x() - s1.x()) < REUSE_EPS &&
+                        std::abs(s0.y() - s1.y()) < REUSE_EPS &&
+                        std::abs(s0.z() - s1.z()) < REUSE_EPS &&
+                        std::abs(m0.x() - m1.x()) < REUSE_EPS &&
+                        std::abs(m0.y() - m1.y()) < REUSE_EPS &&
+                        std::abs(m0.z() - m1.z()) < REUSE_EPS) {
                         auto it = silhouette_cache.find({obj, prev});
                         if (it != silhouette_cache.end()) {
                             silhouette_cache[{obj, inst_idx}] = it->second;
@@ -622,21 +639,43 @@ void ArrangeJob::process(Ctl &ctl)
             ExPolygons silhouette = union_ex(all_polys);
 
             if (!silhouette.empty()) {
-                auto largest = std::max_element(silhouette.begin(), silhouette.end(),
-                    [](const ExPolygon &a, const ExPolygon &b) {
-                        return std::abs(a.area()) < std::abs(b.area());
-                    });
-                ExPolygons simplified = offset_ex(
-                    offset_ex(*largest, scaled(-0.05)),
-                    scaled(0.05));
-                silhouette_cache[{obj, inst_idx}] = !simplified.empty() ? simplified.front() : *largest;
+                // Morphological smoothing — removes self-touching and tiny
+                // artifacts from the raw projection. Apply per-region so
+                // disconnected islands are preserved (the pre-smoothing path
+                // was an open-close on the whole set which could erase thin
+                // bridges between close-but-distinct regions).
+                ExPolygons smoothed;
+                smoothed.reserve(silhouette.size());
+                for (const ExPolygon &region : silhouette) {
+                    ExPolygons shrunk = offset_ex(region, scaled(-0.05));
+                    if (shrunk.empty()) {
+                        // The region is thinner than 0.1mm — keep it
+                        // as-is rather than dropping it entirely.
+                        smoothed.push_back(region);
+                        continue;
+                    }
+                    ExPolygons expanded = offset_ex(shrunk, scaled(0.05));
+                    if (expanded.empty()) {
+                        smoothed.push_back(region);
+                    } else {
+                        for (ExPolygon &r : expanded)
+                            smoothed.push_back(std::move(r));
+                    }
+                }
+                silhouette_cache[{obj, inst_idx}] = std::move(smoothed);
             }
             } // end inst_idx loop
         }
 
-        // Now assign cached silhouettes to ArrangePolygons by matching instances
+        // Now assign cached silhouettes to ArrangePolygons by matching instances.
+        // `found` is set only on a REAL cache hit — earlier revisions set it
+        // unconditionally when the instance position matched, hiding empty
+        // extractions behind a silent fallthrough to the convex hull. If the
+        // instance matches but the silhouette was empty, emit a distinct log
+        // so operators can tell "concave mode failed" from "instance not found".
         for (auto &ap : m_selected) {
             bool found = false;
+            bool instance_matched = false;
             for (auto *obj : model.objects) {
                 if (found) break;
 
@@ -650,16 +689,32 @@ void ArrangeJob::process(Ctl &ctl)
                     if (std::abs(inst_pos.x() - ap.translation.x()) > POS_EPS ||
                         std::abs(inst_pos.y() - ap.translation.y()) > POS_EPS)
                         continue;
+                    instance_matched = true;
                     auto cache_it = silhouette_cache.find({obj, inst_idx});
-                    if (cache_it != silhouette_cache.end())
-                        ap.poly = cache_it->second;
-                    found = true;
+                    if (cache_it != silhouette_cache.end() && !cache_it->second.empty()) {
+                        const ExPolygons &regions = cache_it->second;
+                        ap.concave_regions = regions;
+                        // Populate ap.poly with the largest region so legacy
+                        // consumers (libnest2d fallback, bbox helpers, etc.)
+                        // see a backward-compatible single-polygon silhouette.
+                        auto largest = std::max_element(regions.begin(), regions.end(),
+                            [](const ExPolygon &a, const ExPolygon &b) {
+                                return std::abs(a.area()) < std::abs(b.area());
+                            });
+                        ap.poly = *largest;
+                        found = true;
+                    }
                     break;
                 }
             }
-            if (!found)
-                BOOST_LOG_TRIVIAL(warning) << "concave silhouette: no matching ModelInstance for "
-                                           << ap.name << ", using convex hull";
+            if (!found) {
+                if (instance_matched)
+                    BOOST_LOG_TRIVIAL(warning) << "concave silhouette: extraction produced no regions for "
+                                               << ap.name << " (degenerate mesh?), using convex hull";
+                else
+                    BOOST_LOG_TRIVIAL(warning) << "concave silhouette: no matching ModelInstance for "
+                                               << ap.name << ", using convex hull";
+            }
         }
     }
 
