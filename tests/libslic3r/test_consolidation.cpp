@@ -154,8 +154,24 @@ TEST_CASE("consolidation: four equal squares (current floor = 2 plates)",
 
     BitmapNester::arrange(items, ArrangePolygons{}, bed, params);
 
-    // Current floor. Ideal would be max_bed == 0 (all on plate 0 as a
-    // 2x2 grid). Tighten when the equal-squares gap is investigated.
+    // ROOT CAUSE (diagnosed 2026-04-11 via instrumented run):
+    //   item 0 → (0, 0)   grid-aligned
+    //   item 1 → (80, 0)  grid-aligned against item 0's right edge
+    //   item 2 → (60, 80) OFF-GRID — anchor tiebreaker pulled toward
+    //                     bed center, breaking grid alignment
+    //   item 3 → no 80x80 slot left on plate 0, falls to plate 1
+    //
+    // The delta_area for candidates (0,80), (60,80), (80,80) is
+    // IDENTICAL — all produce a 160x160 cluster bbox. The scoring
+    // secondary (dist to anchor = bed center) picks (60,80) because
+    // its candidate center is closest to (100,100) mm. That's a
+    // correct implementation of the stated tiebreaker but the wrong
+    // heuristic: grid alignment would leave room for item 3.
+    //
+    // Fix direction: tiebreaker should prefer grid-aligned positions
+    // (candidate corner abuts cluster corner) over anchor-distance.
+    // Not a one-liner — filed to task #56. Until then this test gates
+    // against regression below the current floor.
     REQUIRE(test_utils::max_bed_idx(items) <= 1);
     REQUIRE(test_utils::no_overlap(items));
 }
