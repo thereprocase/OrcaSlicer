@@ -942,3 +942,55 @@ TEST_CASE("arrange: concave item (L-shape) placed without overlap", "[BitmapNest
     REQUIRE(items[1].bed_idx == 0);
     REQUIRE(no_overlap(items));
 }
+
+TEST_CASE("Arrange: align_to_y_axis pre-rotation preserved in concave mode", "[BitmapNester]")
+{
+    // Simulates update_selected_items_axis_align writing ap.rotation before the
+    // nester runs. The nester must compose its own rotation on top rather than
+    // overwriting it with just best_rot.
+    //
+    // Setup: 30×10 mm rectangle, pre-rotated PI/2 by the caller (align_to_y_axis
+    // equivalent). allow_rotations=false so the nester's own best_rot is always 0.
+    // Expected post-arrange rotation: PI/2 + 0 = PI/2.
+    // Expected placed bbox: ~10 mm wide × ~30 mm tall (rotated shape).
+
+    const double initial_rotation = M_PI / 2.0;
+
+    ArrangePolygon ap = make_ap(make_rect_mm(0.0, 0.0, 30.0, 10.0));
+    ap.rotation = initial_rotation;   // caller pre-sets this (axis-align angle)
+
+    ArrangePolygons items{ap};
+    ArrangePolygons excludes;
+    BoundingBox bed = make_bed_mm(250.0, 210.0);
+    ArrangeParams p = no_shrink_params();
+    // allow_rotations=false means allowed_rotations stays {0.0} — the nester
+    // tries only rot=0, making best_rot=0 and the final rotation = base_rot + 0.
+    p.allow_rotations = false;
+
+    BitmapNester::arrange(items, excludes, bed, p);
+
+    // Item must be placed.
+    REQUIRE(items[0].bed_idx != UNARRANGED);
+
+    // Pre-rotation must be preserved: base_rot + best_rot = PI/2 + 0 = PI/2.
+    REQUIRE_THAT(items[0].rotation, Catch::Matchers::WithinAbs(initial_rotation, 1e-6));
+
+    // Reconstruct the placed shape using the standard transform (rotate then
+    // translate), matching what the renderer and post-centering loop do.
+    ExPolygon placed = items[0].transformed_poly();
+    BoundingBox bb = get_extents(placed);
+
+    double w_mm = unscaled<double>(bb.max.x() - bb.min.x());
+    double h_mm = unscaled<double>(bb.max.y() - bb.min.y());
+
+    // A 30×10 rect rotated PI/2 becomes ~10 wide × ~30 tall.
+    // Allow 1 mm raster tolerance in each dimension.
+    REQUIRE_THAT(w_mm, Catch::Matchers::WithinAbs(10.0, 1.0));
+    REQUIRE_THAT(h_mm, Catch::Matchers::WithinAbs(30.0, 1.0));
+
+    // Placed bbox must be within the bed boundaries.
+    REQUIRE(unscaled<double>(bb.min.x()) >= -0.5);
+    REQUIRE(unscaled<double>(bb.min.y()) >= -0.5);
+    REQUIRE(unscaled<double>(bb.max.x()) <= 250.5);
+    REQUIRE(unscaled<double>(bb.max.y()) <= 210.5);
+}
