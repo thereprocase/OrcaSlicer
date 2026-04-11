@@ -870,87 +870,112 @@ public:
                         else if (params.min_obj_distance > 0)
                             pad_px = std::max(1, (int)std::ceil(unscaled<double>(params.min_obj_distance / 2) / res));
 
+                        // Build rot_cache once per item (not per plate × rot
+                        // as the previous code did). Each entry has the
+                        // rasterized + optionally dilated bitmap pair, the
+                        // dimensions, and the inflated bbox. The per-to_plate
+                        // loop below scores all rotations against that plate
+                        // and picks the best — mirroring the per-rotation
+                        // refine pass in the main placement loop. The old
+                        // code picked the first rotation that found any valid
+                        // position, which is the same asymmetry BUG3 fixed in
+                        // the placement loop earlier this session.
+                        struct MigRot {
+                            double rot;
+                            int iw, ih, iwpr_item;
+                            std::vector<uint64_t> ibm, hbm;
+                            BoundingBox inflated_bb;
+                        };
+                        std::vector<MigRot> mig_cache;
+                        mig_cache.reserve(rots.size());
+                        for (double rot : rots) {
+                            ExPolygons rshapes = base_shapes;
+                            if (rot != 0.0)
+                                for (ExPolygon &s : rshapes) s.rotate(rot);
+
+                            int raw_iw, raw_ih, raw_iwpr;
+                            auto raw_bm = rasterize(rshapes, res, bw, bh, raw_iw, raw_ih, raw_iwpr);
+                            if (raw_bm.empty()) continue;
+
+                            ExPolygon hull_expoly;
+                            hull_expoly.contour = Geometry::convex_hull(rshapes);
+                            if (hull_expoly.contour.empty()) continue;
+                            int h_iw, h_ih, h_iwpr;
+                            auto h_raw = rasterize(hull_expoly, res, bw, bh, h_iw, h_ih, h_iwpr);
+                            if (h_raw.empty() || h_iw != raw_iw || h_ih != raw_ih) continue;
+
+                            MigRot mr;
+                            mr.rot = rot;
+                            mr.iw = raw_iw;
+                            mr.ih = raw_ih;
+                            mr.iwpr_item = raw_iwpr;
+                            mr.inflated_bb = get_extents(rshapes);
+                            if (pad_px > 0) {
+                                mr.iw = raw_iw + 2 * pad_px;
+                                mr.ih = raw_ih + 2 * pad_px;
+                                if (mr.iw > bw || mr.ih > bh) continue;
+                                mr.iwpr_item = (mr.iw + 63) / 64;
+                                mr.ibm = dilate_bitmap(raw_bm, raw_iwpr, raw_iw, raw_ih,
+                                                       pad_px, mr.iwpr_item, mr.iw, mr.ih);
+                                mr.hbm = dilate_bitmap(h_raw, raw_iwpr, raw_iw, raw_ih,
+                                                       pad_px, mr.iwpr_item, mr.iw, mr.ih);
+                                coord_t pad_sc = scaled(pad_px * res);
+                                mr.inflated_bb.min -= Vec2crd(pad_sc, pad_sc);
+                                mr.inflated_bb.max += Vec2crd(pad_sc, pad_sc);
+                            } else {
+                                if (mr.iw > bw || mr.ih > bh) continue;
+                                mr.ibm = std::move(raw_bm);
+                                mr.hbm = std::move(h_raw);
+                            }
+                            mig_cache.push_back(std::move(mr));
+                        }
+
+                        if (mig_cache.empty()) continue;
+
                         bool migrated = false;
                         for (int to_plate = 0; to_plate < from_plate && !migrated; ++to_plate) {
-                            for (double rot : rots) {
-                                ExPolygons rshapes = base_shapes;
-                                if (rot != 0.0)
-                                    for (ExPolygon &s : rshapes) s.rotate(rot);
+                            // Per-to_plate: score every rotation's best
+                            // position (coarse + refine), keep the global
+                            // best-scoring (rotation, px, py). Commit exactly
+                            // that winner.
 
-                                int raw_iw, raw_ih, raw_iwpr;
-                                auto raw_bm = rasterize(rshapes, res, bw, bh, raw_iw, raw_ih, raw_iwpr);
-                                if (raw_bm.empty()) continue;
+                            // Destination cluster bbox snapshot for scoring —
+                            // same for every rotation tried on this plate.
+                            const ClusterBB &dst_cbb = cluster_bb[to_plate];
+                            bool dst_empty = dst_cbb.empty();
+                            int64_t dst_area = dst_empty ? 0 :
+                                (int64_t)(dst_cbb.maxx - dst_cbb.minx + 1) *
+                                (int64_t)(dst_cbb.maxy - dst_cbb.miny + 1);
 
-                                ExPolygon hull_expoly;
-                                hull_expoly.contour = Geometry::convex_hull(rshapes);
-                                if (hull_expoly.contour.empty()) continue;
-                                int h_iw, h_ih, h_iwpr;
-                                auto h_raw = rasterize(hull_expoly, res, bw, bh, h_iw, h_ih, h_iwpr);
-                                if (h_raw.empty() || h_iw != raw_iw || h_ih != raw_ih) continue;
+                            int     best_rci   = -1;
+                            int64_t best_score = std::numeric_limits<int64_t>::max();
+                            int     best_px    = -1;
+                            int     best_py    = -1;
 
-                                int iw = raw_iw, ih = raw_ih, iwpr_item = raw_iwpr;
-                                std::vector<uint64_t> ibm, hbm;
-                                BoundingBox inflated_bb = get_extents(rshapes);
-                                if (pad_px > 0) {
-                                    iw = raw_iw + 2 * pad_px;
-                                    ih = raw_ih + 2 * pad_px;
-                                    if (iw > bw || ih > bh) continue;
-                                    iwpr_item = (iw + 63) / 64;
-                                    ibm = dilate_bitmap(raw_bm, raw_iwpr, raw_iw, raw_ih,
-                                                        pad_px, iwpr_item, iw, ih);
-                                    hbm = dilate_bitmap(h_raw, raw_iwpr, raw_iw, raw_ih,
-                                                        pad_px, iwpr_item, iw, ih);
-                                    coord_t pad_sc = scaled(pad_px * res);
-                                    inflated_bb.min -= Vec2crd(pad_sc, pad_sc);
-                                    inflated_bb.max += Vec2crd(pad_sc, pad_sc);
-                                } else {
-                                    ibm = std::move(raw_bm);
-                                    hbm = std::move(h_raw);
-                                    if (iw > bw || ih > bh) continue;
-                                }
-
-                                int max_py = bh - ih;
-                                int max_px = bw - iw;
+                            for (size_t rci = 0; rci < mig_cache.size(); ++rci) {
+                                const MigRot &mr = mig_cache[rci];
+                                int max_py = bh - mr.ih;
+                                int max_px = bw - mr.iw;
                                 if (max_py < 0 || max_px < 0) continue;
 
-                                // Scored scan for the best clear position.
-                                //
-                                // Mirrors the placement scan's strategy: coarse
-                                // stride (matching placement's /8, not the old
-                                // /4), explicit max-row/max-col boundary
-                                // positions, score by destination cluster-bbox
-                                // growth, then refine ±cstride around the
-                                // coarse winner. The old first-fit scan stamped
-                                // the first open slot it saw — 2× coarser than
-                                // placement's grid and blind to whether a
-                                // neighbor position would compact the cluster
-                                // better. That asymmetry is most of why the
-                                // 125-piece tetris STL spills over on plate 02.
-                                int cstride = std::clamp(std::min(iw, ih) / 8, 4, 64);
+                                int cstride = std::clamp(std::min(mr.iw, mr.ih) / 8, 4, 64);
 
                                 auto position_clear_dst = [&](int px, int py) -> bool {
                                     if (collides(plate_items[to_plate], wpr, bw, bh,
-                                                 ibm, iwpr_item, iw, ih, px, py)) return false;
+                                                 mr.ibm, mr.iwpr_item, mr.iw, mr.ih, px, py)) return false;
                                     if (collides(plate_excludes[to_plate], wpr, bw, bh,
-                                                 hbm, iwpr_item, iw, ih, px, py)) return false;
+                                                 mr.hbm, mr.iwpr_item, mr.iw, mr.ih, px, py)) return false;
                                     return true;
                                 };
-
-                                // Destination cluster bbox snapshot for scoring.
-                                const ClusterBB &dst_cbb = cluster_bb[to_plate];
-                                bool dst_empty = dst_cbb.empty();
-                                int64_t dst_area = dst_empty ? 0 :
-                                    (int64_t)(dst_cbb.maxx - dst_cbb.minx + 1) *
-                                    (int64_t)(dst_cbb.maxy - dst_cbb.miny + 1);
 
                                 auto score_dst = [&](int px, int py) -> int64_t {
                                     int nminx = px;
                                     int nminy = py;
-                                    int nmaxx = px + iw - 1;
-                                    int nmaxy = py + ih - 1;
+                                    int nmaxx = px + mr.iw - 1;
+                                    int nmaxy = py + mr.ih - 1;
                                     int64_t new_area;
                                     if (dst_empty) {
-                                        new_area = (int64_t)iw * (int64_t)ih;
+                                        new_area = (int64_t)mr.iw * (int64_t)mr.ih;
                                     } else {
                                         int mnx = std::min(dst_cbb.minx, nminx);
                                         int mny = std::min(dst_cbb.miny, nminy);
@@ -990,62 +1015,74 @@ public:
                                 int ry1 = std::min(max_py, coarse_py + cstride);
                                 int rx0 = std::max(0, coarse_px - cstride);
                                 int rx1 = std::min(max_px, coarse_px + cstride);
-                                int64_t refine_score = coarse_score;
-                                int found_px = coarse_px;
-                                int found_py = coarse_py;
+                                int64_t rot_score = coarse_score;
+                                int rot_px = coarse_px;
+                                int rot_py = coarse_py;
                                 for (int py = ry0; py <= ry1; ++py) {
                                     for (int px = rx0; px <= rx1; ++px) {
                                         if (!position_clear_dst(px, py)) continue;
                                         int64_t s = score_dst(px, py);
-                                        if (s < refine_score) {
-                                            refine_score = s;
-                                            found_px = px;
-                                            found_py = py;
+                                        if (s < rot_score) {
+                                            rot_score = s;
+                                            rot_px = px;
+                                            rot_py = py;
                                         }
                                     }
                                 }
 
-                                // Commit the migration.
-                                stamp(plate_items[to_plate], wpr, bw, bh,
-                                      ibm, iwpr_item, iw, ih, found_px, found_py);
-
-                                // Update destination cluster bbox.
-                                {
-                                    ClusterBB &c = cluster_bb[to_plate];
-                                    int nminx = found_px, nminy = found_py;
-                                    int nmaxx = found_px + iw - 1;
-                                    int nmaxy = found_py + ih - 1;
-                                    if (c.empty()) {
-                                        c.minx = nminx; c.miny = nminy;
-                                        c.maxx = nmaxx; c.maxy = nmaxy;
-                                    } else {
-                                        c.minx = std::min(c.minx, nminx);
-                                        c.miny = std::min(c.miny, nminy);
-                                        c.maxx = std::max(c.maxx, nmaxx);
-                                        c.maxy = std::max(c.maxy, nmaxy);
-                                    }
+                                if (rot_score < best_score) {
+                                    best_score = rot_score;
+                                    best_rci   = (int)rci;
+                                    best_px    = rot_px;
+                                    best_py    = rot_py;
                                 }
-
-                                // Update item state.
-                                double origin_x = found_px * res
-                                                  - unscaled<double>(inflated_bb.min.x())
-                                                  + unscaled<double>(ebed.min.x());
-                                double origin_y = found_py * res
-                                                  - unscaled<double>(inflated_bb.min.y())
-                                                  + unscaled<double>(ebed.min.y());
-                                it.translation = Vec2crd{scaled(origin_x), scaled(origin_y)};
-                                // Compose: base_rot is the caller's original
-                                // pre-rotation; rot is the consolidation pass's
-                                // chosen alternative orientation. Mirrors the
-                                // greedy commit at line ~638.
-                                it.rotation    = base_rot + rot;
-                                it.bed_idx     = to_plate;
-
-                                migrated = true;
-                                any_migration = true;
-                                plate_dirty = true;
-                                break;
                             }
+
+                            if (best_rci < 0) continue;  // no rotation had a valid position on this plate
+
+                            const MigRot &best = mig_cache[best_rci];
+
+                            // Commit the migration with the best-scoring
+                            // rotation's bitmap and position.
+                            stamp(plate_items[to_plate], wpr, bw, bh,
+                                  best.ibm, best.iwpr_item, best.iw, best.ih,
+                                  best_px, best_py);
+
+                            // Update destination cluster bbox.
+                            {
+                                ClusterBB &c = cluster_bb[to_plate];
+                                int nminx = best_px, nminy = best_py;
+                                int nmaxx = best_px + best.iw - 1;
+                                int nmaxy = best_py + best.ih - 1;
+                                if (c.empty()) {
+                                    c.minx = nminx; c.miny = nminy;
+                                    c.maxx = nmaxx; c.maxy = nmaxy;
+                                } else {
+                                    c.minx = std::min(c.minx, nminx);
+                                    c.miny = std::min(c.miny, nminy);
+                                    c.maxx = std::max(c.maxx, nmaxx);
+                                    c.maxy = std::max(c.maxy, nmaxy);
+                                }
+                            }
+
+                            // Update item state.
+                            double origin_x = best_px * res
+                                              - unscaled<double>(best.inflated_bb.min.x())
+                                              + unscaled<double>(ebed.min.x());
+                            double origin_y = best_py * res
+                                              - unscaled<double>(best.inflated_bb.min.y())
+                                              + unscaled<double>(ebed.min.y());
+                            it.translation = Vec2crd{scaled(origin_x), scaled(origin_y)};
+                            // Compose: base_rot is the caller's original
+                            // pre-rotation; best.rot is the consolidation
+                            // pass's chosen alternative orientation. Mirrors
+                            // the greedy commit at line ~638.
+                            it.rotation    = base_rot + best.rot;
+                            it.bed_idx     = to_plate;
+
+                            migrated = true;
+                            any_migration = true;
+                            plate_dirty = true;
                         }
                     }
 
