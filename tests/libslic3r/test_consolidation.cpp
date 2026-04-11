@@ -126,23 +126,28 @@ TEST_CASE("consolidation: loose pack — all items on plate 0",
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 2 — four equal squares on a comfortably-sized bed.
+// Scenario 2 — four equal squares land as a 2x2 grid on plate 0.
 //
 // 4 equal 80x80 rectangles on a 200x200 bed. Total 4 * 6400 = 25600 mm²
-// on 40000 mm² (64% density). The geometrically optimal layout is a
-// 2x2 grid = 160x160 cluster with 40mm margin on each axis.
+// on 40000 mm² (64% density). Geometric optimum is a 2x2 grid =
+// 160x160 cluster post-centered to (20,20)-(180,180).
 //
-// KNOWN ALGORITHMIC GAP (filed 2026-04-11): the current greedy +
-// consolidation does NOT find the 2x2 grid layout on this input. It
-// lands with max_bed_idx=1, meaning one square spills to plate 2.
-// Suspected cause: the scoring + stride choice for equal-sized square
-// items misses the (180px, 180px) position for the fourth square on
-// plate 0 even though refine should reach it in a ±coarse window
-// around the coarse winner. Needs investigation. Until fixed, the
-// assertion is max_bed<=1 to keep the test green as a floor gate.
+// HISTORY: This test initially exposed a failure mode where the
+// hybrid anchor (corner for first item, bed center for rest)
+// over-pulled item 2 to (60,80) instead of (0,80) or (80,80) when
+// delta_area tied across those positions. Item 3 then had no 80x80
+// slot. Fixed 2026-04-11 by switching to pure corner anchor for all
+// items in default-align mode, relying on post-centering to move the
+// resulting tight cluster to the bed center. The corner anchor
+// produces grid-aligned placement because ties are broken by smallest
+// (px, py), which is BL-fill. Post-centering still works as before,
+// shifting the final cluster to (20,20)-(180,180). S+Z 50x50 still
+// passes because smart-shuffle picks up the slack that hybrid used
+// to provide for small-N central-trap cases. See task #56 for the
+// diagnosis trail.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("consolidation: four equal squares (current floor = 2 plates)",
+TEST_CASE("consolidation: four equal squares fit 2x2 on plate 0",
           "[BitmapNester][consolidation][BitmapRegression]")
 {
     ArrangePolygons items;
@@ -154,25 +159,22 @@ TEST_CASE("consolidation: four equal squares (current floor = 2 plates)",
 
     BitmapNester::arrange(items, ArrangePolygons{}, bed, params);
 
-    // ROOT CAUSE (diagnosed 2026-04-11 via instrumented run):
-    //   item 0 → (0, 0)   grid-aligned
-    //   item 1 → (80, 0)  grid-aligned against item 0's right edge
-    //   item 2 → (60, 80) OFF-GRID — anchor tiebreaker pulled toward
-    //                     bed center, breaking grid alignment
-    //   item 3 → no 80x80 slot left on plate 0, falls to plate 1
-    //
-    // The delta_area for candidates (0,80), (60,80), (80,80) is
-    // IDENTICAL — all produce a 160x160 cluster bbox. The scoring
-    // secondary (dist to anchor = bed center) picks (60,80) because
-    // its candidate center is closest to (100,100) mm. That's a
-    // correct implementation of the stated tiebreaker but the wrong
-    // heuristic: grid alignment would leave room for item 3.
-    //
-    // Fix direction: tiebreaker should prefer grid-aligned positions
-    // (candidate corner abuts cluster corner) over anchor-distance.
-    // Not a one-liner — filed to task #56. Until then this test gates
-    // against regression below the current floor.
-    REQUIRE(test_utils::max_bed_idx(items) <= 1);
+    // Expected layout after the 2026-04-11 corner-anchor-for-all fix:
+    //   item 0 → (20, 20)   post-centered from (0, 0)
+    //   item 1 → (100, 20)  post-centered from (80, 0)
+    //   item 2 → (20, 100)  post-centered from (0, 80)
+    //   item 3 → (100, 100) post-centered from (80, 80)
+    // All on plate 0. Compactness ratio = 1.0 (zero waste inside bbox).
+    // Diagnostic — visible on pass or fail
+    UNSCOPED_INFO("max_bed=" << test_utils::max_bed_idx(items)
+                  << " perim_mm=" << test_utils::cluster_bbox_perimeter_mm(items)
+                  << " compact=" << test_utils::cluster_compactness(items));
+    for (size_t i = 0; i < items.size(); ++i)
+        UNSCOPED_INFO("  item " << i << " bed=" << items[i].bed_idx
+                      << " x=" << unscaled<double>(items[i].translation.x())
+                      << " y=" << unscaled<double>(items[i].translation.y()));
+
+    REQUIRE(test_utils::max_bed_idx(items) == 0);
     REQUIRE(test_utils::no_overlap(items));
 }
 
@@ -238,11 +240,7 @@ TEST_CASE("consolidation: deterministic rerun",
 
     ArrangePolygons items = build();
     run(items);
-    // See Scenario 2's note: four equal squares currently land on 2
-    // plates due to a suspected scoring/stride gap. Assertion floors
-    // track that; the determinism check is what this test case
-    // primarily verifies.
-    REQUIRE(test_utils::max_bed_idx(items) <= 1);
+    REQUIRE(test_utils::max_bed_idx(items) == 0);
     REQUIRE(test_utils::no_overlap(items));
 
     ArrangePolygons rerun = build();
