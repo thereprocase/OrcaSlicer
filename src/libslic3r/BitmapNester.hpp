@@ -604,17 +604,8 @@ public:
                 const double ay = anchor.second;
 
                 const ClusterBB &cbb = cluster_bb[plate_idx];
+                const int64_t cbb_area = cbb.area();
                 const bool cbb_empty = cbb.empty();
-                // Squared-diagonal of the current cluster bbox. Used as the
-                // primary scoring metric — see score_at. Travel cost between
-                // two points in a rectangle is upper-bounded by its
-                // diagonal, so minimizing diag² directly minimizes the
-                // worst-case print-head XY travel across the cluster.
-                const int64_t cbb_w = cbb_empty ? 0
-                    : (int64_t)(cbb.maxx - cbb.minx + 1);
-                const int64_t cbb_h = cbb_empty ? 0
-                    : (int64_t)(cbb.maxy - cbb.miny + 1);
-                const int64_t cbb_diag2 = cbb_w * cbb_w + cbb_h * cbb_h;
 
                 // Tall-parts-centered bias. At high layer counts, only tall
                 // parts are still printing. Putting them in a plate corner
@@ -637,29 +628,20 @@ public:
                     : std::min(1.0, item_height_mm / 100.0);
 
                 // Score a candidate placement as:
-                //   primary   = growth in cluster bounding box SQUARED DIAG.
-                //               Travel cost between two points in a
-                //               rectangle is upper-bounded by its diagonal,
-                //               so minimizing diag² is a direct proxy for
-                //               worst-case print-head XY travel across the
-                //               cluster. Two placements with the same bbox
-                //               area but different shapes (100x100 vs
-                //               400x25) have very different diag² (20000
-                //               vs 160625), and diag² correctly identifies
-                //               the square as tighter. This is the user's
-                //               priority #1 (travel minimization) baked
-                //               directly into the scoring.
+                //   primary   = growth in cluster bounding box area (int64)
                 //   secondary = squared pixel distance of candidate bbox
                 //               center from resolved anchor + tall-bias
                 //               toward plate center (skipped for first item
                 //               per plate so the anchor seed still lands).
                 //
                 // A rotated L-shape slotted into an existing L's concave notch
-                // has its bbox already inside the cluster bbox, so delta_diag2
+                // has its bbox already inside the cluster bbox, so delta_area
                 // is zero and it wins over any non-interlocking position.
-                // When the cluster is empty, all positions tie on delta_diag2
-                // (the diag² is just the item bbox diag² for any position)
-                // and the anchor tiebreaker decides.
+                // When the cluster is empty, all positions tie on delta_area
+                // and the anchor tiebreaker decides (first item clusters
+                // around the wipe tower; in the default case the anchor is
+                // (0, 0) so first item lands top-left, preserving the old
+                // first-fit baseline pack density).
                 //
                 // We return a pair so lexicographic comparison does the right
                 // thing without numerical scaling games.
@@ -670,20 +652,17 @@ public:
                     int nminy = py;
                     int nmaxx = px + rc.iw - 1;
                     int nmaxy = py + rc.ih - 1;
-                    int64_t new_w, new_h;
+                    int64_t new_area;
                     if (cbb_empty) {
-                        new_w = (int64_t)rc.iw;
-                        new_h = (int64_t)rc.ih;
+                        new_area = (int64_t)rc.iw * (int64_t)rc.ih;
                     } else {
                         int mnx = std::min(cbb.minx, nminx);
                         int mny = std::min(cbb.miny, nminy);
                         int mxx = std::max(cbb.maxx, nmaxx);
                         int mxy = std::max(cbb.maxy, nmaxy);
-                        new_w = (int64_t)(mxx - mnx + 1);
-                        new_h = (int64_t)(mxy - mny + 1);
+                        new_area = (int64_t)(mxx - mnx + 1) * (int64_t)(mxy - mny + 1);
                     }
-                    int64_t new_diag2 = new_w * new_w + new_h * new_h;
-                    int64_t delta = new_diag2 - cbb_diag2;
+                    int64_t delta = new_area - cbb_area;
                     double cx = (double)px + rc.iw * 0.5 - ax;
                     double cy = (double)py + rc.ih * 0.5 - ay;
                     double dist2 = cx * cx + cy * cy;
@@ -1004,16 +983,11 @@ public:
 
                             // Destination cluster bbox snapshot for scoring —
                             // same for every rotation tried on this plate.
-                            // Uses squared-diagonal like the main placement
-                            // scorer (primary is delta_diag² — worst-case
-                            // travel proxy).
                             const ClusterBB &dst_cbb = cluster_bb[to_plate];
                             bool dst_empty = dst_cbb.empty();
-                            int64_t dst_w = dst_empty ? 0
-                                : (int64_t)(dst_cbb.maxx - dst_cbb.minx + 1);
-                            int64_t dst_h = dst_empty ? 0
-                                : (int64_t)(dst_cbb.maxy - dst_cbb.miny + 1);
-                            int64_t dst_diag2 = dst_w * dst_w + dst_h * dst_h;
+                            int64_t dst_area = dst_empty ? 0 :
+                                (int64_t)(dst_cbb.maxx - dst_cbb.minx + 1) *
+                                (int64_t)(dst_cbb.maxy - dst_cbb.miny + 1);
 
                             int     best_rci   = -1;
                             int64_t best_score = std::numeric_limits<int64_t>::max();
@@ -1041,20 +1015,18 @@ public:
                                     int nminy = py;
                                     int nmaxx = px + mr.iw - 1;
                                     int nmaxy = py + mr.ih - 1;
-                                    int64_t new_w, new_h;
+                                    int64_t new_area;
                                     if (dst_empty) {
-                                        new_w = (int64_t)mr.iw;
-                                        new_h = (int64_t)mr.ih;
+                                        new_area = (int64_t)mr.iw * (int64_t)mr.ih;
                                     } else {
                                         int mnx = std::min(dst_cbb.minx, nminx);
                                         int mny = std::min(dst_cbb.miny, nminy);
                                         int mxx = std::max(dst_cbb.maxx, nmaxx);
                                         int mxy = std::max(dst_cbb.maxy, nmaxy);
-                                        new_w = (int64_t)(mxx - mnx + 1);
-                                        new_h = (int64_t)(mxy - mny + 1);
+                                        new_area = (int64_t)(mxx - mnx + 1) *
+                                                   (int64_t)(mxy - mny + 1);
                                     }
-                                    int64_t new_diag2 = new_w * new_w + new_h * new_h;
-                                    return new_diag2 - dst_diag2;
+                                    return new_area - dst_area;
                                 };
 
                                 // Coarse scan with explicit boundary positions.
