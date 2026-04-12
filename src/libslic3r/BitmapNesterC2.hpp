@@ -856,6 +856,18 @@ private:
         for (std::size_t i = 0; i < items.size(); ++i) {
             if (items[i].bed_idx != UNARRANGED) continue;
 
+            // Guard against degenerate polygons (zero-area items that
+            // rasterize to nothing). get_extents on an empty contour
+            // produces an undefined bbox; calling center() on that is
+            // UB. Just assign a plate without centering.
+            // (Aragorn audit 2026-04-12)
+            if (items[i].poly.contour.points.empty()) {
+                items[i].translation = Vec2crd{0, 0};
+                items[i].rotation    = 0.0;
+                items[i].bed_idx     = next_plate_idx++;
+                continue;
+            }
+
             // Center the item on a new plate. Translation moves the
             // item's poly center to the bed center.
             BoundingBox item_bb = get_extents(items[i].poly);
@@ -951,8 +963,12 @@ private:
             if (ci.rot != 0.0) rotated.rotate(ci.rot);
             BoundingBox rot_bb = get_extents(rotated);
             // px = (translation_mm + rot_bb.min_mm) / res
-            ci.px = (int)((tx_mm + unscaled<double>(rot_bb.min.x())) / res);
-            ci.py = (int)((ty_mm + unscaled<double>(rot_bb.min.y())) / res);
+            // Use lround, not (int) cast — truncation toward zero
+            // can drift by 1px due to IEEE 754 roundtrip through
+            // scaled/unscaled, leaving ghost bits in the composite.
+            // (Sauron audit 2026-04-12)
+            ci.px = (int)std::lround((tx_mm + unscaled<double>(rot_bb.min.x())) / res);
+            ci.py = (int)std::lround((ty_mm + unscaled<double>(rot_bb.min.y())) / res);
         }
 
         // Build fresh composite from per-part bitmaps.
