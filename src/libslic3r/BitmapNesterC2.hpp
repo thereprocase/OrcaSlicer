@@ -490,18 +490,21 @@ private:
         // Plate size: 2048×2048 px at 0.5 mm/pixel = 1024×1024 mm
         // in world. Generous enough for any realistic island; costs
         // 512 KB of allocation per call which is acceptable.
-        // Bitmap resolution derived from spacing setting.
-        // res = spacing/2 clamped to [0.1, 0.5] mm/px.
-        // At default 0.5mm spacing → res = 0.25 mm/px.
-        // At tight 0.1mm spacing → res = 0.1 mm/px (floor).
-        // At wide 5mm spacing → res = 0.5 mm/px (ceiling).
+        // Bitmap resolution = spacing / 2 (Nyquist: need ≥ 2 samples
+        // across the minimum gap to distinguish gap from contact).
+        // Clamped to [0.1, 0.5] mm/px.
         double spacing_mm = unscaled<double>(params.min_obj_distance);
-        const double res = std::max(0.1, std::min(0.5,
-                               spacing_mm > 0.0 ? spacing_mm / 2.0 : 0.5));
-        // Plate dimensions scale with resolution. The virtual plate
-        // must be large enough to hold the bed + generous margin for
-        // the island to grow before locate clips it. 2× bed size in
-        // each axis, rounded up to 64-bit word boundary.
+        if (spacing_mm <= 0.0) spacing_mm = 1.0;  // sane default
+        const double res = std::max(0.1, std::min(0.5, spacing_mm / 2.0));
+        // Virtual plate = 2× bed at the Nyquist resolution.
+        // 2× bed so the island can grow freely before locate clips.
+        // Width rounded up to 64-bit word boundary.
+        //
+        // plate_px = 2 * bed_mm / res = 2 * bed_mm * 2 / spacing
+        //          = 4 * bed_mm / spacing
+        //
+        // At 256mm bed, 0.5mm spacing: 4 * 256 / 0.5 = 2048 px.
+        // The old hardcoded 2048 was this formula all along.
         double bed_w_mm = unscaled<double>(bed.size().x());
         double bed_h_mm = unscaled<double>(bed.size().y());
         const int plate_bw  = ((int)(bed_w_mm * 2.0 / res) + 63) & ~63;
@@ -563,10 +566,16 @@ private:
             if (rot_cache.empty()) continue;
 
             // First item: stamp at plate center with first rotation.
+            // If the item is larger than the virtual plate, skip it —
+            // it can't fit in imagination space, so it definitely can't
+            // fit on the bed. Spillover will catch it.
             if (occ_max_px == 0) {
                 const RotCache& rc = rot_cache[0];
                 int px = seed_cx - rc.iw / 2;
                 int py = seed_cy - rc.ih / 2;
+                if (px < 0 || py < 0 ||
+                    px + rc.iw > plate_bw || py + rc.ih > plate_bh)
+                    continue;
                 BitmapNester::stamp(plate_items, plate_wpr, plate_bw, plate_bh,
                                     rc.bm, rc.iwpr, rc.iw, rc.ih, px, py);
 
