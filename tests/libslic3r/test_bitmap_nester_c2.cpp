@@ -26,6 +26,7 @@
 #include "libslic3r/Point.hpp"
 #include "libslic3r/Polygon.hpp"
 #include "bitmap_test_utils.hpp"
+#include "harness_oracle.hpp"
 
 #include <cmath>
 #include <vector>
@@ -93,6 +94,26 @@ ExPolygon c2_solid_square_mm()
         Point(scaled<coord_t>(40.0), scaled<coord_t>(0.0)),
         Point(scaled<coord_t>(40.0), scaled<coord_t>(40.0)),
         Point(scaled<coord_t>(0.0),  scaled<coord_t>(40.0))
+    });
+}
+
+// C-shape (a square with a deep rectangular notch cut from one side).
+// Outer bbox is 40x40; the notch is 30 wide × 24 deep cut from the
+// right side centered vertically. Silhouette area = 1600 - 720 = 880
+// mm² vs bbox area 1600 mm² — ratio 0.55. A "pocket" that can
+// accept another shape's protrusion but whose bbox significantly
+// over-represents the occupied area.
+ExPolygon c2_c_shape_mm()
+{
+    return ExPolygon(Points{
+        Point(scaled<coord_t>( 0.0), scaled<coord_t>( 0.0)),  // BL
+        Point(scaled<coord_t>(40.0), scaled<coord_t>( 0.0)),  // BR
+        Point(scaled<coord_t>(40.0), scaled<coord_t>( 8.0)),  // bottom of mouth
+        Point(scaled<coord_t>(10.0), scaled<coord_t>( 8.0)),  // inward top of notch
+        Point(scaled<coord_t>(10.0), scaled<coord_t>(32.0)),  // inward bottom of notch
+        Point(scaled<coord_t>(40.0), scaled<coord_t>(32.0)),  // top of mouth
+        Point(scaled<coord_t>(40.0), scaled<coord_t>(40.0)),  // TR
+        Point(scaled<coord_t>( 0.0), scaled<coord_t>(40.0))   // TL
     });
 }
 
@@ -620,4 +641,98 @@ TEST_CASE("C2 M2.4: multi-plate partition preserves determinism",
         REQUIRE(a[i].translation.y() == b[i].translation.y());
         REQUIRE(std::abs(a[i].rotation - b[i].rotation) < 1e-9);
     }
+}
+
+// ===========================================================================
+// M2.5.1 — bbox is wrong for concave: L-shape notch-fill discriminator
+// ===========================================================================
+//
+// Two 40x40 L-shapes with a 20x20 top-right notch. L1 at (0,0) has
+// its notch empty at (20,20)-(40,40). L2 placed at (20,20) has its
+// bottom-left solid 20x20 quadrant sitting IN L1's notch — i.e.,
+// L2's solid fills L1's empty region.
+//
+// Bbox overlap: L1 bbox (0,0)-(40,40), L2 bbox (20,20)-(60,60).
+// They overlap in (20,20)-(40,40) = 20x20 = 400 mm².
+//
+// Silhouette overlap: L1 is empty in the (20,20)-(40,40) region
+// (that's L1's notch). L2's solid in that region is (20,20)-(40,40)
+// (that's L2's bottom-left quadrant, which is SOLID). L1 empty +
+// L2 solid = ZERO silhouette overlap.
+//
+// Result: bbox says "collision", silhouette says "clear". A solver
+// using bbox as the collision shape would reject this valid
+// placement. A silhouette-aware solver accepts it.
+//
+// This is the binary proof that motivates the M2.5 bbox purge. Every
+// place we use bbox as a proxy for silhouette, we over-reject valid
+// placements in exactly this way. For a crescent, the over-rejection
+// ratio is ~4× (bbox is 4× silhouette area). For these L-shapes, it's
+// ~1.3× (bbox 1600 vs silhouette ~1200), still enough to demonstrate.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("C2 M2.5.1: L-shape notch-fill — bbox overlaps but silhouettes don't",
+          "[BitmapNesterC2][c2-m2.5][bbox-discriminator]")
+{
+    // L1 at origin, L2 at (20, 20). L2's bottom-left quadrant fills
+    // L1's top-right notch exactly.
+    ArrangePolygon l1 = c2_make_ap(c2_l_shape_40_20_mm());
+    l1.translation = Vec2crd{0, 0};
+    l1.rotation = 0.0;
+    l1.bed_idx = 0;
+
+    ArrangePolygon l2 = c2_make_ap(c2_l_shape_40_20_mm());
+    l2.translation = Vec2crd{scaled<coord_t>(20.0), scaled<coord_t>(20.0)};
+    l2.rotation = 0.0;
+    l2.bed_idx = 0;
+
+    ArrangePolygons items;
+    items.push_back(l1);
+    items.push_back(l2);
+
+    // Transformed polygons.
+    ExPolygon tp0 = items[0].transformed_poly();
+    ExPolygon tp1 = items[1].transformed_poly();
+    BoundingBox bb0 = get_extents(tp0);
+    BoundingBox bb1 = get_extents(tp1);
+
+    // Compute bbox overlap state explicitly.
+    bool bbox_overlap =
+        !(bb0.max.x() < bb1.min.x() ||
+          bb0.min.x() > bb1.max.x() ||
+          bb0.max.y() < bb1.min.y() ||
+          bb0.min.y() > bb1.max.y());
+
+    UNSCOPED_INFO("L1 bbox: ("
+                  << unscaled<double>(bb0.min.x()) << ", "
+                  << unscaled<double>(bb0.min.y()) << ") to ("
+                  << unscaled<double>(bb0.max.x()) << ", "
+                  << unscaled<double>(bb0.max.y()) << ")");
+    UNSCOPED_INFO("L2 bbox: ("
+                  << unscaled<double>(bb1.min.x()) << ", "
+                  << unscaled<double>(bb1.min.y()) << ") to ("
+                  << unscaled<double>(bb1.max.x()) << ", "
+                  << unscaled<double>(bb1.max.y()) << ")");
+    UNSCOPED_INFO("bbox_overlap = " << (bbox_overlap ? "YES" : "no"));
+
+    // 1. Bboxes overlap. If a solver used bbox as the collision
+    //    shape, it would reject this placement.
+    REQUIRE(bbox_overlap);
+
+    // 2. Silhouettes DO NOT overlap. The polygon-intersection
+    //    no_overlap helper confirms clear.
+    REQUIRE(test_utils::no_overlap(items));
+
+    // 3. The winding-number oracle (independent ground truth)
+    //    agrees: no interior point of L2 lies inside L1, or vice
+    //    versa. This pins the result with a provably-correct
+    //    method in case no_overlap has any edge-case weakness.
+    REQUIRE_FALSE(test_utils::expolygons_overlap_oracle_symmetric(
+        tp0, tp1, 0.25));
+
+    // Summary in the test log: bbox says "collision", three
+    // independent silhouette methods say "clear". Every
+    // bbox-as-collision-shape check over-rejects this placement.
+    // M2.5.3 bitmap AND replaces the current collision path and
+    // will handle this case correctly.
 }
