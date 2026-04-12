@@ -227,9 +227,15 @@ public:
             compact_on_plate(items, islands[g], (int)g, bed);
         }
 
+        // TODO: post-compaction overflow check. Items hanging off the
+        // bed after compaction should be unplaced and sent to spillover.
+        // Disabled for now — the compactor sometimes INCREASES overflow
+        // (quality gate rejects, items stay in original positions which
+        // may still overflow). Need to fix compactor convergence first.
+
         // M3.1 spillover recovery: items that pack_as_island couldn't
         // fit (best_rci stayed -1) still have bed_idx == UNARRANGED.
-        // Each gets its own plate centered on the bed. This is the
+        // Each gets its own plate. This is the
         // minimum viable spillover — guarantees every item ends up
         // placed somewhere, no items silently vanish. Fitting
         // spillovers onto existing plates with remaining space is an
@@ -1274,6 +1280,10 @@ private:
         };
 
         int overflow_before = count_overflow(composite);
+        fprintf(stderr, "[C2 compact] items=%d bed=%dx%d px overflow_before=%d res=%.2f\n",
+                (int)island.compact_items.size(),
+                bed_max_px - bed_min_px, bed_max_py - bed_min_py,
+                overflow_before, res);
 
         // Save positions for quality gate rollback.
         struct SavedPos { int px, py; };
@@ -1283,8 +1293,23 @@ private:
             saved.push_back({ci.px, ci.py});
 
         // ─── Main compaction loop ────────────────────────────────
-        constexpr int MAX_ITER = 50;
+        // Iteration budget: 50 base + extra if overflow remains.
+        // At 0.5mm/px, 50 iters = 25mm of travel. If the cluster
+        // overflows the bed by more than that, 50 isn't enough.
+        // Check overflow every 50 iters; if still non-zero, keep
+        // going up to 200 total.
+        constexpr int BASE_ITER = 50;
+        constexpr int MAX_ITER  = 200;
         for (int iter = 0; iter < MAX_ITER; ++iter) {
+            // After base iterations, check if we still need to push.
+            // If no overflow remains, the base budget is sufficient.
+            if (iter == BASE_ITER) {
+                int mid_overflow = count_overflow(composite);
+                fprintf(stderr, "[C2 compact] iter=%d mid_overflow=%d %s\n",
+                        iter, mid_overflow,
+                        mid_overflow == 0 ? "CONVERGED" : "EXTENDING");
+                if (mid_overflow == 0) break;
+            }
             bool any_moved = false;
 
             for (auto& ci : island.compact_items) {
@@ -1393,11 +1418,17 @@ private:
                 if (moved) any_moved = true;
             }
 
-            if (!any_moved) break;
+            if (!any_moved) {
+                fprintf(stderr, "[C2 compact] converged at iter=%d\n", iter);
+                break;
+            }
         }
 
         // ─── Quality gate: pixel overflow count ──────────────────
         int overflow_after = count_overflow(composite);
+        fprintf(stderr, "[C2 compact] done. overflow: %d -> %d (%s)\n",
+                overflow_before, overflow_after,
+                overflow_after <= overflow_before ? "OK" : "REJECTED");
         if (overflow_after > overflow_before) {
             // Reject compaction — restore saved positions.
             for (std::size_t i = 0; i < island.compact_items.size(); ++i) {
