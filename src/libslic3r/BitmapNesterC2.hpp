@@ -461,7 +461,6 @@ private:
         const BoundingBox& bed,
         const ArrangeParams& params)
     {
-        (void)excludes;
         (void)bed;
 
         NesterC2Island island;
@@ -540,11 +539,32 @@ private:
         std::vector<uint64_t> plate_items(
             (std::size_t)plate_wpr * plate_bh, 0);
 
-        // Seed position: plate center. First item's bitmap gets
-        // stamped so its center is near (seed_cx, seed_cy) and the
-        // cluster can grow outward in any direction.
+        // Stamp exclude zones (wipe tower, calibration areas) onto
+        // the plate as fixed obstacles. Items will avoid them via
+        // bitmap AND collision. Excludes are in bed coordinates;
+        // map to virtual plate pixels centered at (seed_cx, seed_cy).
         const int seed_cx = plate_bw / 2;
         const int seed_cy = plate_bh / 2;
+        double bed_cx_mm = unscaled<double>(bed.center().x());
+        double bed_cy_mm = unscaled<double>(bed.center().y());
+        for (const ArrangePolygon& ex : excludes) {
+            ExPolygon ex_poly = ex.poly;
+            if (ex.rotation != 0.0) ex_poly.rotate(ex.rotation);
+            ex_poly.translate(ex.translation.x(), ex.translation.y());
+            int eiw = 0, eih = 0, eiwpr = 0;
+            auto ebm = BitmapNester::rasterize(
+                ex_poly, res, plate_bw, plate_bh, eiw, eih, eiwpr);
+            if (ebm.empty()) continue;
+            BoundingBox ebb = get_extents(ex_poly);
+            double ex_cx_mm = unscaled<double>(ebb.min.x());
+            double ex_cy_mm = unscaled<double>(ebb.min.y());
+            int epx = seed_cx + (int)((ex_cx_mm - bed_cx_mm) / res);
+            int epy = seed_cy + (int)((ex_cy_mm - bed_cy_mm) / res);
+            if (epx >= 0 && epy >= 0 &&
+                epx + eiw <= plate_bw && epy + eih <= plate_bh)
+                BitmapNester::stamp(plate_items, plate_wpr, plate_bw, plate_bh,
+                                    ebm, eiwpr, eiw, eih, epx, epy);
+        }
 
         // Running extent of the set bits on the plate. Initial
         // "empty" state uses sentinels that will be replaced on
