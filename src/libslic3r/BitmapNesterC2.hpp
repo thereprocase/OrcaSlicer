@@ -1159,45 +1159,56 @@ private:
         if (island.compact_items.size() < 2) return;
 
         const double res = island.bitmap_res;
-        const int bw  = island.plate_bw;
-        const int bh  = island.plate_bh;
-        const int wpr = island.plate_wpr;
 
-        // Bed boundaries in pixel space.
-        int bed_min_px = (int)(unscaled<double>(bed.min.x()) / res);
-        int bed_min_py = (int)(unscaled<double>(bed.min.y()) / res);
-        int bed_max_px = (int)(unscaled<double>(bed.max.x()) / res);
-        int bed_max_py = (int)(unscaled<double>(bed.max.y()) / res);
+        // The compactor works in BED pixel space, not the pack_as_island
+        // virtual plate space. After locate_island_on_plate, items have
+        // bed-relative translations that can be negative or larger than
+        // the virtual plate. The compactor allocates its own bed-sized
+        // bitmap so every item is fully visible.
+        double bed_w_mm = unscaled<double>(bed.size().x());
+        double bed_h_mm = unscaled<double>(bed.size().y());
+        // Add margin so items that hang off the bed are still rasterized
+        // (the compactor's job is to push them back in).
+        double margin_mm = 50.0;  // 50mm margin each side
+        double total_w_mm = bed_w_mm + 2 * margin_mm;
+        double total_h_mm = bed_h_mm + 2 * margin_mm;
+        const int bw  = ((int)(total_w_mm / res) + 63) & ~63;
+        const int bh  = (int)(total_h_mm / res) + 1;
+        const int wpr = (bw + 63) / 64;
 
-        // Adjust CompactItem pixel positions for the locate shift.
-        // locate_island_on_plate added a shift to each item's
-        // translation. We need to convert current mm-space translations
-        // back to pixel positions for bitmap operations.
+        // Bed boundaries in the compactor's pixel space.
+        // The bed starts at margin_mm from the origin.
+        int bed_min_px = (int)(margin_mm / res);
+        int bed_min_py = (int)(margin_mm / res);
+        int bed_max_px = bed_min_px + (int)(bed_w_mm / res);
+        int bed_max_py = bed_min_py + (int)(bed_h_mm / res);
+
+        // Pixel offset: items' mm-space translations are relative to
+        // bed.min. Convert to compactor pixel space by adding the
+        // margin offset.
+        double bed_origin_x_mm = unscaled<double>(bed.min.x());
+        double bed_origin_y_mm = unscaled<double>(bed.min.y());
+
+        // Convert item translations to compactor pixel positions.
+        // Items have bed-relative mm translations from locate.
+        // Convert to the compactor's pixel space (bed starts at
+        // margin_mm from origin).
         for (auto& ci : island.compact_items) {
             std::size_t orig = ci.original_idx;
-            // The item's current translation in scaled coords → mm → px
             double tx_mm = unscaled<double>(items[orig].translation.x());
             double ty_mm = unscaled<double>(items[orig].translation.y());
-            // Find the rotation's bbox offset (the same math used at
-            // commit time to derive translation from pixel position).
-            // If pad_px > 0 the committed bitmap was dilated: inflated_bb.min
-            // = rot_bb.min - pad_px*res.  We must use inflated_bb.min to
-            // invert the commit formula: tx = px*res - inflated_bb.min
-            // → px = (tx + inflated_bb.min) / res.
             ExPolygon rotated = items[orig].poly;
             if (ci.rot != 0.0) rotated.rotate(ci.rot);
             BoundingBox rot_bb = get_extents(rotated);
-            // Reconstruct inflated_bb.min by applying the same pad shift.
             coord_t pad_sc = scaled<coord_t>(ci.pad_px * res);
             double inflated_min_x = unscaled<double>(rot_bb.min.x() - pad_sc);
             double inflated_min_y = unscaled<double>(rot_bb.min.y() - pad_sc);
-            // px = (translation_mm + inflated_bb.min_mm) / res
-            // Use lround, not (int) cast — truncation toward zero
-            // can drift by 1px due to IEEE 754 roundtrip through
-            // scaled/unscaled, leaving ghost bits in the composite.
-            // (Sauron audit 2026-04-12)
-            ci.px = (int)std::lround((tx_mm + inflated_min_x) / res);
-            ci.py = (int)std::lround((ty_mm + inflated_min_y) / res);
+            // Item's world-mm position = tx_mm + inflated_min_x
+            // Compactor px = (world_mm - bed_origin_mm + margin_mm) / res
+            double world_x = tx_mm + inflated_min_x - bed_origin_x_mm + margin_mm;
+            double world_y = ty_mm + inflated_min_y - bed_origin_y_mm + margin_mm;
+            ci.px = (int)std::lround(world_x / res);
+            ci.py = (int)std::lround(world_y / res);
         }
 
         // Build fresh composite from per-part bitmaps.
@@ -1396,17 +1407,22 @@ private:
         }
 
         // ─── Write back to items[].translation ───────────────────
-        // Invert: tx = px*res - inflated_bb.min, where inflated_bb.min
-        // = rot_bb.min - pad_px*res.  Expanding: tx = px*res - rot_bb.min
-        // + pad_px*res.  Equivalently: tx = px*res - rot_bb.min.x() + pad_sc.
+        // Convert from compactor pixel space back to bed-relative
+        // scaled translations.
+        // world_mm = ci.px * res - margin_mm + bed_origin_mm
+        // translation = world_mm - inflated_min_mm
+        //             = ci.px * res - margin_mm + bed_origin_mm
+        //               - (rot_bb.min_mm - pad_mm)
         for (const auto& ci : island.compact_items) {
             std::size_t orig = ci.original_idx;
             ExPolygon rotated = items[orig].poly;
             if (ci.rot != 0.0) rotated.rotate(ci.rot);
             BoundingBox rot_bb = get_extents(rotated);
             coord_t pad_sc = scaled<coord_t>(ci.pad_px * res);
-            coord_t tx = scaled<coord_t>(ci.px * res) - rot_bb.min.x() + pad_sc;
-            coord_t ty = scaled<coord_t>(ci.py * res) - rot_bb.min.y() + pad_sc;
+            double world_x = ci.px * res - margin_mm + bed_origin_x_mm;
+            double world_y = ci.py * res - margin_mm + bed_origin_y_mm;
+            coord_t tx = scaled<coord_t>(world_x) - rot_bb.min.x() + pad_sc;
+            coord_t ty = scaled<coord_t>(world_y) - rot_bb.min.y() + pad_sc;
             items[orig].translation = Vec2crd{tx, ty};
         }
     }
