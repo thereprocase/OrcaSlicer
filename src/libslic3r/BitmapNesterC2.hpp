@@ -116,6 +116,7 @@ struct CompactItem {
     int                   px = 0;      // current pixel position on plate
     int                   py = 0;
     double                rot = 0.0;   // committed rotation
+    int                   pad_px = 0;  // bitmap dilation radius (pixels); 0 = no dilation
 };
 
 struct NesterC2Island {
@@ -462,7 +463,6 @@ private:
     {
         (void)excludes;
         (void)bed;
-        (void)params;
 
         NesterC2Island island;
         if (group.items.empty()) return island;
@@ -570,25 +570,58 @@ private:
 
             // Rot cache: for each rotation, pre-rasterize the rotated
             // shape ONCE. Saves re-rasterizing on every candidate scan.
+            // If min_obj_distance > 0, the bitmap is dilated so adjacent
+            // pixel-touching items maintain the required spacing in polygon
+            // space (mirrors C1's dilate_bitmap approach, no Clipper).
             struct RotCache {
                 double rot;
                 std::vector<uint64_t> bm;
                 int iw = 0;
                 int ih = 0;
                 int iwpr = 0;
-                BoundingBox rot_bb;  // extents of the rotated polygon
+                BoundingBox rot_bb;  // inflated (padded) bbox; equals raw bbox when pad_px == 0
+                int pad_px = 0;      // dilation radius used to produce this bitmap
             };
+
+            // Compute per-item pad from min_obj_distance (same formula as C1).
+            const int item_pad_px = (params.min_obj_distance > 0)
+                ? std::max(1, (int)std::ceil(
+                      unscaled<double>(params.min_obj_distance / 2) / res))
+                : 0;
+
             std::vector<RotCache> rot_cache;
             rot_cache.reserve(rots.size());
             for (double rot : rots) {
                 ExPolygon rotated = base_poly;
                 if (rot != 0.0) rotated.rotate(rot);
-                int iw = 0, ih = 0, iwpr = 0;
-                auto bm = BitmapNester::rasterize(
-                    rotated, res, plate_bw, plate_bh, iw, ih, iwpr);
-                if (bm.empty() || iw <= 0 || ih <= 0) continue;
+                int raw_iw = 0, raw_ih = 0, raw_iwpr = 0;
+                auto raw_bm = BitmapNester::rasterize(
+                    rotated, res, plate_bw, plate_bh, raw_iw, raw_ih, raw_iwpr);
+                if (raw_bm.empty() || raw_iw <= 0 || raw_ih <= 0) continue;
+
+                BoundingBox inflated_bb = get_extents(rotated);
+                int iw = raw_iw, ih = raw_ih, iwpr = raw_iwpr;
+                std::vector<uint64_t> bm;
+                if (item_pad_px > 0) {
+                    iw = raw_iw + 2 * item_pad_px;
+                    ih = raw_ih + 2 * item_pad_px;
+                    if (iw > plate_bw || ih > plate_bh) continue;
+                    iwpr = (iw + 63) / 64;
+                    bm = BitmapNester::dilate_bitmap(
+                        raw_bm, raw_iwpr, raw_iw, raw_ih,
+                        item_pad_px, iwpr, iw, ih);
+                    // Adjust inflated bbox: dilation expands by pad_px pixels
+                    // in every direction, so the bitmap's top-left corner
+                    // represents rot_bb.min - pad_px*res in polygon space.
+                    coord_t pad_sc = scaled<coord_t>(item_pad_px * res);
+                    inflated_bb.min -= Vec2crd(pad_sc, pad_sc);
+                    inflated_bb.max += Vec2crd(pad_sc, pad_sc);
+                } else {
+                    bm = std::move(raw_bm);
+                }
+
                 rot_cache.push_back({rot, std::move(bm), iw, ih, iwpr,
-                                     get_extents(rotated)});
+                                     inflated_bb, item_pad_px});
             }
             if (rot_cache.empty()) continue;
 
@@ -611,8 +644,10 @@ private:
                 occ_max_px = px + rc.iw;
                 occ_max_py = py + rc.ih;
 
-                // Compute mm-space translation: move the rotated
-                // polygon so its bbox min lands at (px*res, py*res) mm.
+                // Compute mm-space translation: move the rotated polygon so
+                // the inflated bitmap's top-left corner lands at (px*res,
+                // py*res) mm.  rot_bb here is already the inflated bbox (min
+                // shifted by -pad_px*res), so the formula is identical to C1.
                 ExPolygon seeded = base_poly;
                 if (rc.rot != 0.0) seeded.rotate(rc.rot);
                 coord_t dx = scaled<coord_t>(px * res) - rc.rot_bb.min.x();
@@ -634,7 +669,8 @@ private:
                 // M4.5: save winning bitmap for trash compactor.
                 island.compact_items.push_back({idx,
                     std::move(rot_cache[0].bm),
-                    rc.iw, rc.ih, rc.iwpr, px, py, rc.rot});
+                    rc.iw, rc.ih, rc.iwpr, px, py, rc.rot,
+                    rc.pad_px});
                 continue;
             }
 
@@ -707,6 +743,9 @@ private:
                         return;
 
                     // Score: hull perimeter delta if committed here.
+                    // rot_bb is the inflated bbox; use it directly for the
+                    // same formula as the commit path so hull points are
+                    // consistent (polygon placed at inflated_bb.min offset).
                     ExPolygon candidate = base_poly;
                     if (rc.rot != 0.0) candidate.rotate(rc.rot);
                     coord_t cdx = scaled<coord_t>(px * res) - rc.rot_bb.min.x();
@@ -852,7 +891,8 @@ private:
             // M4.5: save winning bitmap for trash compactor.
             island.compact_items.push_back({idx,
                 std::move(rot_cache[best_rci].bm),
-                br.iw, br.ih, br.iwpr, best_px, best_py, br.rot});
+                br.iw, br.ih, br.iwpr, best_px, best_py, br.rot,
+                br.pad_px});
         }
 
 #ifndef NDEBUG
@@ -1123,16 +1163,24 @@ private:
             double ty_mm = unscaled<double>(items[orig].translation.y());
             // Find the rotation's bbox offset (the same math used at
             // commit time to derive translation from pixel position).
+            // If pad_px > 0 the committed bitmap was dilated: inflated_bb.min
+            // = rot_bb.min - pad_px*res.  We must use inflated_bb.min to
+            // invert the commit formula: tx = px*res - inflated_bb.min
+            // → px = (tx + inflated_bb.min) / res.
             ExPolygon rotated = items[orig].poly;
             if (ci.rot != 0.0) rotated.rotate(ci.rot);
             BoundingBox rot_bb = get_extents(rotated);
-            // px = (translation_mm + rot_bb.min_mm) / res
+            // Reconstruct inflated_bb.min by applying the same pad shift.
+            coord_t pad_sc = scaled<coord_t>(ci.pad_px * res);
+            double inflated_min_x = unscaled<double>(rot_bb.min.x() - pad_sc);
+            double inflated_min_y = unscaled<double>(rot_bb.min.y() - pad_sc);
+            // px = (translation_mm + inflated_bb.min_mm) / res
             // Use lround, not (int) cast — truncation toward zero
             // can drift by 1px due to IEEE 754 roundtrip through
             // scaled/unscaled, leaving ghost bits in the composite.
             // (Sauron audit 2026-04-12)
-            ci.px = (int)std::lround((tx_mm + unscaled<double>(rot_bb.min.x())) / res);
-            ci.py = (int)std::lround((ty_mm + unscaled<double>(rot_bb.min.y())) / res);
+            ci.px = (int)std::lround((tx_mm + inflated_min_x) / res);
+            ci.py = (int)std::lround((ty_mm + inflated_min_y) / res);
         }
 
         // Build fresh composite from per-part bitmaps.
@@ -1331,13 +1379,17 @@ private:
         }
 
         // ─── Write back to items[].translation ───────────────────
+        // Invert: tx = px*res - inflated_bb.min, where inflated_bb.min
+        // = rot_bb.min - pad_px*res.  Expanding: tx = px*res - rot_bb.min
+        // + pad_px*res.  Equivalently: tx = px*res - rot_bb.min.x() + pad_sc.
         for (const auto& ci : island.compact_items) {
             std::size_t orig = ci.original_idx;
             ExPolygon rotated = items[orig].poly;
             if (ci.rot != 0.0) rotated.rotate(ci.rot);
             BoundingBox rot_bb = get_extents(rotated);
-            coord_t tx = scaled<coord_t>(ci.px * res) - rot_bb.min.x();
-            coord_t ty = scaled<coord_t>(ci.py * res) - rot_bb.min.y();
+            coord_t pad_sc = scaled<coord_t>(ci.pad_px * res);
+            coord_t tx = scaled<coord_t>(ci.px * res) - rot_bb.min.x() + pad_sc;
+            coord_t ty = scaled<coord_t>(ci.py * res) - rot_bb.min.y() + pad_sc;
             items[orig].translation = Vec2crd{tx, ty};
         }
     }

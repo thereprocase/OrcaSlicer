@@ -1763,5 +1763,5 @@ TEST_CASE("S3.5: C2 vs C1 plate count on L-bracket mix",
     // micro-overlaps until min_obj_distance inflation is wired in.
     bool c2_clean = test_utils::no_overlap(c2_items);
     UNSCOPED_INFO("C2 polygon overlap: " << (c2_clean ? "clean" : "micro-overlaps (bitmap quantization)"));
-    // REQUIRE(c2_clean);  // TODO: enable after min_obj_distance inflation
+    REQUIRE(c2_clean);  // Enabled after min_obj_distance inflation (S3.6)
 }
