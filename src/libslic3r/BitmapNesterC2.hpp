@@ -731,6 +731,15 @@ private:
                 int rot_max_px = std::min(plate_bw - rc.iw, search_max_px);
                 int rot_max_py = std::min(plate_bh - rc.ih, search_max_py);
 
+                // Pre-rotate the polygon ONCE per rotation — not per
+                // candidate. The rotation is the same for all (px,py)
+                // within one rci. Only the translation varies.
+                // This eliminates N_candidates rotate() calls per item
+                // (the #1 hot-path cost per Legolas S3.3 review).
+                ExPolygon pre_rotated = base_poly;
+                if (rc.rot != 0.0) pre_rotated.rotate(rc.rot);
+                Points pre_rotated_pts = pre_rotated.contour.points;
+
                 // Shared lambda: evaluate one (px, py) candidate and
                 // update best_* if it improves the hull score.
                 auto eval = [&](int px, int py) {
@@ -742,19 +751,16 @@ private:
                                                rc.iw, rc.ih, px, py))
                         return;
 
-                    // Score: hull perimeter delta if committed here.
-                    // rot_bb is the inflated bbox; use it directly for the
-                    // same formula as the commit path so hull points are
-                    // consistent (polygon placed at inflated_bb.min offset).
-                    ExPolygon candidate = base_poly;
-                    if (rc.rot != 0.0) candidate.rotate(rc.rot);
+                    // Score: hull perimeter delta. Translate the
+                    // pre-rotated contour points (no re-rotation).
                     coord_t cdx = scaled<coord_t>(px * res) - rc.rot_bb.min.x();
                     coord_t cdy = scaled<coord_t>(py * res) - rc.rot_bb.min.y();
-                    candidate.translate(cdx, cdy);
 
-                    Points new_pts = placed_hull_pts;
-                    for (const Point& p : candidate.contour.points)
-                        new_pts.push_back(p);
+                    Points new_pts;
+                    new_pts.reserve(placed_hull_pts.size() + pre_rotated_pts.size());
+                    new_pts = placed_hull_pts;
+                    for (const Point& p : pre_rotated_pts)
+                        new_pts.emplace_back(p.x() + cdx, p.y() + cdy);
                     if (new_pts.size() < 3) return;
                     Polygon new_hull = Geometry::convex_hull(new_pts);
                     if (new_hull.points.size() < 3) return;
@@ -830,6 +836,10 @@ private:
                 const RotCache& rc = rot_cache[best_rci];
                 ref_max_px = std::min(ref_max_px, plate_bw - rc.iw);
                 ref_max_py = std::min(ref_max_py, plate_bh - rc.ih);
+                // Pre-rotate once for refine (same optimization as coarse).
+                ExPolygon ref_rotated = base_poly;
+                if (rc.rot != 0.0) ref_rotated.rotate(rc.rot);
+                Points ref_rot_pts = ref_rotated.contour.points;
                 for (int ry = ref_min_py; ry <= ref_max_py; ++ry) {
                     for (int rx = ref_min_px; rx <= ref_max_px; ++rx) {
                         if (BitmapNester::collides(plate_items, plate_wpr,
@@ -837,14 +847,13 @@ private:
                                                     rc.bm, rc.iwpr,
                                                     rc.iw, rc.ih, rx, ry))
                             continue;
-                        ExPolygon candidate = base_poly;
-                        if (rc.rot != 0.0) candidate.rotate(rc.rot);
                         coord_t cdx = scaled<coord_t>(rx * res) - rc.rot_bb.min.x();
                         coord_t cdy = scaled<coord_t>(ry * res) - rc.rot_bb.min.y();
-                        candidate.translate(cdx, cdy);
-                        Points new_pts = placed_hull_pts;
-                        for (const Point& p : candidate.contour.points)
-                            new_pts.push_back(p);
+                        Points new_pts;
+                        new_pts.reserve(placed_hull_pts.size() + ref_rot_pts.size());
+                        new_pts = placed_hull_pts;
+                        for (const Point& p : ref_rot_pts)
+                            new_pts.emplace_back(p.x() + cdx, p.y() + cdy);
                         if (new_pts.size() < 3) continue;
                         Polygon new_hull = Geometry::convex_hull(new_pts);
                         if (new_hull.points.size() < 3) continue;
@@ -941,14 +950,22 @@ private:
 #endif
 
         // Finalize island metadata. island.bbox is computed from
-        // the accumulated hull vertices — this is the "min/max of
-        // actual placed geometry" form of bbox that the M2.5 bbox
-        // purge directive allows.
+        // the accumulated hull vertices, then expanded by the
+        // inflation padding so locate_island_on_plate's clamp
+        // accounts for the full bitmap footprint (not just the
+        // raw polygon extent).
         if (!placed_hull_pts.empty()) {
             island.bbox = BoundingBox(placed_hull_pts.front(),
                                       placed_hull_pts.front());
             for (const Point& p : placed_hull_pts)
                 island.bbox.merge(p);
+            // Expand by the max pad used during rasterization.
+            coord_t max_pad_sc = 0;
+            for (const auto& ci : island.compact_items)
+                max_pad_sc = std::max(max_pad_sc,
+                    scaled<coord_t>(ci.pad_px * res));
+            island.bbox.min -= Point(max_pad_sc, max_pad_sc);
+            island.bbox.max += Point(max_pad_sc, max_pad_sc);
         }
         island.hull_perimeter_mm = current_hull_perim_mm;
 
