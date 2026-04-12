@@ -1,5 +1,6 @@
 #include "Arrange.hpp"
 #include "BitmapNester.hpp"
+#include "BitmapNesterC2.hpp"
 #include "Print.hpp"
 #include "BoundingBox.hpp"
 #include "libslic3r.h"
@@ -1125,7 +1126,7 @@ static bool try_bitmap_arrange(ArrangePolygons &arrangables,
 {
     if (!params.use_concave_shapes || params.is_seq_print) return false;
 
-    BitmapNester::arrange(arrangables, excludes, bed, params);
+    BitmapNesterC2::arrange(arrangables, excludes, bed, params);
     return true;
 }
 
