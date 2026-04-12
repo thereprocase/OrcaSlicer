@@ -96,6 +96,26 @@ ExPolygon c2_solid_square_mm()
     });
 }
 
+// L-shape with 40x40 bbox and a 20x20 notch cut from the top-right
+// quadrant. Two of these (one at rotation 0, one at rotation 180°)
+// nest perfectly into each other's notches, producing a 40x40
+// combined footprint. The hull-scored C2 path should find this
+// interlock; a naive bbox-scored greedy will stack them side-by-side
+// or stacked, producing a 40x80 or 80x40 cluster — double the
+// expected footprint. This is the Category 6.4 discriminator at
+// its cleanest: known optimal, binary pass/fail.
+ExPolygon c2_l_shape_40_20_mm()
+{
+    return ExPolygon(Points{
+        Point(scaled<coord_t>( 0.0), scaled<coord_t>( 0.0)),
+        Point(scaled<coord_t>(40.0), scaled<coord_t>( 0.0)),
+        Point(scaled<coord_t>(40.0), scaled<coord_t>(20.0)),
+        Point(scaled<coord_t>(20.0), scaled<coord_t>(20.0)),
+        Point(scaled<coord_t>(20.0), scaled<coord_t>(40.0)),
+        Point(scaled<coord_t>( 0.0), scaled<coord_t>(40.0))
+    });
+}
+
 // Notched square: a 40x40 square with a 20x20 rectangular notch cut
 // from the middle of the top edge. The four outermost corners (0,0),
 // (40,0), (40,40), (0,40) are all still on the outline, so the convex
@@ -491,6 +511,85 @@ TEST_CASE("C2 M2.4: forty squares on a tight bed exercises the hull path",
     UNSCOPED_INFO("total cluster hull perimeter = " << total_hull);
     REQUIRE(total_hull >= 160.0);
     REQUIRE(total_hull <= 6400.0);
+}
+
+// ---------------------------------------------------------------------------
+// Category 1.4 from the C2 test corpus: a pair of L-shapes where
+// the optimal packing is the 180°-rotated mate filling the notch.
+//
+// Geometry: each L has a 40x40 bbox with a 20x20 notch at the
+// top-right (silhouette area = 1200 mm²). The TIGHTEST possible
+// combination of two such L-shapes is a 60x40 rectangle formed by
+// placing one at origin and the other rotated 180° and offset so
+// its notch fills the first L's notch complement:
+//
+//        ###                 (second L after 180° rotation, notch
+//        ###                  at bottom-left, sitting in the top-
+//        ######               right of the first L)
+//        ######               (first L, notch at top-right)
+//     ######
+//     ######
+//
+// The combined hull is a 60x40 rectangle with perimeter 200 mm.
+// The non-interlocked "dumb" stacking of two 40x40-bbox L-shapes
+// side by side would be an 80x40 rectangle with perimeter 240 mm.
+// So the discriminator is:
+//
+//   Hull-aware solver: ≈ 200 mm (tight nest)
+//   Bbox-only solver:  ≈ 240 mm (naive stack)
+//
+// This is a BINARY pass/fail discriminator with a ≥ 20% quality
+// gap. Binary clear-signal proof that the solver is doing real
+// concave work. Unlike the 40-square test which only proves M2.3
+// RAN, this test proves concave awareness.
+//
+// Currently runs under the k=1 fast path (2 items on a loose 200x200
+// bed, partition returns k=1, path delegates to C1). C1 is itself
+// concave-aware via silhouette rasterization, so the test passes
+// today as a ratification of C1's behavior. When C2 phases replace
+// more of the delegation, the assertion continues holding and
+// ideally the measured hull perimeter drops toward 200 exactly.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("C2 Cat 1.4: two L-shapes nest via the notch (hull discriminator)",
+          "[BitmapNesterC2][c2-corpus][Cat1.4][c2-m2.4]")
+{
+    ArrangePolygons items;
+    ArrangePolygon a = c2_make_ap(c2_l_shape_40_20_mm());
+    a.allowed_rotations = {0.0, M_PI / 2.0, M_PI, 3.0 * M_PI / 2.0};
+    items.push_back(a);
+    ArrangePolygon b = a;
+    items.push_back(b);
+
+    BoundingBox bed = c2_bed_mm(200, 200);
+    ArrangeParams params = c2_params();
+
+    BitmapNesterC2::arrange(items, ArrangePolygons{}, bed, params);
+
+    REQUIRE(test_utils::max_bed_idx(items) == 0);
+    REQUIRE(test_utils::no_overlap(items));
+
+    double hull_perim = test_utils::cluster_hull_perimeter_mm(items);
+    double bbox_perim = test_utils::cluster_bbox_perimeter_mm(items);
+    UNSCOPED_INFO("hull_perim = " << hull_perim << " mm");
+    UNSCOPED_INFO("bbox_perim = " << bbox_perim << " mm");
+
+    // Hull-aware pass: perimeter should be at most 210 mm (the
+    // optimal 60x40 answer is 200; allow 10 mm for rotation rounding
+    // and rasterization noise at the 0.5 mm bitmap resolution).
+    REQUIRE(hull_perim <= 210.0);
+
+    // Discriminator: the result MUST be measurably better than the
+    // naive bbox stack of 240 mm. A solver that treated both shapes
+    // as their 40x40 bounding boxes would produce an 80x40 cluster
+    // with hull perimeter 240. Our solver lands near 200 because
+    // it sees the concave notches and nests them.
+    REQUIRE(hull_perim < 240.0);
+
+    int placed = 0;
+    for (const auto& it : items)
+        if (it.bed_idx != UNARRANGED) placed++;
+    REQUIRE(placed == 2);
 }
 
 TEST_CASE("C2 M2.4: multi-plate partition preserves determinism",
