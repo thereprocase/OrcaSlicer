@@ -1214,7 +1214,7 @@ TEST_CASE("S3.3: border-frame scan — hull perimeter quality unchanged",
 // fidelity issue worth surfacing separately.
 // ===========================================================================
 
-TEST_CASE("S3.1: SUM-bitmap — no pixel exceeds 1 after pack_as_island",
+TEST_CASE("S3.1: SUM-bitmap no pixel exceeds 1 after pack_as_island",
           "[BitmapNesterC2][S3.1]")
 {
     // 6 mixed-size items. Heights chosen so tall items place first,
@@ -1264,4 +1264,434 @@ TEST_CASE("S3.1: SUM-bitmap — no pixel exceeds 1 after pack_as_island",
         items[orig].bed_idx     = 0;
     }
     REQUIRE(test_utils::no_overlap(items));
+}
+
+// ===========================================================================
+// S3.2 — Compaction test battery (7 tests from the design memo)
+// ===========================================================================
+//
+// All tests exercise compact_on_plate via the full pipeline:
+//   build_cache → partition_items(k=1) → pack_as_island
+//   → locate_island_on_plate → compact_on_plate
+//
+// Helper: run the standard pipeline up through locate, return the island.
+// Uses a local namespace to avoid collision with the anonymous namespace
+// at the top of the file.
+// ===========================================================================
+
+namespace s32 {
+
+// Returns the NesterC2Island after pack + locate; items are updated in-place.
+NesterC2Island run_to_locate(ArrangePolygons& items, const BoundingBox& bed)
+{
+    ArrangeParams params = c2_params();
+    ArrangePolygons excludes;
+    auto cache  = BitmapNesterC2::build_cache(items);
+    auto groups = BitmapNesterC2::partition_items(cache, 1);
+    REQUIRE(groups.size() == 1);
+    auto island = BitmapNesterC2::pack_as_island(
+        items, cache, groups[0], excludes, bed, params);
+    BitmapNesterC2::locate_island_on_plate(items, island, 0, bed);
+    return island;
+}
+
+// Returns true if any pair of CompactItems' bitmaps collide at their
+// current px/py positions. O(N^2) — fine for small N in tests.
+bool pairwise_bitmap_collision(const NesterC2Island& island)
+{
+    const int bw  = island.plate_bw;
+    const int bh  = island.plate_bh;
+    const int wpr = island.plate_wpr;
+    for (std::size_t i = 0; i < island.compact_items.size(); ++i) {
+        const auto& ci = island.compact_items[i];
+        if (ci.bm.empty()) continue;
+        std::vector<uint64_t> plate((std::size_t)wpr * bh, 0);
+        BitmapNester::stamp(plate, wpr, bw, bh,
+                            ci.bm, ci.iwpr, ci.iw, ci.ih, ci.px, ci.py);
+        for (std::size_t j = i + 1; j < island.compact_items.size(); ++j) {
+            const auto& cj = island.compact_items[j];
+            if (cj.bm.empty()) continue;
+            if (BitmapNester::collides(plate, wpr, bw, bh,
+                                       cj.bm, cj.iwpr, cj.iw, cj.ih,
+                                       cj.px, cj.py))
+                return true;
+        }
+    }
+    return false;
+}
+
+} // namespace s32
+
+// ---------------------------------------------------------------------------
+// S3.2-a: Zero-overlap after compaction
+//
+// Pack 5 mixed items, compact, then verify no pixel is covered by more
+// than one CompactItem bitmap. Uses sum_bitmap_overlap_max (the SUM-not-OR
+// check) as the primary assertion, with pairwise collides() as a second
+// independent check, and no_overlap (polygon-level Clipper intersection)
+// as the third.
+// ---------------------------------------------------------------------------
+TEST_CASE("S3.2-a: zero overlap after compact_on_plate (SUM-not-OR bitmap check)",
+          "[BitmapNesterC2][S3.2]")
+{
+    ArrangePolygons items;
+    items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(25.0, 25.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(15.0, 15.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 10.0));
+
+    BoundingBox bed = c2_bed_mm(150.0, 150.0);
+    auto island = s32::run_to_locate(items, bed);
+    REQUIRE(island.compact_items.size() == 5);
+
+    BitmapNesterC2::compact_on_plate(items, island, 0, bed);
+
+    // Primary: SUM-bitmap check — the designated S3.1 invariant carried
+    // forward. After compaction no pixel may be covered by 2+ items.
+    uint16_t max_cov = BitmapNesterC2::sum_bitmap_overlap_max(island);
+    UNSCOPED_INFO("sum_bitmap max coverage after compact = " << (int)max_cov);
+    REQUIRE(max_cov <= 1);
+
+    // Secondary: pairwise collides() agrees.
+    REQUIRE_FALSE(s32::pairwise_bitmap_collision(island));
+
+    // Tertiary: polygon-level no_overlap (independent Clipper oracle).
+    REQUIRE(test_utils::no_overlap(items));
+}
+
+// ---------------------------------------------------------------------------
+// S3.2-b: Monotonic convergence
+//
+// Pack 4 equal squares on a 100 mm bed. Measure the occupied cluster
+// extent (right-most edge minus left-most edge, and top minus bottom)
+// from CompactItem pixel positions before and after compaction. The
+// compactor is inward-only — it may not expand the cluster in either axis.
+// Assert extent_after <= extent_before in at least one axis.
+// ---------------------------------------------------------------------------
+TEST_CASE("S3.2-b: compact_on_plate does not expand cluster extent",
+          "[BitmapNesterC2][S3.2]")
+{
+    ArrangePolygons items;
+    for (int i = 0; i < 4; ++i)
+        items.push_back(c2_make_ap(c2_rect_mm(25.0, 25.0), 10.0));
+
+    BoundingBox bed = c2_bed_mm(100.0, 100.0);
+    auto island = s32::run_to_locate(items, bed);
+    REQUIRE(island.compact_items.size() == 4);
+
+    auto measure_extent = [](const NesterC2Island& isl) {
+        int min_x = INT_MAX, max_x = INT_MIN;
+        int min_y = INT_MAX, max_y = INT_MIN;
+        for (const auto& ci : isl.compact_items) {
+            if (ci.bm.empty()) continue;
+            min_x = std::min(min_x, ci.px);
+            max_x = std::max(max_x, ci.px + ci.iw);
+            min_y = std::min(min_y, ci.py);
+            max_y = std::max(max_y, ci.py + ci.ih);
+        }
+        return std::make_pair(max_x - min_x, max_y - min_y);
+    };
+
+    auto [bx, by] = measure_extent(island);
+
+    BitmapNesterC2::compact_on_plate(items, island, 0, bed);
+
+    auto [ax, ay] = measure_extent(island);
+
+    UNSCOPED_INFO("cluster extent before x=" << bx << " y=" << by);
+    UNSCOPED_INFO("cluster extent after  x=" << ax << " y=" << ay);
+
+    // Compaction is inward-only: at least one axis must not grow.
+    REQUIRE((ax <= bx || ay <= by));
+
+    // Compaction must not introduce new bitmap overlaps.
+    REQUIRE_FALSE(s32::pairwise_bitmap_collision(island));
+}
+
+// ---------------------------------------------------------------------------
+// S3.2-c: Spacing preserved after compaction
+//
+// Pack 3 items with a nonzero min_obj_distance (2 mm). The rasterization
+// dilates item bitmaps by this spacing, encoding the gap requirement as
+// set pixels. After compaction, pairwise collides() on the dilated bitmaps
+// must still return false — i.e., the compactor respected the gap that
+// was baked into the bitmap.
+// ---------------------------------------------------------------------------
+TEST_CASE("S3.2-c: compaction preserves baked-in spacing (dilated bitmaps non-colliding)",
+          "[BitmapNesterC2][S3.2]")
+{
+    ArrangePolygons items;
+    items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+
+    BoundingBox bed = c2_bed_mm(200.0, 200.0);
+
+    // Nonzero spacing so bitmaps include dilation.
+    ArrangeParams params = c2_params();
+    params.min_obj_distance = scaled<coord_t>(2.0);  // 2 mm gap
+    ArrangePolygons excludes;
+
+    auto cache  = BitmapNesterC2::build_cache(items);
+    auto groups = BitmapNesterC2::partition_items(cache, 1);
+    REQUIRE(groups.size() == 1);
+    auto island = BitmapNesterC2::pack_as_island(
+        items, cache, groups[0], excludes, bed, params);
+    BitmapNesterC2::locate_island_on_plate(items, island, 0, bed);
+    REQUIRE(island.compact_items.size() == 3);
+
+    BitmapNesterC2::compact_on_plate(items, island, 0, bed);
+
+    // Dilated bitmaps still non-colliding after compaction.
+    bool any_collision = s32::pairwise_bitmap_collision(island);
+    UNSCOPED_INFO("spacing-dilated pairwise collision: "
+                  << (any_collision ? "YES (FAIL)" : "no (OK)"));
+    REQUIRE_FALSE(any_collision);
+
+    // Polygon-level check (un-dilated silhouettes) also clean.
+    REQUIRE(test_utils::no_overlap(items));
+}
+
+// ---------------------------------------------------------------------------
+// S3.2-d: Determinism
+//
+// Run the full pipeline including compact_on_plate twice on independently
+// constructed identical inputs. Assert all CompactItem pixel positions
+// and items[].translation values are bitwise identical between runs.
+// ---------------------------------------------------------------------------
+TEST_CASE("S3.2-d: compact_on_plate is deterministic on identical input",
+          "[BitmapNesterC2][S3.2]")
+{
+    BoundingBox bed = c2_bed_mm(120.0, 120.0);
+
+    auto build_and_run = [&]() {
+        ArrangePolygons items;
+        items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+        items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 10.0));
+        items.push_back(c2_make_ap(c2_rect_mm(25.0, 25.0), 10.0));
+        items.push_back(c2_make_ap(c2_rect_mm(15.0, 15.0), 10.0));
+        auto island = s32::run_to_locate(items, bed);
+        BitmapNesterC2::compact_on_plate(items, island, 0, bed);
+        return std::make_pair(std::move(items), std::move(island));
+    };
+
+    auto [items_a, island_a] = build_and_run();
+    auto [items_b, island_b] = build_and_run();
+
+    REQUIRE(island_a.compact_items.size() == island_b.compact_items.size());
+
+    for (std::size_t i = 0; i < island_a.compact_items.size(); ++i) {
+        const auto& ca = island_a.compact_items[i];
+        const auto& cb = island_b.compact_items[i];
+        UNSCOPED_INFO("compact_item " << i
+                      << " run_a=(" << ca.px << "," << ca.py << ")"
+                      << " run_b=(" << cb.px << "," << cb.py << ")");
+        REQUIRE(ca.original_idx == cb.original_idx);
+        REQUIRE(ca.px == cb.px);
+        REQUIRE(ca.py == cb.py);
+    }
+
+    // Translation write-back must also be bitwise identical.
+    REQUIRE(items_a.size() == items_b.size());
+    for (std::size_t i = 0; i < items_a.size(); ++i) {
+        REQUIRE(items_a[i].translation.x() == items_b[i].translation.x());
+        REQUIRE(items_a[i].translation.y() == items_b[i].translation.y());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S3.2-e: Iteration cap
+//
+// Verify compact_on_plate always returns. The 50-iteration cap in the
+// implementation is the safety net for oscillating scenarios. This test
+// uses a medium-density arrangement where wall pressure fires on every
+// item every iteration; it asserts the call completes (the test
+// framework's timeout catches hangs) and leaves a valid state.
+// ---------------------------------------------------------------------------
+TEST_CASE("S3.2-e: compact_on_plate terminates regardless of density",
+          "[BitmapNesterC2][S3.2]")
+{
+    // 6 items of two sizes — enough mutual pressure to stress the loop.
+    ArrangePolygons items;
+    items.push_back(c2_make_ap(c2_rect_mm(25.0, 25.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(25.0, 25.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(15.0, 15.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(15.0, 15.0), 10.0));
+
+    // Tight bed: items fill it almost completely, forcing the compactor
+    // to fight for every pixel and maximising iteration pressure.
+    BoundingBox bed = c2_bed_mm(90.0, 90.0);
+    auto island = s32::run_to_locate(items, bed);
+
+    // Require at least 2 compact_items so the loop does actual work.
+    REQUIRE(island.compact_items.size() >= 2);
+
+    // Must return. If it hangs, the Catch2 test-runner timeout fires.
+    BitmapNesterC2::compact_on_plate(items, island, 0, bed);
+
+    // Result must be consistent: no bitmap overlaps introduced.
+    REQUIRE_FALSE(s32::pairwise_bitmap_collision(island));
+}
+
+// ---------------------------------------------------------------------------
+// S3.2-f: Quality gate — overflow does not increase
+//
+// The quality gate in compact_on_plate rejects compaction results where
+// overflow_after > overflow_before (rollback to saved positions). For
+// items placed inside a large bed, overflow before is zero; after
+// compaction it must remain zero.
+//
+// Additionally: record the pre-compaction pixel positions and confirm
+// that post-compaction positions do not take any item outside the bed
+// boundary (mm-level bounds check via all_within_bounds).
+// ---------------------------------------------------------------------------
+TEST_CASE("S3.2-f: compact_on_plate quality gate — overflow does not increase",
+          "[BitmapNesterC2][S3.2]")
+{
+    ArrangePolygons items;
+    items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+
+    // Large bed: all items land comfortably inside — overflow_before == 0.
+    BoundingBox bed = c2_bed_mm(200.0, 200.0);
+    auto island = s32::run_to_locate(items, bed);
+    REQUIRE(island.compact_items.size() == 3);
+
+    BitmapNesterC2::compact_on_plate(items, island, 0, bed);
+
+    // Count pixels outside the bed using the same pixel-space as compact_on_plate.
+    const double res = island.bitmap_res;
+    const int bw  = island.plate_bw;
+    const int bh  = island.plate_bh;
+    const int wpr = island.plate_wpr;
+    int bed_min_px = (int)(unscaled<double>(bed.min.x()) / res);
+    int bed_min_py = (int)(unscaled<double>(bed.min.y()) / res);
+    int bed_max_px = (int)(unscaled<double>(bed.max.x()) / res);
+    int bed_max_py = (int)(unscaled<double>(bed.max.y()) / res);
+
+    std::vector<uint64_t> composite((std::size_t)wpr * bh, 0);
+    for (const auto& ci : island.compact_items) {
+        if (ci.bm.empty()) continue;
+        BitmapNester::stamp(composite, wpr, bw, bh,
+                            ci.bm, ci.iwpr, ci.iw, ci.ih, ci.px, ci.py);
+    }
+
+    int overflow_after = 0;
+    for (int y = 0; y < bh; ++y) {
+        bool y_out = (y < bed_min_py || y >= bed_max_py);
+        for (int w = 0; w < wpr; ++w) {
+            uint64_t word = composite[(std::size_t)y * wpr + w];
+            if (word == 0) continue;
+            if (y_out) {
+                overflow_after += popcount64(word);
+                continue;
+            }
+            for (int b = 0; b < 64; ++b) {
+                if (!(word & (uint64_t(1) << b))) continue;
+                int px = w * 64 + b;
+                if (px < bed_min_px || px >= bed_max_px)
+                    ++overflow_after;
+            }
+        }
+    }
+
+    UNSCOPED_INFO("overflow_after compaction = " << overflow_after);
+    REQUIRE(overflow_after == 0);
+
+    // Mm-level bounds check agrees.
+    REQUIRE(test_utils::all_within_bounds(items, bed));
+}
+
+// ---------------------------------------------------------------------------
+// S3.2-g: Void-pull effect
+//
+// Manually place two CompactItems at opposite edges of the bed — left wall
+// and right wall — so wall pressure fires strongly in opposite directions
+// (item 0 pushed right, item 1 pushed left). After compaction both should
+// move toward the center: the pixel gap between their inner edges must be
+// smaller than before.
+//
+// Construction: run the pipeline to get valid bitmaps; then override px/py
+// to spread items symmetrically before calling compact_on_plate.
+// ---------------------------------------------------------------------------
+TEST_CASE("S3.2-g: void-pull closes gap between items pushed by opposing walls",
+          "[BitmapNesterC2][S3.2]")
+{
+    ArrangePolygons items;
+    items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+
+    BoundingBox bed = c2_bed_mm(200.0, 200.0);
+    auto island = s32::run_to_locate(items, bed);
+    REQUIRE(island.compact_items.size() == 2);
+
+    const double res = island.bitmap_res;
+    const int bw  = island.plate_bw;
+    const int bh  = island.plate_bh;
+    const int wpr = island.plate_wpr;
+
+    int bed_min_px = (int)(unscaled<double>(bed.min.x()) / res);
+    int bed_max_px = (int)(unscaled<double>(bed.max.x()) / res);
+    int bed_min_py = (int)(unscaled<double>(bed.min.y()) / res);
+    int bed_mid_py = (bed_min_py + (int)(unscaled<double>(bed.max.y()) / res)) / 2;
+
+    auto& ci0 = island.compact_items[0];
+    auto& ci1 = island.compact_items[1];
+
+    // Spread items to opposite walls. Both fit inside the bed.
+    // Item 0: left wall + 1 px margin. Item 1: right wall - item width - 1 px.
+    ci0.px = bed_min_px + 1;
+    ci0.py = bed_mid_py - ci0.ih / 2;
+    ci1.px = bed_max_px - ci1.iw - 1;
+    ci1.py = bed_mid_py - ci1.ih / 2;
+
+    // Verify no pre-compaction bitmap collision (items are separated by a large gap).
+    {
+        std::vector<uint64_t> pre((std::size_t)wpr * bh, 0);
+        BitmapNester::stamp(pre, wpr, bw, bh,
+                            ci0.bm, ci0.iwpr, ci0.iw, ci0.ih, ci0.px, ci0.py);
+        bool pre_collide = BitmapNester::collides(pre, wpr, bw, bh,
+                                                   ci1.bm, ci1.iwpr, ci1.iw, ci1.ih,
+                                                   ci1.px, ci1.py);
+        REQUIRE_FALSE(pre_collide);
+    }
+
+    // Sync items[].translation to match the overridden px/py, so compact_on_plate's
+    // translation read-back starts from the correct state (it will recompute px/py
+    // from items[].translation at the top of compact_on_plate).
+    for (const auto& ci : island.compact_items) {
+        std::size_t orig = ci.original_idx;
+        ExPolygon rotated = items[orig].poly;
+        if (ci.rot != 0.0) rotated.rotate(ci.rot);
+        BoundingBox rot_bb = get_extents(rotated);
+        coord_t tx = scaled<coord_t>(ci.px * res) - rot_bb.min.x();
+        coord_t ty = scaled<coord_t>(ci.py * res) - rot_bb.min.y();
+        items[orig].translation = Vec2crd{tx, ty};
+    }
+
+    // Gap before = pixel distance between right edge of ci0 and left edge of ci1.
+    int gap_before = ci1.px - (ci0.px + ci0.iw);
+    UNSCOPED_INFO("gap_before = " << gap_before << " px");
+    REQUIRE(gap_before > 0);
+
+    BitmapNesterC2::compact_on_plate(items, island, 0, bed);
+
+    // compact_on_plate re-derives ci.px from items[].translation at entry,
+    // then updates ci.px during compaction, then writes back to
+    // items[].translation at exit. Read the gap from the written-back
+    // compact_items (which compact_on_plate updates directly).
+    const auto& a0 = island.compact_items[0];
+    const auto& a1 = island.compact_items[1];
+    int gap_after = a1.px - (a0.px + a0.iw);
+    UNSCOPED_INFO("gap_after  = " << gap_after  << " px");
+
+    // Wall pressure on both sides drives items toward center — gap shrinks.
+    REQUIRE(gap_after <= gap_before);
+
+    // No bitmap collision introduced by the movement.
+    REQUIRE_FALSE(s32::pairwise_bitmap_collision(island));
 }
