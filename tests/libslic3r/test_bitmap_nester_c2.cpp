@@ -1074,7 +1074,7 @@ TEST_CASE("C2 M4.5: compact_on_plate reduces pixel overflow",
     REQUIRE(true);
 
     // Render PPM for visual inspection.
-    test_utils::dump_placement_ascii(items, bed, "c2_m4.5_compact.txt");
+    test_utils::dump_placement_png(items, bed, "c2_m4.5_compact.png");
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1105,14 +1105,14 @@ TEST_CASE("C2 visual: 5 mixed squares, tall-grouped",
     BitmapNesterC2::locate_island_on_plate(items, island, 0, bed);
 
     // Render before compaction.
-    test_utils::dump_placement_ascii(items, bed,
-                                    "c2_visual_mixed_before_compact.txt");
+    test_utils::dump_placement_png(items, bed,
+                                   "c2_visual_mixed_before_compact.png");
 
     BitmapNesterC2::compact_on_plate(items, island, 0, bed);
 
     // Render after compaction.
-    test_utils::dump_placement_ascii(items, bed,
-                                    "c2_visual_mixed_after_compact.txt");
+    test_utils::dump_placement_png(items, bed,
+                                   "c2_visual_mixed_after_compact.png");
 
     // All items placed.
     for (const auto& ap : items)
@@ -1142,8 +1142,8 @@ TEST_CASE("C2 visual: L-shapes interlock",
     BitmapNesterC2::locate_island_on_plate(items, island, 0, bed);
     BitmapNesterC2::compact_on_plate(items, island, 0, bed);
 
-    test_utils::dump_placement_ascii(items, bed,
-                                    "c2_visual_l_shapes.txt");
+    test_utils::dump_placement_png(items, bed,
+                                    "c2_visual_l_shapes.png");
 
     for (const auto& ap : items)
         REQUIRE(ap.bed_idx == 0);

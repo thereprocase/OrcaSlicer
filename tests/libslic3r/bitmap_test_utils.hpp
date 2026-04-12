@@ -16,6 +16,8 @@
 #include <cmath>
 #include <algorithm>
 
+#include "stb_image_write.h"
+
 namespace Slic3r { namespace arrangement { namespace test_utils {
 
 // ─── Quality metrics adopted by the Three Seers vote 2026-04-11 ────
@@ -338,6 +340,89 @@ inline bool no_overlap(const ArrangePolygons &items)
         }
     }
     return true;
+}
+
+// ─── Visual render: dump placement to PNG ────────────────────────
+//
+// Renders placed items onto a bed-sized canvas as a PNG. Each item
+// gets a distinct color. Bed boundary in gray. Overlap in red.
+// Auto-crops to occupied region ± margin. Output is ~5-20KB — cheap
+// enough for Claude to view inline via the Read tool.
+//
+// Requires stb_image_write.h (single-header, test-only dependency).
+
+// 8-bit grayscale PNG with multiplicative darken compositing.
+// Each part renders as mid-gray (128). Overlapping parts multiply:
+//   1 part  = 128 (mid-gray)
+//   2 parts = 128 * 128/255 ≈ 64 (dark gray)
+//   3 parts = ~32 (nearly black)
+// White = empty. Light gray border = bed edge.
+// Overlap is immediately visible as darkening — no ambiguity.
+//
+// 4× oversampling of 0.5mm bitmap resolution per Nyquist.
+// 200mm bed = 800×800 px, ~15KB as 8-bit grayscale PNG.
+inline void dump_placement_png(const ArrangePolygons& items,
+                                const BoundingBox& bed,
+                                const std::string& filename,
+                                double px_per_mm = 4.0)
+{
+    double bed_w = unscaled<double>(bed.size().x());
+    double bed_h = unscaled<double>(bed.size().y());
+    int img_w = (int)(bed_w * px_per_mm) + 2;
+    int img_h = (int)(bed_h * px_per_mm) + 2;
+    if (img_w <= 0 || img_h <= 0 || img_w > 2048 || img_h > 2048) return;
+
+    // Canvas: white (255).
+    std::vector<uint8_t> gray((std::size_t)img_w * img_h, 255);
+
+    // Bed boundary: light gray.
+    for (int x = 0; x < img_w; ++x) {
+        gray[x] = 200;
+        gray[(std::size_t)(img_h - 1) * img_w + x] = 200;
+    }
+    for (int y = 0; y < img_h; ++y) {
+        gray[(std::size_t)y * img_w] = 200;
+        gray[(std::size_t)y * img_w + img_w - 1] = 200;
+    }
+
+    double bed_min_x = unscaled<double>(bed.min.x());
+    double bed_min_y = unscaled<double>(bed.min.y());
+
+    // Part gray level: 128 (mid-gray). Each layer multiplies.
+    constexpr uint8_t PART_GRAY = 128;
+
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (items[i].bed_idx == UNARRANGED) continue;
+        ExPolygon poly = items[i].poly;
+        if (items[i].rotation != 0.0) poly.rotate(items[i].rotation);
+        poly.translate(items[i].translation.x(), items[i].translation.y());
+
+        BoundingBox pbb = get_extents(poly);
+        int px_min = (int)((unscaled<double>(pbb.min.x()) - bed_min_x) * px_per_mm);
+        int px_max = (int)((unscaled<double>(pbb.max.x()) - bed_min_x) * px_per_mm);
+        int py_min = (int)((unscaled<double>(pbb.min.y()) - bed_min_y) * px_per_mm);
+        int py_max = (int)((unscaled<double>(pbb.max.y()) - bed_min_y) * px_per_mm);
+
+        for (int py = py_min; py <= py_max; ++py) {
+            for (int px = px_min; px <= px_max; ++px) {
+                int ix = px + 1;
+                int iy = py + 1;
+                if (ix < 0 || ix >= img_w || iy < 0 || iy >= img_h) continue;
+                double wx = bed_min_x + (px + 0.5) / px_per_mm;
+                double wy = bed_min_y + (py + 0.5) / px_per_mm;
+                Point pt(scaled<coord_t>(wx), scaled<coord_t>(wy));
+                if (poly.contains(pt)) {
+                    // Flip Y for image coordinates.
+                    int fy = img_h - 1 - iy;
+                    std::size_t off = (std::size_t)fy * img_w + ix;
+                    // Multiplicative darken: new = old * PART_GRAY / 255
+                    gray[off] = (uint8_t)((uint16_t)gray[off] * PART_GRAY / 255);
+                }
+            }
+        }
+    }
+
+    stbi_write_png(filename.c_str(), img_w, img_h, 1, gray.data(), img_w);
 }
 
 // ─── Visual render: dump placement to ASCII art ──────────────────
