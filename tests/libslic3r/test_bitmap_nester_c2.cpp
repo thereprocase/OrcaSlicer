@@ -427,3 +427,98 @@ TEST_CASE("Category 6.4: identical convex hulls produce different packings",
     // scoring.
     REQUIRE((bbox_delta > 0.05 || hull_delta > 0.05));
 }
+
+// ===========================================================================
+// M2.4 — Tests that actually exercise M2.3's hull-scored inner loop
+// ===========================================================================
+//
+// Every prior C2 test takes the k=1 fast path (single-group input ->
+// delegate to BitmapNester::arrange). The M2.3 hull-scored inner loop
+// only runs when estimate_min_plates returns k >= 2. These tests force
+// k >= 2 and assert that the hull-scored path produces valid output.
+
+TEST_CASE("C2 M2.4: forty squares on a tight bed exercises the hull path",
+          "[BitmapNesterC2][c2-m2-hull][c2-m2.4]")
+{
+    // 40 × 40x40 squares = 64000 mm² on a 200x200 = 40000 mm² bed.
+    // 160% density — clearly needs 2 plates under any algorithm.
+    // estimate_min_plates: ceil(64000 / (40000 * 0.82)) = ceil(1.95) = 2
+    // => partition_items produces k=2 => M2.3 runs on each group.
+    ArrangePolygons items;
+    for (int i = 0; i < 40; ++i)
+        items.push_back(c2_make_ap(c2_rect_mm(40, 40)));
+
+    BoundingBox bed = c2_bed_mm(200, 200);
+    ArrangeParams params = c2_params();
+
+    BitmapNesterC2::arrange(items, ArrangePolygons{}, bed, params);
+
+    // Count outcomes per bed_idx.
+    std::map<int, int> per_bed;
+    int unarranged = 0;
+    for (const auto& it : items) {
+        if (it.bed_idx == UNARRANGED) unarranged++;
+        else per_bed[it.bed_idx]++;
+    }
+
+    UNSCOPED_INFO("unarranged = " << unarranged);
+    for (const auto& kv : per_bed)
+        UNSCOPED_INFO("bed " << kv.first << ": " << kv.second << " items");
+
+    // Primary assertion: M2.3 produced a multi-plate partition. This
+    // verifies the hull-scored path ran at all.
+    REQUIRE(per_bed.size() >= 2);
+
+    // Secondary: most items should be placed. M2.3 may leave some
+    // items UNARRANGED if the coarse grid scan can't find a clear
+    // position — that's documented behavior, and M3's spillover
+    // recovery will handle them. For now we just assert that the
+    // fraction placed is at least 80%.
+    int placed = 0;
+    for (const auto& kv : per_bed) placed += kv.second;
+    REQUIRE(placed >= 32);  // 80% of 40
+
+    // Tertiary: no overlaps within any plate.
+    REQUIRE(test_utils::no_overlap(items));
+
+    // Quaternary: hull perimeter on each plate is at least the lower
+    // bound set by the number of squares times their perimeter
+    // contribution. Each square has perimeter 4*40 = 160 mm, and the
+    // cluster hull is at most the sum of perimeters and at least the
+    // perimeter of one square (for a single-item cluster). So we
+    // expect per-plate hull perimeter between 160 and 6400 mm.
+    double total_hull = test_utils::cluster_hull_perimeter_mm(items);
+    UNSCOPED_INFO("total cluster hull perimeter = " << total_hull);
+    REQUIRE(total_hull >= 160.0);
+    REQUIRE(total_hull <= 6400.0);
+}
+
+TEST_CASE("C2 M2.4: multi-plate partition preserves determinism",
+          "[BitmapNesterC2][c2-m2-hull][c2-m2.4][BitmapDeterminism]")
+{
+    // Same input as above — byte-identical second run.
+    auto build = []() {
+        ArrangePolygons xs;
+        for (int i = 0; i < 40; ++i)
+            xs.push_back(c2_make_ap(c2_rect_mm(40, 40)));
+        return xs;
+    };
+    BoundingBox bed = c2_bed_mm(200, 200);
+    ArrangeParams params = c2_params();
+    auto run = [&](ArrangePolygons& xs) {
+        BitmapNesterC2::arrange(xs, ArrangePolygons{}, bed, params);
+    };
+
+    ArrangePolygons a = build();
+    ArrangePolygons b = build();
+    run(a);
+    run(b);
+
+    REQUIRE(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        REQUIRE(a[i].bed_idx == b[i].bed_idx);
+        REQUIRE(a[i].translation.x() == b[i].translation.x());
+        REQUIRE(a[i].translation.y() == b[i].translation.y());
+        REQUIRE(std::abs(a[i].rotation - b[i].rotation) < 1e-9);
+    }
+}
