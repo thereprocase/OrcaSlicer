@@ -660,6 +660,47 @@ private:
 
             if (best_rci < 0) continue;  // unplaceable — M3 spillover will retry
 
+            // Refine pass: 1px stride in a window around the coarse
+            // winner. The coarse stride can miss the exact interlock
+            // position by up to stride pixels; the refine pass finds
+            // the pixel-perfect optimum. Window: ±stride in each axis.
+            {
+                int ref_min_px = std::max(0, best_px - stride);
+                int ref_min_py = std::max(0, best_py - stride);
+                int ref_max_px = std::min(plate_bw - 1, best_px + stride);
+                int ref_max_py = std::min(plate_bh - 1, best_py + stride);
+                const RotCache& rc = rot_cache[best_rci];
+                ref_max_px = std::min(ref_max_px, plate_bw - rc.iw);
+                ref_max_py = std::min(ref_max_py, plate_bh - rc.ih);
+                for (int ry = ref_min_py; ry <= ref_max_py; ++ry) {
+                    for (int rx = ref_min_px; rx <= ref_max_px; ++rx) {
+                        if (BitmapNester::collides(plate_items, plate_wpr,
+                                                    plate_bw, plate_bh,
+                                                    rc.bm, rc.iwpr,
+                                                    rc.iw, rc.ih, rx, ry))
+                            continue;
+                        ExPolygon candidate = base_poly;
+                        if (rc.rot != 0.0) candidate.rotate(rc.rot);
+                        coord_t cdx = scaled<coord_t>(rx * res) - rc.rot_bb.min.x();
+                        coord_t cdy = scaled<coord_t>(ry * res) - rc.rot_bb.min.y();
+                        candidate.translate(cdx, cdy);
+                        Points new_pts = placed_hull_pts;
+                        for (const Point& p : candidate.contour.points)
+                            new_pts.push_back(p);
+                        if (new_pts.size() < 3) continue;
+                        Polygon new_hull = Geometry::convex_hull(new_pts);
+                        if (new_hull.points.size() < 3) continue;
+                        double new_perim = unscaled<double>(new_hull.length());
+                        double delta = new_perim - current_hull_perim_mm;
+                        if (delta < best_score) {
+                            best_score = delta;
+                            best_px    = rx;
+                            best_py    = ry;
+                        }
+                    }
+                }
+            }
+
             // Commit: stamp the bitmap, update hull state, update
             // running extent, record on the island.
             const RotCache& br = rot_cache[best_rci];
