@@ -20,6 +20,7 @@
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Arrange.hpp"
 #include "libslic3r/BitmapNester.hpp"
+#include "libslic3r/BitmapNesterC2.hpp"
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/Geometry/ConvexHull.hpp"
@@ -270,4 +271,70 @@ TEST_CASE("real mix: pressure pack on 200x200 plate",
 
     ArrangePolygons rerun = build_input();
     REQUIRE(test_utils::deterministic_rerun(rerun, run));
+}
+
+// ---------------------------------------------------------------------------
+// C2 vs C1 A/B on the same real-mix fixtures.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("real mix: C2 vs C1 on OBJ fixtures (256x256)",
+          "[BitmapNesterC2][real-mix][S3.8]")
+{
+    struct Entry { const char *name; int copies; };
+    const Entry entries[] = {
+        {"ipadstand.obj",            4},
+        {"extruder_idler.obj",       4},
+        {"frog_legs.obj",            3},
+        {"cube_with_concave_hole.obj", 6},
+        {"small_dorito.obj",         6},
+    };
+
+    std::vector<ExPolygon> shapes;
+    std::vector<int>       copy_counts;
+    for (const auto &e : entries) {
+        ExPolygon fp = load_fixture_footprint(e.name);
+        if (fp.contour.points.empty()) {
+            WARN("C2 real mix: fixture not loadable: " << e.name);
+            return;
+        }
+        shapes.push_back(std::move(fp));
+        copy_counts.push_back(e.copies);
+    }
+
+    auto build_input = [&]() {
+        ArrangePolygons xs;
+        for (size_t i = 0; i < shapes.size(); ++i)
+            for (int c = 0; c < copy_counts[i]; ++c)
+                xs.push_back(make_ap(shapes[i]));
+        scatter(xs, 0xD1CE0A11u, 400.0);
+        return xs;
+    };
+
+    BoundingBox bed = make_bed_mm(256.0, 256.0);
+    ArrangeParams params = benchmark_params();
+
+    // C1
+    ArrangePolygons c1 = build_input();
+    BitmapNester::arrange(c1, ArrangePolygons{}, bed, params);
+    int c1_plates = test_utils::max_bed_idx(c1) + 1;
+    int c1_overflow = test_utils::overflow_piece_count(c1);
+
+    // C2
+    ArrangePolygons c2 = build_input();
+    BitmapNesterC2::arrange(c2, ArrangePolygons{}, bed, params);
+    int c2_plates = test_utils::max_bed_idx(c2) + 1;
+    int c2_overflow = test_utils::overflow_piece_count(c2);
+
+    UNSCOPED_INFO("=== Real Mix A/B: OBJ fixtures on 256x256 ===");
+    UNSCOPED_INFO("C1: " << c1_plates << " plates, "
+                  << c1_overflow << " overflow");
+    UNSCOPED_INFO("C2: " << c2_plates << " plates, "
+                  << c2_overflow << " overflow");
+
+    // Render both.
+    test_utils::dump_placement_png(c1, bed, "c2_ab_real_c1.png");
+    test_utils::dump_placement_png(c2, bed, "c2_ab_real_c2.png");
+
+    // C2 must not use more plates than C1.
+    REQUIRE(c2_plates <= c1_plates);
 }
