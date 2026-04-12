@@ -34,7 +34,24 @@
 
 namespace Slic3r { namespace arrangement {
 
+// Forward declaration to enable the friend declaration below.
+// BitmapNesterC2 needs access to rasterize/collides/stamp as the
+// bitmap narrow phase for its own pack_as_island — added on the
+// feature/concave-bitmap-c2 branch for M2.5.3. Pure compile-time
+// grant; no runtime impact on C1.
+class BitmapNesterC2;
+
 class BitmapNester {
+    // M2.5.2: BitmapNesterC2 is the C2 fork's packer. It reuses
+    // the bitmap primitives (rasterize, collides, stamp) for its
+    // own collision detection so it doesn't depend on the
+    // heavyweight polygon-intersection path. Friend access is the
+    // minimally-invasive way to expose those primitives without
+    // making them public or touching the #ifdef BITMAP_NESTER_TESTING
+    // gate that tests use. Added on feature/concave-bitmap-c2
+    // 2026-04-11 — not cherry-picked back to C1.
+    friend class BitmapNesterC2;
+
 public:
     static void arrange(ArrangePolygons &items,
                         const ArrangePolygons &excludes,
