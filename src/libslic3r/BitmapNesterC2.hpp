@@ -377,11 +377,44 @@ private:
                       return ia.priority_score > ib.priority_score;
                   });
 
-        // Placed polygons in local (island) coordinates.
-        ExPolygons               placed_polys;
-        std::vector<BoundingBox> placed_bboxes;  // cached for pre-reject
-        Points                   placed_hull_pts;
-        double                   current_hull_perim_mm = 0.0;
+        // ─── Virtual plate for bitmap AND collision detection ─────
+        //
+        // We maintain a local bitmap that grows as items commit.
+        // Per the M2.5 bbox-purge directive, this replaces the
+        // Clipper intersection_ex path and its AABB pre-reject.
+        // Bitmap AND is nanoseconds per check — cheaper than any
+        // polygon-based narrow phase.
+        //
+        // Plate size: 2048×2048 px at 0.5 mm/pixel = 1024×1024 mm
+        // in world. Generous enough for any realistic island; costs
+        // 512 KB of allocation per call which is acceptable.
+        const double res = 0.5;  // mm per pixel
+        const int plate_bw  = 2048;
+        const int plate_bh  = 2048;
+        const int plate_wpr = (plate_bw + 63) / 64;
+        std::vector<uint64_t> plate_items(
+            (std::size_t)plate_wpr * plate_bh, 0);
+
+        // Seed position: plate center. First item's bitmap gets
+        // stamped so its center is near (seed_cx, seed_cy) and the
+        // cluster can grow outward in any direction.
+        const int seed_cx = plate_bw / 2;
+        const int seed_cy = plate_bh / 2;
+
+        // Running extent of the set bits on the plate. Initial
+        // "empty" state uses sentinels that will be replaced on
+        // the first commit.
+        int occ_min_px = plate_bw;
+        int occ_min_py = plate_bh;
+        int occ_max_px = 0;
+        int occ_max_py = 0;
+
+        // Hull scoring state — accumulates vertices in world-mm
+        // coordinates as items commit. Computed once per commit;
+        // the scoring loop builds a temporary "new_pts" per
+        // candidate for delta computation.
+        Points placed_hull_pts;
+        double current_hull_perim_mm = 0.0;
 
         for (std::size_t idx : order) {
             const ArrangePolygon& ap = items_in[idx];
@@ -390,16 +423,50 @@ private:
             std::vector<double> rots = rots_raw;
             if (rots.empty()) rots.push_back(0.0);
 
-            // First item: seed at origin, rotation 0.
-            if (placed_polys.empty()) {
+            // Rot cache: for each rotation, pre-rasterize the rotated
+            // shape ONCE. Saves re-rasterizing on every candidate scan.
+            struct RotCache {
+                double rot;
+                std::vector<uint64_t> bm;
+                int iw = 0;
+                int ih = 0;
+                int iwpr = 0;
+                BoundingBox rot_bb;  // extents of the rotated polygon
+            };
+            std::vector<RotCache> rot_cache;
+            rot_cache.reserve(rots.size());
+            for (double rot : rots) {
+                ExPolygon rotated = base_poly;
+                if (rot != 0.0) rotated.rotate(rot);
+                int iw = 0, ih = 0, iwpr = 0;
+                auto bm = BitmapNester::rasterize(
+                    rotated, res, plate_bw, plate_bh, iw, ih, iwpr);
+                if (bm.empty() || iw <= 0 || ih <= 0) continue;
+                rot_cache.push_back({rot, std::move(bm), iw, ih, iwpr,
+                                     get_extents(rotated)});
+            }
+            if (rot_cache.empty()) continue;
+
+            // First item: stamp at plate center with first rotation.
+            if (occ_max_px == 0) {
+                const RotCache& rc = rot_cache[0];
+                int px = seed_cx - rc.iw / 2;
+                int py = seed_cy - rc.ih / 2;
+                BitmapNester::stamp(plate_items, plate_wpr, plate_bw, plate_bh,
+                                    rc.bm, rc.iwpr, rc.iw, rc.ih, px, py);
+
+                occ_min_px = px;
+                occ_min_py = py;
+                occ_max_px = px + rc.iw;
+                occ_max_py = py + rc.ih;
+
+                // Compute mm-space translation: move the rotated
+                // polygon so its bbox min lands at (px*res, py*res) mm.
                 ExPolygon seeded = base_poly;
-                // Translate so bbox min lands at (0, 0) — predictable
-                // seed position regardless of input polygon offsets.
-                BoundingBox sbb = get_extents(seeded);
-                seeded.translate(-sbb.min.x(), -sbb.min.y());
-                BoundingBox seeded_bb = get_extents(seeded);
-                placed_polys.push_back(seeded);
-                placed_bboxes.push_back(seeded_bb);
+                if (rc.rot != 0.0) seeded.rotate(rc.rot);
+                coord_t dx = scaled<coord_t>(px * res) - rc.rot_bb.min.x();
+                coord_t dy = scaled<coord_t>(py * res) - rc.rot_bb.min.y();
+                seeded.translate(dx, dy);
 
                 for (const Point& p : seeded.contour.points)
                     placed_hull_pts.push_back(p);
@@ -408,119 +475,64 @@ private:
                     if (hull.points.size() >= 3)
                         current_hull_perim_mm = unscaled<double>(hull.length());
                 }
+
                 island.item_indices.push_back(idx);
-                island.rotations.push_back(0.0);
-                island.translations.push_back(Vec2crd{-sbb.min.x(), -sbb.min.y()});
+                island.rotations.push_back(rc.rot);
+                island.translations.push_back(Vec2crd{dx, dy});
                 continue;
             }
 
-            // Compute current cluster bbox for grid search window.
-            BoundingBox cluster_bb = get_extents(placed_polys);
-
-            // Grid stride: max_dim / 4 mm, floor 2 mm. Coarse enough to
-            // keep candidate counts manageable.
-            double max_dim_mm = 20.0;
-            for (const auto& info : cache) {
-                if (info.original_idx == idx) {
-                    max_dim_mm = info.max_dim_mm;
-                    break;
-                }
+            // Subsequent items: grid scan around the occupied extent.
+            // The occupied extent is the "min/max of set bits" form
+            // the boss explicitly allowed — derived from actual
+            // geometry, not a rectangular approximation of it.
+            int max_rot_iw = 0, max_rot_ih = 0;
+            for (const auto& rc : rot_cache) {
+                max_rot_iw = std::max(max_rot_iw, rc.iw);
+                max_rot_ih = std::max(max_rot_ih, rc.ih);
             }
-            double stride_mm = std::max(2.0, max_dim_mm / 4.0);
-            coord_t stride = scaled<coord_t>(stride_mm);
 
-            // Search window: cluster bbox expanded by max_dim on all
-            // sides. Items can wrap around the cluster.
-            coord_t margin = scaled<coord_t>(max_dim_mm * 1.25);
-            BoundingBox search_bb = cluster_bb;
-            search_bb.min -= Point(margin, margin);
-            search_bb.max += Point(margin, margin);
+            // Search window: occupied extent expanded by the new
+            // item's max dimensions so positions where the new item
+            // wraps around the cluster are reachable.
+            int search_min_px = std::max(0, occ_min_px - max_rot_iw);
+            int search_min_py = std::max(0, occ_min_py - max_rot_ih);
+            int search_max_px = std::min(plate_bw - 1, occ_max_px);
+            int search_max_py = std::min(plate_bh - 1, occ_max_py);
 
-            // Track the globally best (rot, px, py) across all rotations.
-            double best_score  = std::numeric_limits<double>::max();
-            double best_rot    = 0.0;
-            Vec2crd best_trans = Vec2crd{0, 0};
-            ExPolygon best_committed;
-            bool best_found = false;
+            // Grid stride: half of the smaller rotation dimension,
+            // floor 2 px. Coarser strides are fine because the narrow
+            // phase is cheap.
+            int stride = std::max(2, std::min(max_rot_iw, max_rot_ih) / 4);
 
-            for (double rot : rots) {
-                ExPolygon rotated = base_poly;
-                if (rot != 0.0) rotated.rotate(rot);
-                BoundingBox rot_bb = get_extents(rotated);
-                coord_t rot_w = rot_bb.size().x();
-                coord_t rot_h = rot_bb.size().y();
-                (void)rot_w; (void)rot_h;  // reserved for early bbox-vs-gap pruning
+            double best_score = std::numeric_limits<double>::max();
+            int    best_rci   = -1;
+            int    best_px    = -1;
+            int    best_py    = -1;
 
-                for (coord_t y = search_bb.min.y();
-                     y <= search_bb.max.y(); y += stride) {
-                    for (coord_t x = search_bb.min.x();
-                         x <= search_bb.max.x(); x += stride) {
-                        // Candidate bbox in world coordinates: the
-                        // rotated shape translated so its own bbox
-                        // min is at (x, y).
-                        BoundingBox cand_bb;
-                        cand_bb.min = Point(x, y);
-                        cand_bb.max = Point(x + rot_bb.size().x(),
-                                            y + rot_bb.size().y());
+            for (std::size_t rci = 0; rci < rot_cache.size(); ++rci) {
+                const RotCache& rc = rot_cache[rci];
+                int rot_max_px = std::min(plate_bw - rc.iw, search_max_px);
+                int rot_max_py = std::min(plate_bh - rc.ih, search_max_py);
 
-                        // Bbox pre-reject: skip candidates that don't
-                        // overlap ANY placed item's bbox. This is a
-                        // 5-10× speedup on typical inputs because
-                        // most grid positions are nowhere near any
-                        // placed item — and intersection_ex is the
-                        // hot cost per candidate. Cheap aabb test
-                        // replaces the expensive polygon intersection
-                        // for the vast majority of rejected positions.
-                        //
-                        // NOTE: non-overlap with ALL placed bboxes
-                        // means the candidate is collision-free — we
-                        // can commit without calling intersection_ex
-                        // at all.
-                        bool any_bbox_overlap = false;
-                        bool collides = false;
-                        for (const BoundingBox& pb : placed_bboxes) {
-                            if (cand_bb.max.x() < pb.min.x() ||
-                                cand_bb.min.x() > pb.max.x() ||
-                                cand_bb.max.y() < pb.min.y() ||
-                                cand_bb.min.y() > pb.max.y()) {
-                                continue;  // no bbox overlap
-                            }
-                            any_bbox_overlap = true;
-                            break;
-                        }
+                for (int py = search_min_py; py <= rot_max_py; py += stride) {
+                    for (int px = search_min_px; px <= rot_max_px; px += stride) {
+                        // Bitmap AND is the narrow phase. Nanoseconds.
+                        if (BitmapNester::collides(plate_items, plate_wpr,
+                                                   plate_bw, plate_bh,
+                                                   rc.bm, rc.iwpr,
+                                                   rc.iw, rc.ih, px, py))
+                            continue;
 
-                        // Build the candidate polygon only when needed:
-                        // either for the real collision check (bbox
-                        // overlap case) or for the hull scoring (both
-                        // cases).
-                        ExPolygon candidate = rotated;
-                        candidate.translate(x - rot_bb.min.x(),
-                                            y - rot_bb.min.y());
+                        // Score: hull perimeter delta if committed here.
+                        // Build the candidate polygon in world coords to
+                        // extract its vertices for the hull calc.
+                        ExPolygon candidate = base_poly;
+                        if (rc.rot != 0.0) candidate.rotate(rc.rot);
+                        coord_t cdx = scaled<coord_t>(px * res) - rc.rot_bb.min.x();
+                        coord_t cdy = scaled<coord_t>(py * res) - rc.rot_bb.min.y();
+                        candidate.translate(cdx, cdy);
 
-                        if (any_bbox_overlap) {
-                            // At least one placed item's bbox overlaps
-                            // the candidate — expensive intersection_ex
-                            // check required for each such placed item.
-                            ExPolygons cand_vec{candidate};
-                            for (std::size_t p = 0; p < placed_polys.size(); ++p) {
-                                const BoundingBox& pb = placed_bboxes[p];
-                                if (cand_bb.max.x() < pb.min.x() ||
-                                    cand_bb.min.x() > pb.max.x() ||
-                                    cand_bb.max.y() < pb.min.y() ||
-                                    cand_bb.min.y() > pb.max.y()) {
-                                    continue;  // skip non-overlapping
-                                }
-                                ExPolygons inter = intersection_ex(
-                                    cand_vec, ExPolygons{placed_polys[p]});
-                                if (!inter.empty()) {
-                                    collides = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (collides) continue;
-
-                        // Score: new hull perimeter if this commits.
                         Points new_pts = placed_hull_pts;
                         for (const Point& p : candidate.contour.points)
                             new_pts.push_back(p);
@@ -530,43 +542,56 @@ private:
                         double new_perim = unscaled<double>(new_hull.length());
                         double delta = new_perim - current_hull_perim_mm;
                         if (delta < best_score) {
-                            best_score     = delta;
-                            best_rot       = rot;
-                            best_trans     = Vec2crd{
-                                x - rot_bb.min.x(), y - rot_bb.min.y()};
-                            best_committed = candidate;
-                            best_found     = true;
+                            best_score = delta;
+                            best_rci   = (int)rci;
+                            best_px    = px;
+                            best_py    = py;
                         }
                     }
                 }
             }
 
-            if (!best_found) {
-                // Couldn't place this item in the search window. Mark
-                // it unplaced; M3 recover_spillover will try harder.
-                // (In M2.3's current state this just means the item's
-                // bed_idx stays UNARRANGED in items_out.)
-                continue;
-            }
+            if (best_rci < 0) continue;  // unplaceable — M3 spillover will retry
 
-            // Commit: update placed_polys + hull state, record on island.
-            placed_polys.push_back(best_committed);
-            placed_bboxes.push_back(get_extents(best_committed));
-            for (const Point& p : best_committed.contour.points)
+            // Commit: stamp the bitmap, update hull state, update
+            // running extent, record on the island.
+            const RotCache& br = rot_cache[best_rci];
+            BitmapNester::stamp(plate_items, plate_wpr, plate_bw, plate_bh,
+                                br.bm, br.iwpr, br.iw, br.ih,
+                                best_px, best_py);
+
+            occ_min_px = std::min(occ_min_px, best_px);
+            occ_min_py = std::min(occ_min_py, best_py);
+            occ_max_px = std::max(occ_max_px, best_px + br.iw);
+            occ_max_py = std::max(occ_max_py, best_py + br.ih);
+
+            ExPolygon committed = base_poly;
+            if (br.rot != 0.0) committed.rotate(br.rot);
+            coord_t bdx = scaled<coord_t>(best_px * res) - br.rot_bb.min.x();
+            coord_t bdy = scaled<coord_t>(best_py * res) - br.rot_bb.min.y();
+            committed.translate(bdx, bdy);
+            for (const Point& p : committed.contour.points)
                 placed_hull_pts.push_back(p);
             if (placed_hull_pts.size() >= 3) {
                 Polygon hull = Geometry::convex_hull(placed_hull_pts);
                 if (hull.points.size() >= 3)
                     current_hull_perim_mm = unscaled<double>(hull.length());
             }
+
             island.item_indices.push_back(idx);
-            island.rotations.push_back(best_rot);
-            island.translations.push_back(best_trans);
+            island.rotations.push_back(br.rot);
+            island.translations.push_back(Vec2crd{bdx, bdy});
         }
 
-        // Finalize island metadata.
-        if (!placed_polys.empty()) {
-            island.bbox = get_extents(placed_polys);
+        // Finalize island metadata. island.bbox is computed from
+        // the accumulated hull vertices — this is the "min/max of
+        // actual placed geometry" form of bbox that the M2.5 bbox
+        // purge directive allows.
+        if (!placed_hull_pts.empty()) {
+            island.bbox = BoundingBox(placed_hull_pts.front(),
+                                      placed_hull_pts.front());
+            for (const Point& p : placed_hull_pts)
+                island.bbox.merge(p);
         }
         island.hull_perimeter_mm = current_hull_perim_mm;
 
