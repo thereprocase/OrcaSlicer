@@ -533,8 +533,12 @@ private:
         // The old hardcoded 2048 was this formula all along.
         double bed_w_mm = unscaled<double>(bed.size().x());
         double bed_h_mm = unscaled<double>(bed.size().y());
-        const int plate_bw  = ((int)(bed_w_mm * 2.0 / res) + 63) & ~63;
-        const int plate_bh  = (int)(bed_h_mm * 2.0 / res) + 1;
+        // Cap plate at 8192 px per axis (~50MB bitmap) to prevent
+        // OOM on pathological beds. Aragorn War Council audit.
+        const int plate_bw  = std::min(8192,
+            ((int)(bed_w_mm * 2.0 / res) + 63) & ~63);
+        const int plate_bh  = std::min(8192,
+            (int)(bed_h_mm * 2.0 / res) + 1);
         const int plate_wpr = (plate_bw + 63) / 64;
         std::vector<uint64_t> plate_items(
             (std::size_t)plate_wpr * plate_bh, 0);
@@ -942,7 +946,7 @@ private:
         // ensures it compiles out entirely in Release builds.
         if (!island.compact_items.empty()) {
             std::vector<uint16_t> sum_buf(
-                (std::size_t)plate_wpr * plate_bh * 64, 0);
+                (std::size_t)plate_bw * plate_bh, 0);
             for (const CompactItem& ci : island.compact_items) {
                 for (int row = 0; row < ci.ih; ++row) {
                     for (int word = 0; word < ci.iwpr; ++word) {
