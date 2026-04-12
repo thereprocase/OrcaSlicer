@@ -1275,13 +1275,21 @@ private:
                 int db = bed_max_py - cy;
                 int dmin = std::min({dl, dr, dt, db});
 
+                // Wall pressure: push inward from the nearest wall.
+                // dmin identifies which wall is closest (or which the
+                // item has crossed, when dmin < 0). The corresponding
+                // direction pushes TOWARD bed center.
+                //
+                // Sauron audit 2026-04-12: the old `dmin <= 0` guard
+                // unconditionally pushed right, which was wrong when
+                // items hung off the right/top/bottom walls. Removed.
                 int step_x = 0, step_y = 0;
-                if (dmin <= 0 || dmin == dl)      step_x =  1;
-                else if (dmin == dr)              step_x = -1;
-                else if (dmin == dt)              step_y =  1;
-                else if (dmin == db)              step_y = -1;
+                if      (dmin == dl)  step_x =  1;  // nearest left wall → push right
+                else if (dmin == dr)  step_x = -1;  // nearest right wall → push left
+                else if (dmin == dt)  step_y =  1;  // nearest top wall → push down
+                else if (dmin == db)  step_y = -1;  // nearest bottom wall → push up
 
-                // Guard: part at exact center → no wall pressure.
+                // Guard: exact center of bed → no wall pressure.
                 if (step_x == 0 && step_y == 0) continue;
 
                 // 2. XOR-remove from composite.
