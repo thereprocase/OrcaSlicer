@@ -177,16 +177,12 @@ public:
         int  k      = estimate_min_plates(cache, bed);
         auto groups = partition_items(cache, k);
 
-        // Fast path: single group on a loose bed collapses to the
-        // pre-partitioning pass-through. Zero behavior change on
-        // k=1 inputs.
-        if (groups.size() <= 1) {
-            BitmapNester::arrange(items, excludes, bed, params);
-            return;
-        }
-
-        // Multi-group path: pack each group as an island, then
-        // locate each island on its own plate, then compact.
+        // Full C2 pipeline for all group counts including k=1.
+        // The k=1 C1 fallback was removed — C2 now handles all
+        // cases through its own pack → locate → compact → spill
+        // pipeline. This is required for the trash compactor and
+        // height-desc sort to actually run on single-plate jobs
+        // (which is most real-world usage).
         std::vector<NesterC2Island> islands;
         islands.reserve(groups.size());
         for (std::size_t g = 0; g < groups.size(); ++g) {
