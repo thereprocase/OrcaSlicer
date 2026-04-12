@@ -490,9 +490,22 @@ private:
         // Plate size: 2048×2048 px at 0.5 mm/pixel = 1024×1024 mm
         // in world. Generous enough for any realistic island; costs
         // 512 KB of allocation per call which is acceptable.
-        const double res = 0.5;  // mm per pixel
-        const int plate_bw  = 2048;
-        const int plate_bh  = 2048;
+        // Bitmap resolution derived from spacing setting.
+        // res = spacing/2 clamped to [0.1, 0.5] mm/px.
+        // At default 0.5mm spacing → res = 0.25 mm/px.
+        // At tight 0.1mm spacing → res = 0.1 mm/px (floor).
+        // At wide 5mm spacing → res = 0.5 mm/px (ceiling).
+        double spacing_mm = unscaled<double>(params.min_obj_distance);
+        const double res = std::max(0.1, std::min(0.5,
+                               spacing_mm > 0.0 ? spacing_mm / 2.0 : 0.5));
+        // Plate dimensions scale with resolution. The virtual plate
+        // must be large enough to hold the bed + generous margin for
+        // the island to grow before locate clips it. 2× bed size in
+        // each axis, rounded up to 64-bit word boundary.
+        double bed_w_mm = unscaled<double>(bed.size().x());
+        double bed_h_mm = unscaled<double>(bed.size().y());
+        const int plate_bw  = ((int)(bed_w_mm * 2.0 / res) + 63) & ~63;
+        const int plate_bh  = (int)(bed_h_mm * 2.0 / res) + 1;
         const int plate_wpr = (plate_bw + 63) / 64;
         std::vector<uint64_t> plate_items(
             (std::size_t)plate_wpr * plate_bh, 0);
