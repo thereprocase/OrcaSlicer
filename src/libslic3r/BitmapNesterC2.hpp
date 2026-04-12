@@ -386,18 +386,44 @@ private:
         NesterC2Island island;
         if (group.items.empty()) return island;
 
-        // Placement order: priority_score desc. Tallest/hardest first.
+        // Placement order: height_mm desc primary, priority_score desc
+        // tiebreak. M2.6 Council of Elrond / Sauron arbitration: tallest
+        // items place first so the greedy hull-perimeter scorer naturally
+        // clusters them at the local island origin; shorter items accrete
+        // around the growing perimeter. Produces a passive height gradient
+        // ("tall in middle, short at edges") for free — no new phase,
+        // no new cache fields, no post-process compaction.
+        //
+        // Stability: std::stable_sort + continuous height key + secondary
+        // priority_score tiebreak means a 0.01mm perturbation on a single
+        // item moves at most that item in the ordering; equal-height
+        // neighbors do not swap. Layout flinch is bounded by the input
+        // perturbation.
+        //
+        // Invariants preserved:
+        //   - Plate count minimum: sort changes trial order only, not
+        //     the set of items accepted.
+        //   - Bound-agnostic: sort key is intrinsic to each item.
+        //   - No new allocations: sort is over an index vector.
+        //   - Complexity O(N log N), dominated by the placement loop.
+        //
+        // Perf fix (also M2.6): previous comparator used std::find_if
+        // over `cache` per comparison — O(N·M log N) for the full sort.
+        // Replaced with a direct lookup table keyed on original_idx.
         std::vector<std::size_t> order = group.items;
-        std::sort(order.begin(), order.end(),
-                  [&cache](std::size_t a, std::size_t b) {
-                      const auto& ia = *std::find_if(
-                          cache.begin(), cache.end(),
-                          [a](const NesterC2ItemInfo& i) { return i.original_idx == a; });
-                      const auto& ib = *std::find_if(
-                          cache.begin(), cache.end(),
-                          [b](const NesterC2ItemInfo& i) { return i.original_idx == b; });
-                      return ia.priority_score > ib.priority_score;
-                  });
+        std::vector<std::size_t> cache_idx_by_orig(items_in.size(),
+                                                   (std::size_t)-1);
+        for (std::size_t ci = 0; ci < cache.size(); ++ci)
+            cache_idx_by_orig[cache[ci].original_idx] = ci;
+        std::stable_sort(
+            order.begin(), order.end(),
+            [&cache, &cache_idx_by_orig](std::size_t a, std::size_t b) {
+                const auto& ia = cache[cache_idx_by_orig[a]];
+                const auto& ib = cache[cache_idx_by_orig[b]];
+                if (ia.height_mm != ib.height_mm)
+                    return ia.height_mm > ib.height_mm;
+                return ia.priority_score > ib.priority_score;
+            });
 
         // ─── Virtual plate for bitmap AND collision detection ─────
         //

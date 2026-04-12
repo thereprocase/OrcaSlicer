@@ -736,3 +736,170 @@ TEST_CASE("C2 M2.5.1: L-shape notch-fill — bbox overlaps but silhouettes don't
     // M2.5.3 bitmap AND replaces the current collision path and
     // will handle this case correctly.
 }
+
+// ────────────────────────────────────────────────────────────────────
+// M2.6 — tall-parts-grouped via height-desc placement order
+//
+// Sauron-arbitrated design: pack_as_island sorts by height_mm desc
+// (priority_score tiebreak) at entry. The effect this is supposed to
+// guarantee is NOT "tall items end up in the middle of the final
+// hull" — hull-perimeter greedy accretes compactly in a biased
+// direction, so the seed can end up at one edge of the cluster.
+//
+// The guarantee is weaker and more defensible: **tall items are
+// placed BEFORE short items**, and multiple tall items therefore
+// cluster contiguously at the front of the placement sequence. The
+// final layout has talls as a single connected subcluster, not
+// scattered among the shorts.
+//
+// This test checks exactly that: two tests in one, covering both the
+// single-tall case (tall placed first) and the multiple-tall case
+// (talls occupy the first K placement slots contiguously).
+// ────────────────────────────────────────────────────────────────────
+TEST_CASE("C2 M2.6: tall items placed first and cluster together",
+          "[BitmapNesterC2][M2.6]")
+{
+    SECTION("single tall is placed first") {
+        ArrangePolygons items;
+        // Deliberately place the tall item LAST in the input list.
+        // Without the height-desc sort it would be placed last;
+        // with the sort it must be placed first.
+        items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 10.0));
+        items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 10.0));
+        items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 10.0));
+        items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 10.0));
+        items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 120.0));
+
+        BoundingBox bed = c2_bed_mm(200.0, 200.0);
+        ArrangeParams params = c2_params();
+        ArrangePolygons excludes;
+
+        auto cache  = BitmapNesterC2::build_cache(items);
+        auto groups = BitmapNesterC2::partition_items(cache, 1);
+        REQUIRE(groups.size() == 1);
+
+        auto island = BitmapNesterC2::pack_as_island(
+            items, cache, groups[0], excludes, bed, params);
+
+        REQUIRE(island.item_indices.size() == 5);
+
+        // The tall item is original_idx 4. With height-desc sort it
+        // must be the first committed placement.
+        UNSCOPED_INFO("placement order: "
+                      << island.item_indices[0] << ", "
+                      << island.item_indices[1] << ", "
+                      << island.item_indices[2] << ", "
+                      << island.item_indices[3] << ", "
+                      << island.item_indices[4]);
+        REQUIRE(island.item_indices[0] == 4);
+    }
+
+    SECTION("multiple tall items cluster contiguously at front") {
+        // 3 tall items (heights 100/110/120) interleaved with 3 shorts
+        // in the input order. After height-desc sort the 3 talls must
+        // occupy placement positions 0, 1, 2 — i.e. the first three
+        // committed placements are all tall, no short between them.
+        ArrangePolygons items;
+        items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0),  10.0));  // 0 short
+        items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 100.0));  // 1 tall
+        items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0),   8.0));  // 2 short
+        items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 120.0));  // 3 tall
+        items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0),  12.0));  // 4 short
+        items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 110.0));  // 5 tall
+
+        BoundingBox bed = c2_bed_mm(200.0, 200.0);
+        ArrangeParams params = c2_params();
+        ArrangePolygons excludes;
+
+        auto cache  = BitmapNesterC2::build_cache(items);
+        auto groups = BitmapNesterC2::partition_items(cache, 1);
+        REQUIRE(groups.size() == 1);
+
+        auto island = BitmapNesterC2::pack_as_island(
+            items, cache, groups[0], excludes, bed, params);
+
+        REQUIRE(island.item_indices.size() == 6);
+
+        auto is_tall = [&cache](std::size_t orig) {
+            for (const auto& info : cache)
+                if (info.original_idx == orig)
+                    return info.height_mm >= 100.0;
+            return false;
+        };
+
+        UNSCOPED_INFO("placement order: "
+                      << island.item_indices[0] << ", "
+                      << island.item_indices[1] << ", "
+                      << island.item_indices[2] << ", "
+                      << island.item_indices[3] << ", "
+                      << island.item_indices[4] << ", "
+                      << island.item_indices[5]);
+
+        // First three placements must all be tall.
+        REQUIRE(is_tall(island.item_indices[0]));
+        REQUIRE(is_tall(island.item_indices[1]));
+        REQUIRE(is_tall(island.item_indices[2]));
+        // Last three must all be short.
+        REQUIRE_FALSE(is_tall(island.item_indices[3]));
+        REQUIRE_FALSE(is_tall(island.item_indices[4]));
+        REQUIRE_FALSE(is_tall(island.item_indices[5]));
+
+        // Among the talls, the 120mm one (original_idx 3) must be
+        // placed first — the height-desc sort is total, not just
+        // tall-vs-short bucketing.
+        REQUIRE(island.item_indices[0] == 3);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// M2.6 stability: a 0.01 mm height perturbation on a single item
+// must not reshuffle the rest of the layout. Frodo called this out as
+// the user-hated failure mode; std::stable_sort + continuous height
+// key + priority_score tiebreak make this a hard invariant.
+// ────────────────────────────────────────────────────────────────────
+TEST_CASE("C2 M2.6: 0.01mm height perturbation does not reshuffle",
+          "[BitmapNesterC2][M2.6]")
+{
+    auto run_once = [](double tall_height) {
+        ArrangePolygons items;
+        items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), tall_height));
+        items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 10.0));
+        items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 10.0));
+        items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 10.0));
+        BoundingBox bed = c2_bed_mm(200.0, 200.0);
+        ArrangeParams params = c2_params();
+        ArrangePolygons excludes;
+        auto cache = BitmapNesterC2::build_cache(items);
+        auto groups = BitmapNesterC2::partition_items(cache, 1);
+        return BitmapNesterC2::pack_as_island(
+            items, cache, groups[0], excludes, bed, params);
+    };
+
+    auto a = run_once(120.00);
+    auto b = run_once(120.01);
+
+    REQUIRE(a.item_indices.size() == b.item_indices.size());
+
+    // Map original_idx → translation. Comparison is robust to
+    // ordering inside the parallel vectors.
+    auto locate = [](const NesterC2Island& isl,
+                     std::size_t orig) -> Vec2crd {
+        for (std::size_t i = 0; i < isl.item_indices.size(); ++i)
+            if (isl.item_indices[i] == orig) return isl.translations[i];
+        return Vec2crd{0, 0};
+    };
+
+    for (std::size_t orig = 0; orig < 4; ++orig) {
+        Vec2crd ta = locate(a, orig);
+        Vec2crd tb = locate(b, orig);
+        double dx = unscaled<double>(ta.x() - tb.x());
+        double dy = unscaled<double>(ta.y() - tb.y());
+        UNSCOPED_INFO("orig " << orig
+                      << " dx=" << dx << " dy=" << dy);
+        // Exact match expected: with stable_sort and a 0.01mm
+        // perturbation only on item 0, no rank changes anywhere,
+        // so every item lands at byte-for-byte the same position.
+        REQUIRE(ta.x() == tb.x());
+        REQUIRE(ta.y() == tb.y());
+    }
+}
