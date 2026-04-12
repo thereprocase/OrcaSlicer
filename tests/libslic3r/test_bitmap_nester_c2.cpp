@@ -30,6 +30,7 @@
 #include "harness_oracle.hpp"
 
 #include <cmath>
+#include <cstdio>
 #include <vector>
 
 using namespace Slic3r;
@@ -1071,4 +1072,79 @@ TEST_CASE("C2 M4.5: compact_on_plate reduces pixel overflow",
     // each pair.)
     UNSCOPED_INFO("compact_on_plate completed without crash");
     REQUIRE(true);
+
+    // Render PPM for visual inspection.
+    test_utils::dump_placement_ascii(items, bed, "c2_m4.5_compact.txt");
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Visual render tests — full C2 pipeline, output PPM for inspection.
+// These test the complete pack → locate → compact → render pipeline.
+// ────────────────────────────────────────────────────────────────────
+
+TEST_CASE("C2 visual: 5 mixed squares, tall-grouped",
+          "[BitmapNesterC2][visual]")
+{
+    ArrangePolygons items;
+    items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 120.0));
+    items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0),  10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(25.0, 25.0),  80.0));
+    items.push_back(c2_make_ap(c2_rect_mm(15.0, 15.0),  10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0),  50.0));
+
+    BoundingBox bed = c2_bed_mm(200.0, 200.0);
+    ArrangeParams params = c2_params();
+    ArrangePolygons excludes;
+
+    auto cache  = BitmapNesterC2::build_cache(items);
+    auto groups = BitmapNesterC2::partition_items(cache, 1);
+    REQUIRE(groups.size() == 1);
+
+    auto island = BitmapNesterC2::pack_as_island(
+        items, cache, groups[0], excludes, bed, params);
+    BitmapNesterC2::locate_island_on_plate(items, island, 0, bed);
+
+    // Render before compaction.
+    test_utils::dump_placement_ascii(items, bed,
+                                    "c2_visual_mixed_before_compact.txt");
+
+    BitmapNesterC2::compact_on_plate(items, island, 0, bed);
+
+    // Render after compaction.
+    test_utils::dump_placement_ascii(items, bed,
+                                    "c2_visual_mixed_after_compact.txt");
+
+    // All items placed.
+    for (const auto& ap : items)
+        REQUIRE(ap.bed_idx == 0);
+}
+
+TEST_CASE("C2 visual: L-shapes interlock",
+          "[BitmapNesterC2][visual]")
+{
+    // Two L-shapes that should interlock via hull-perimeter scoring.
+    ArrangePolygons items;
+    items.push_back(c2_make_ap(c2_l_shape_40_20_mm(), 20.0));
+    items.push_back(c2_make_ap(c2_l_shape_40_20_mm(), 20.0));
+    items.push_back(c2_make_ap(c2_rect_mm(15.0, 15.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(15.0, 15.0), 10.0));
+
+    BoundingBox bed = c2_bed_mm(200.0, 200.0);
+    ArrangeParams params = c2_params();
+    ArrangePolygons excludes;
+
+    auto cache  = BitmapNesterC2::build_cache(items);
+    auto groups = BitmapNesterC2::partition_items(cache, 1);
+    REQUIRE(groups.size() == 1);
+
+    auto island = BitmapNesterC2::pack_as_island(
+        items, cache, groups[0], excludes, bed, params);
+    BitmapNesterC2::locate_island_on_plate(items, island, 0, bed);
+    BitmapNesterC2::compact_on_plate(items, island, 0, bed);
+
+    test_utils::dump_placement_ascii(items, bed,
+                                    "c2_visual_l_shapes.txt");
+
+    for (const auto& ap : items)
+        REQUIRE(ap.bed_idx == 0);
 }

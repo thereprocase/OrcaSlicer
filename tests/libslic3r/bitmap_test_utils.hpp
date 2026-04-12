@@ -340,4 +340,93 @@ inline bool no_overlap(const ArrangePolygons &items)
     return true;
 }
 
+// ─── Visual render: dump placement to ASCII art ──────────────────
+//
+// Renders placed items onto a bed-sized grid as a compact text file.
+// Each cell (5mm × 5mm at default) shows a character: '.' for empty,
+// 'A'-'Z' for items (cycling), '#' for overlap, 'X' for outside bed.
+// The bed boundary is drawn with '+', '-', '|'.
+//
+// Output is ~40×40 characters for a 200×200 bed at 5mm/cell — fits
+// in a single screen and costs ~200 tokens for Claude to review.
+//
+// Usage:
+//   test_utils::dump_placement_ascii(items, bed, "test_name.txt");
+
+inline void dump_placement_ascii(const ArrangePolygons& items,
+                                  const BoundingBox& bed,
+                                  const std::string& filename,
+                                  double cell_mm = 5.0)
+{
+    double bed_w = unscaled<double>(bed.size().x());
+    double bed_h = unscaled<double>(bed.size().y());
+    int cols = (int)(bed_w / cell_mm) + 2;  // +2 for border
+    int rows = (int)(bed_h / cell_mm) + 2;
+    if (cols > 200 || rows > 200) return;
+
+    // Grid: 0 = empty, 1-26 = item A-Z, -1 = overlap
+    std::vector<int> grid(cols * rows, 0);
+
+    double bed_min_x = unscaled<double>(bed.min.x());
+    double bed_min_y = unscaled<double>(bed.min.y());
+
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (items[i].bed_idx == UNARRANGED) continue;
+
+        ExPolygon poly = items[i].poly;
+        if (items[i].rotation != 0.0) poly.rotate(items[i].rotation);
+        poly.translate(items[i].translation.x(), items[i].translation.y());
+
+        int label = (int)(i % 26) + 1;
+
+        for (int r = 0; r < rows - 2; ++r) {
+            for (int c = 0; c < cols - 2; ++c) {
+                double wx = bed_min_x + (c + 0.5) * cell_mm;
+                double wy = bed_min_y + (r + 0.5) * cell_mm;
+                Point pt(scaled<coord_t>(wx), scaled<coord_t>(wy));
+                if (poly.contains(pt)) {
+                    int gi = (r + 1) * cols + (c + 1);
+                    if (grid[gi] != 0 && grid[gi] != label)
+                        grid[gi] = -1;  // overlap
+                    else
+                        grid[gi] = label;
+                }
+            }
+        }
+    }
+
+    // Write text. Top row = Y max (flip for natural orientation).
+    FILE* f = fopen(filename.c_str(), "w");
+    if (!f) return;
+
+    // Header.
+    fprintf(f, "# C2 placement render: %dx%d mm bed, %.0f mm/cell\n",
+            (int)bed_w, (int)bed_h, cell_mm);
+    fprintf(f, "# Items: %d placed\n", (int)items.size());
+
+    // Top border.
+    fprintf(f, "+");
+    for (int c = 0; c < cols - 2; ++c) fprintf(f, "-");
+    fprintf(f, "+\n");
+
+    // Grid rows (top-down = high Y first).
+    for (int r = rows - 3; r >= 0; --r) {
+        fprintf(f, "|");
+        for (int c = 0; c < cols - 2; ++c) {
+            int v = grid[(r + 1) * cols + (c + 1)];
+            if (v == 0)       fprintf(f, ".");
+            else if (v == -1) fprintf(f, "#");
+            else              fprintf(f, "%c", 'A' + (v - 1));
+        }
+        fprintf(f, "|\n");
+    }
+
+    // Bottom border.
+    fprintf(f, "+");
+    for (int c = 0; c < cols - 2; ++c) fprintf(f, "-");
+    fprintf(f, "+\n");
+
+    fclose(f);
+}
+
 }}} // namespace Slic3r::arrangement::test_utils
