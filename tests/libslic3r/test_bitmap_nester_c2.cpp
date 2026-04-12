@@ -903,3 +903,57 @@ TEST_CASE("C2 M2.6: 0.01mm height perturbation does not reshuffle",
         REQUIRE(ta.y() == tb.y());
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// M3.1 — spillover recovery: items that couldn't fit their group's
+// island must still end up on SOME plate, never left UNARRANGED.
+//
+// Force spillover by partitioning into 2 groups where one group's
+// combined area exceeds what the virtual plate can fit (or more
+// practically, use a direct call to recover_spillover).
+// ────────────────────────────────────────────────────────────────────
+TEST_CASE("C2 M3.1: spillover items get their own plates",
+          "[BitmapNesterC2][M3.1]")
+{
+    // 3 items, pack 2 on island 0. Force the 3rd to spill by
+    // leaving it UNARRANGED.
+    ArrangePolygons items;
+    items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+
+    // Simulate: items 0 and 1 are placed on plate 0; item 2 is
+    // UNARRANGED (spillover).
+    items[0].bed_idx = 0;
+    items[0].translation = Vec2crd{0, 0};
+    items[1].bed_idx = 0;
+    items[1].translation = Vec2crd{scaled<coord_t>(40.0), 0};
+    // items[2] stays UNARRANGED (default from c2_make_ap)
+
+    BoundingBox bed = c2_bed_mm(200.0, 200.0);
+    auto cache = BitmapNesterC2::build_cache(items);
+    int next_plate = 1;
+
+    BitmapNesterC2::recover_spillover(items, cache, next_plate, bed);
+
+    // Item 2 must now be placed on plate 1 (the next plate).
+    REQUIRE(items[2].bed_idx == 1);
+    // Translation should center the item on the bed.
+    double tx_mm = unscaled<double>(items[2].translation.x());
+    double ty_mm = unscaled<double>(items[2].translation.y());
+    // Item center after translation: (tx + 15, ty + 15) should be
+    // near bed center (100, 100).
+    BoundingBox item_bb = get_extents(items[2].poly);
+    double cx = unscaled<double>(item_bb.center().x() + items[2].translation.x());
+    double cy = unscaled<double>(item_bb.center().y() + items[2].translation.y());
+    double bed_cx = unscaled<double>(bed.center().x());
+    double bed_cy = unscaled<double>(bed.center().y());
+    UNSCOPED_INFO("spillover center: (" << cx << ", " << cy << ")");
+    UNSCOPED_INFO("bed center:       (" << bed_cx << ", " << bed_cy << ")");
+    REQUIRE(std::abs(cx - bed_cx) < 1.0);
+    REQUIRE(std::abs(cy - bed_cy) < 1.0);
+
+    // Items 0 and 1 must not have been modified.
+    REQUIRE(items[0].bed_idx == 0);
+    REQUIRE(items[1].bed_idx == 0);
+}

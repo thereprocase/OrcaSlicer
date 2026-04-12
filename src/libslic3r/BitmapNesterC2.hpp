@@ -153,6 +153,15 @@ public:
                 items, cache, groups[g], excludes, bed, params);
             locate_island_on_plate(items, island, (int)g, bed);
         }
+
+        // M3.1 spillover recovery: items that pack_as_island couldn't
+        // fit (best_rci stayed -1) still have bed_idx == UNARRANGED.
+        // Each gets its own plate centered on the bed. This is the
+        // minimum viable spillover — guarantees every item ends up
+        // placed somewhere, no items silently vanish. Fitting
+        // spillovers onto existing plates with remaining space is an
+        // optimization for a future milestone.
+        recover_spillover(items, cache, (int)groups.size(), bed);
     }
 
     // ─── M1 phase functions (exposed for testing via the
@@ -730,13 +739,34 @@ private:
         }
     }
 
-    // M3: attempt to find a home for items that couldn't fit their target
-    // island. Retry rotations, migrate to neighbor islands, or spawn a new
-    // island as a last resort.
-    // static void recover_spillover(ArrangePolygons& items,
-    //                               std::vector<NesterC2Island>& islands,
-    //                               const BoundingBox& bed,
-    //                               const ArrangeParams& params);
+    // M3.1: spillover recovery. Items that pack_as_island couldn't
+    // fit (no clear position in the scan window) stay UNARRANGED.
+    // This gives each one its own plate, centered on the bed.
+    //
+    // Future optimization: try fitting spillovers onto existing
+    // plates with remaining space before spawning new plates.
+    static void recover_spillover(ArrangePolygons& items,
+                                   const std::vector<NesterC2ItemInfo>& cache,
+                                   int next_plate_idx,
+                                   const BoundingBox& bed)
+    {
+        coord_t cx = bed.center().x();
+        coord_t cy = bed.center().y();
+
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            if (items[i].bed_idx != UNARRANGED) continue;
+
+            // Center the item on a new plate. Translation moves the
+            // item's poly center to the bed center.
+            BoundingBox item_bb = get_extents(items[i].poly);
+            coord_t dx = cx - item_bb.center().x();
+            coord_t dy = cy - item_bb.center().y();
+
+            items[i].translation = Vec2crd{dx, dy};
+            items[i].rotation    = 0.0;
+            items[i].bed_idx     = next_plate_idx++;
+        }
+    }
 };
 
 }} // namespace Slic3r::arrangement
