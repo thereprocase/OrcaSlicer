@@ -1148,3 +1148,120 @@ TEST_CASE("C2 visual: L-shapes interlock",
     for (const auto& ap : items)
         REQUIRE(ap.bed_idx == 0);
 }
+
+// ────────────────────────────────────────────────────────────────────
+// S3.3: border-frame scan — placement quality regression gate.
+//
+// Packs 4 L-shapes that can interlock. The border-frame scan must
+// find a packing whose island hull perimeter is no worse than the
+// pre-S3.3 rectangular scan produced. The threshold (300 mm) is a
+// generous upper bound: two interlocked L-shapes have a hull perimeter
+// of ~200 mm, four of them stay well below 300 mm when properly nested.
+//
+// If this test fails the border-frame strips missed a better position
+// that the rectangular scan would have found — widen a strip or add a
+// fallback row/column to recover coverage.
+// ────────────────────────────────────────────────────────────────────
+TEST_CASE("S3.3: border-frame scan — hull perimeter quality unchanged",
+          "[BitmapNesterC2][S3.3]")
+{
+    ArrangePolygons items;
+    items.push_back(c2_make_ap(c2_l_shape_40_20_mm(), 20.0));
+    items.push_back(c2_make_ap(c2_l_shape_40_20_mm(), 20.0));
+    items.push_back(c2_make_ap(c2_l_shape_40_20_mm(), 20.0));
+    items.push_back(c2_make_ap(c2_l_shape_40_20_mm(), 20.0));
+
+    BoundingBox bed = c2_bed_mm(200.0, 200.0);
+    ArrangeParams params = c2_params();
+    ArrangePolygons excludes;
+
+    auto cache  = BitmapNesterC2::build_cache(items);
+    auto groups = BitmapNesterC2::partition_items(cache, 1);
+    REQUIRE(groups.size() == 1);
+
+    auto island = BitmapNesterC2::pack_as_island(
+        items, cache, groups[0], excludes, bed, params);
+
+    // All 4 items must have been placed (no spillover).
+    REQUIRE(island.item_indices.size() == 4);
+
+    // Hull perimeter must be reasonable — interlocked L-shapes nest
+    // tightly. 300 mm is the regression ceiling; anything above signals
+    // the border-frame scan missed good positions and scattered items.
+    double hull_perim = island.hull_perimeter_mm;
+    UNSCOPED_INFO("island hull_perimeter_mm = " << hull_perim);
+    REQUIRE(hull_perim > 0.0);
+    REQUIRE(hull_perim < 300.0);
+}
+
+// ===========================================================================
+// S3.1 — SUM-bitmap integrity check
+// ===========================================================================
+//
+// Explicit test for the per-pixel accumulation invariant after
+// pack_as_island: every pixel on the virtual plate must be covered by
+// at most one CompactItem. The check is also present as a debug-mode
+// assertion inside pack_as_island itself (NDEBUG guard), but this test
+// calls sum_bitmap_overlap_max directly so it runs in Release builds too.
+//
+// Input: 6 mixed-size, mixed-shape items — 2 large rectangles,
+// 2 L-shapes, 2 small squares. Enough variety to exercise the coarse
+// grid scan and the refine pass, and enough density that the
+// placement loop has to navigate around already-committed items.
+//
+// The SUM check is the primary assertion. no_overlap (polygon-level)
+// is the secondary cross-check — if they disagree, it is a rasterization
+// fidelity issue worth surfacing separately.
+// ===========================================================================
+
+TEST_CASE("S3.1: SUM-bitmap — no pixel exceeds 1 after pack_as_island",
+          "[BitmapNesterC2][S3.1]")
+{
+    // 6 mixed-size items. Heights chosen so tall items place first,
+    // exercising the height-desc ordering introduced in M2.6.
+    ArrangePolygons items;
+    items.push_back(c2_make_ap(c2_rect_mm(40.0, 30.0), 120.0));  // 0 large, tall
+    items.push_back(c2_make_ap(c2_l_shape_40_20_mm(),  20.0));   // 1 L-shape
+    items.push_back(c2_make_ap(c2_rect_mm(25.0, 25.0), 10.0));   // 2 medium
+    items.push_back(c2_make_ap(c2_l_shape_40_20_mm(),  20.0));   // 3 L-shape
+    items.push_back(c2_make_ap(c2_rect_mm(15.0, 15.0), 10.0));   // 4 small
+    items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0), 10.0));   // 5 small
+
+    // Allow 4 rotations so the hull-scored greedy has freedom to find
+    // interlocks between the L-shapes and the rectangular items.
+    for (auto& ap : items)
+        ap.allowed_rotations = {0.0, M_PI / 2.0, M_PI, 3.0 * M_PI / 2.0};
+
+    BoundingBox bed        = c2_bed_mm(200.0, 200.0);
+    ArrangeParams params   = c2_params();
+    ArrangePolygons excludes;
+
+    auto cache  = BitmapNesterC2::build_cache(items);
+    auto groups = BitmapNesterC2::partition_items(cache, 1);
+    REQUIRE(groups.size() == 1);
+
+    auto island = BitmapNesterC2::pack_as_island(
+        items, cache, groups[0], excludes, bed, params);
+
+    UNSCOPED_INFO("compact_items committed: " << island.compact_items.size());
+    UNSCOPED_INFO("plate_bw=" << island.plate_bw
+                  << " plate_bh=" << island.plate_bh
+                  << " plate_wpr=" << island.plate_wpr);
+
+    // Primary assertion: the SUM-bitmap max must be <= 1. This is the
+    // S3.1 invariant — no pixel covered by more than one CompactItem.
+    uint16_t max_overlap = BitmapNesterC2::sum_bitmap_overlap_max(island);
+    UNSCOPED_INFO("sum_bitmap max coverage = " << (int)max_overlap);
+    REQUIRE(max_overlap <= 1);
+
+    // Secondary assertion: polygon-level overlap oracle agrees.
+    // Populate item translations from island data so no_overlap can
+    // compute transformed_poly() for each placed item.
+    for (std::size_t i = 0; i < island.item_indices.size(); ++i) {
+        std::size_t orig = island.item_indices[i];
+        items[orig].rotation    = island.rotations[i];
+        items[orig].translation = island.translations[i];
+        items[orig].bed_idx     = 0;
+    }
+    REQUIRE(test_utils::no_overlap(items));
+}

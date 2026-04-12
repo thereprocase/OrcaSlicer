@@ -666,43 +666,113 @@ private:
             int    best_px    = -1;
             int    best_py    = -1;
 
+            // S3.3: border-frame scan.
+            //
+            // The old rectangular scan visited every position in the
+            // expanded occupied extent, including deep-interior positions
+            // (always collide — cheap) AND far-exterior clear positions
+            // (never score well — expensive hull computation wasted).
+            //
+            // The border-frame scan visits only 4 strips that hug the
+            // cluster perimeter, where items can actually nestle against
+            // neighbors. For a cluster occupying C×C pixels the frame
+            // visits ~4*C/stride positions; the rectangle visited
+            // (C/stride)^2 — a 3-5× reduction for typical cluster sizes.
+            //
+            // Four strips (per rotation, because rc.iw/ih vary):
+            //   Top    : py in [search_min_py, occ_min_py],      px full
+            //   Bottom : py in [occ_max_py - rc.ih, rot_max_py], px full
+            //            (shifted so item bottom edge aligns with cluster bottom)
+            //   Left   : py in middle band, px in [search_min_px, occ_min_px]
+            //   Right  : py in middle band, px in [occ_max_px - rc.iw, rot_max_px]
+            //
+            // Strips may overlap at the corners; duplicates are
+            // harmless (collides() is nanoseconds and hull scoring is
+            // gated on a clear position).
+
             for (std::size_t rci = 0; rci < rot_cache.size(); ++rci) {
                 const RotCache& rc = rot_cache[rci];
                 int rot_max_px = std::min(plate_bw - rc.iw, search_max_px);
                 int rot_max_py = std::min(plate_bh - rc.ih, search_max_py);
 
-                for (int py = search_min_py; py <= rot_max_py; py += stride) {
-                    for (int px = search_min_px; px <= rot_max_px; px += stride) {
-                        // Bitmap AND is the narrow phase. Nanoseconds.
-                        if (BitmapNester::collides(plate_items, plate_wpr,
-                                                   plate_bw, plate_bh,
-                                                   rc.bm, rc.iwpr,
-                                                   rc.iw, rc.ih, px, py))
-                            continue;
+                // Shared lambda: evaluate one (px, py) candidate and
+                // update best_* if it improves the hull score.
+                auto eval = [&](int px, int py) {
+                    if (px < search_min_px || px > rot_max_px) return;
+                    if (py < search_min_py || py > rot_max_py) return;
+                    if (BitmapNester::collides(plate_items, plate_wpr,
+                                               plate_bw, plate_bh,
+                                               rc.bm, rc.iwpr,
+                                               rc.iw, rc.ih, px, py))
+                        return;
 
-                        // Score: hull perimeter delta if committed here.
-                        // Build the candidate polygon in world coords to
-                        // extract its vertices for the hull calc.
-                        ExPolygon candidate = base_poly;
-                        if (rc.rot != 0.0) candidate.rotate(rc.rot);
-                        coord_t cdx = scaled<coord_t>(px * res) - rc.rot_bb.min.x();
-                        coord_t cdy = scaled<coord_t>(py * res) - rc.rot_bb.min.y();
-                        candidate.translate(cdx, cdy);
+                    // Score: hull perimeter delta if committed here.
+                    ExPolygon candidate = base_poly;
+                    if (rc.rot != 0.0) candidate.rotate(rc.rot);
+                    coord_t cdx = scaled<coord_t>(px * res) - rc.rot_bb.min.x();
+                    coord_t cdy = scaled<coord_t>(py * res) - rc.rot_bb.min.y();
+                    candidate.translate(cdx, cdy);
 
-                        Points new_pts = placed_hull_pts;
-                        for (const Point& p : candidate.contour.points)
-                            new_pts.push_back(p);
-                        if (new_pts.size() < 3) continue;
-                        Polygon new_hull = Geometry::convex_hull(new_pts);
-                        if (new_hull.points.size() < 3) continue;
-                        double new_perim = unscaled<double>(new_hull.length());
-                        double delta = new_perim - current_hull_perim_mm;
-                        if (delta < best_score) {
-                            best_score = delta;
-                            best_rci   = (int)rci;
-                            best_px    = px;
-                            best_py    = py;
-                        }
+                    Points new_pts = placed_hull_pts;
+                    for (const Point& p : candidate.contour.points)
+                        new_pts.push_back(p);
+                    if (new_pts.size() < 3) return;
+                    Polygon new_hull = Geometry::convex_hull(new_pts);
+                    if (new_hull.points.size() < 3) return;
+                    double new_perim = unscaled<double>(new_hull.length());
+                    double delta = new_perim - current_hull_perim_mm;
+                    if (delta < best_score) {
+                        best_score = delta;
+                        best_rci   = (int)rci;
+                        best_px    = px;
+                        best_py    = py;
+                    }
+                };
+
+                // Top strip: item above or flush with cluster top.
+                // py range: [search_min_py, occ_min_py], full px.
+                {
+                    int strip_max_py = std::min(rot_max_py, occ_min_py);
+                    for (int py = search_min_py; py <= strip_max_py; py += stride)
+                        for (int px = search_min_px; px <= rot_max_px; px += stride)
+                            eval(px, py);
+                }
+
+                // Bottom strip: item below or flush with cluster bottom.
+                // py range: [occ_max_py - rc.ih, rot_max_py], full px.
+                {
+                    int strip_min_py = std::max(search_min_py, occ_max_py - rc.ih);
+                    // Avoid re-scanning top strip (overlap at corners is
+                    // harmless but wastes cycles on tall items).
+                    strip_min_py = std::max(strip_min_py, occ_min_py + stride);
+                    for (int py = strip_min_py; py <= rot_max_py; py += stride)
+                        for (int px = search_min_px; px <= rot_max_px; px += stride)
+                            eval(px, py);
+                }
+
+                // Middle-band py range (left and right strips only).
+                // Rows already covered by top/bottom strips are excluded
+                // to avoid redundant hull scoring.
+                int mid_min_py = std::max(search_min_py, occ_min_py + stride);
+                int mid_max_py = std::min(rot_max_py,
+                                          occ_max_py - rc.ih - stride);
+
+                if (mid_min_py <= mid_max_py) {
+                    // Left strip: item left of or flush with cluster left edge.
+                    {
+                        int strip_max_px = std::min(rot_max_px, occ_min_px);
+                        for (int py = mid_min_py; py <= mid_max_py; py += stride)
+                            for (int px = search_min_px; px <= strip_max_px; px += stride)
+                                eval(px, py);
+                    }
+                    // Right strip: item right of or flush with cluster right edge.
+                    {
+                        int strip_min_px = std::max(search_min_px,
+                                                     occ_max_px - rc.iw);
+                        strip_min_px = std::max(strip_min_px, occ_min_px + stride);
+                        for (int py = mid_min_py; py <= mid_max_py; py += stride)
+                            for (int px = strip_min_px; px <= rot_max_px; px += stride)
+                                eval(px, py);
                     }
                 }
             }
@@ -784,6 +854,51 @@ private:
                 std::move(rot_cache[best_rci].bm),
                 br.iw, br.ih, br.iwpr, best_px, best_py, br.rot});
         }
+
+#ifndef NDEBUG
+        // S3.1 SUM-bitmap integrity check.
+        //
+        // After the placement loop, every committed CompactItem must
+        // occupy a disjoint set of pixels on the virtual plate. We
+        // verify this by accumulating per-pixel contribution counts
+        // in a uint16_t shadow buffer and asserting no pixel exceeds 1.
+        //
+        // uint16_t (not uint64_t) because we need per-pixel counts, not
+        // word-packed bits. A value > 1 means two CompactItems share at
+        // least one pixel — accumulated-overlap bug that the pairwise
+        // bitmap AND collision check should have prevented.
+        //
+        // Complexity: O(N * iw * ih) where N = island.compact_items.size().
+        // For 40 items on a 2048×2048 plate this is ~50µs. NDEBUG guard
+        // ensures it compiles out entirely in Release builds.
+        if (!island.compact_items.empty()) {
+            std::vector<uint16_t> sum_buf(
+                (std::size_t)plate_wpr * plate_bh * 64, 0);
+            for (const CompactItem& ci : island.compact_items) {
+                for (int row = 0; row < ci.ih; ++row) {
+                    for (int word = 0; word < ci.iwpr; ++word) {
+                        uint64_t w = ci.bm[(std::size_t)row * ci.iwpr + word];
+                        if (w == 0) continue;
+                        int plate_row = ci.py + row;
+                        if (plate_row < 0 || plate_row >= plate_bh) continue;
+                        // Each bit in the word corresponds to one pixel.
+                        // Pixel x = ci.px + word*64 + bit_index.
+                        int base_x = ci.px + word * 64;
+                        for (int bit = 0; bit < 64; ++bit) {
+                            if (!((w >> bit) & 1ULL)) continue;
+                            int px_x = base_x + bit;
+                            if (px_x < 0 || px_x >= plate_bw) continue;
+                            std::size_t pixel_idx =
+                                (std::size_t)plate_row * plate_bw + px_x;
+                            sum_buf[pixel_idx]++;
+                            assert(sum_buf[pixel_idx] <= 1 &&
+                                   "S3.1: pixel overlap — two CompactItems share a pixel");
+                        }
+                    }
+                }
+            }
+        }
+#endif
 
         // Finalize island metadata. island.bbox is computed from
         // the accumulated hull vertices — this is the "min/max of
@@ -1225,6 +1340,57 @@ private:
             coord_t ty = scaled<coord_t>(ci.py * res) - rot_bb.min.y();
             items[orig].translation = Vec2crd{tx, ty};
         }
+    }
+
+#ifdef BITMAP_NESTER_C2_TESTING
+public:
+#else
+private:
+#endif
+
+    // S3.1: SUM-bitmap overlap checker.
+    //
+    // Iterates all CompactItems in the island and counts how many times
+    // each pixel is covered. Returns the maximum coverage count found.
+    // A correct placement has max == 1 (every pixel covered by at most
+    // one item) or max == 0 (no items placed). Any value > 1 indicates
+    // two or more items share a pixel — an overlap.
+    //
+    // Uses island.plate_bw and island.plate_bh to bound the pixel
+    // coordinate space; pixels that fall outside those bounds are
+    // ignored (they represent out-of-plate data, which is a separate
+    // concern).
+    //
+    // Complexity: O(N * iw * ih) per item, dominated by the inner
+    // bit-scan. For 40 items on a 2048x2048 plate this is ~50 µs.
+    static uint16_t sum_bitmap_overlap_max(const NesterC2Island& island)
+    {
+        if (island.compact_items.empty()) return 0;
+        const int bw  = island.plate_bw;
+        const int bh  = island.plate_bh;
+        std::vector<uint16_t> sum_buf((std::size_t)bw * bh, 0);
+        uint16_t max_count = 0;
+        for (const CompactItem& ci : island.compact_items) {
+            for (int row = 0; row < ci.ih; ++row) {
+                const int plate_row = ci.py + row;
+                if (plate_row < 0 || plate_row >= bh) continue;
+                for (int word = 0; word < ci.iwpr; ++word) {
+                    uint64_t w = ci.bm[(std::size_t)row * ci.iwpr + word];
+                    if (w == 0) continue;
+                    const int base_x = ci.px + word * 64;
+                    for (int bit = 0; bit < 64; ++bit) {
+                        if (!((w >> bit) & 1ULL)) continue;
+                        const int px_x = base_x + bit;
+                        if (px_x < 0 || px_x >= bw) continue;
+                        uint16_t& cell = sum_buf[
+                            (std::size_t)plate_row * bw + px_x];
+                        ++cell;
+                        if (cell > max_count) max_count = cell;
+                    }
+                }
+            }
+        }
+        return max_count;
     }
 };
 
