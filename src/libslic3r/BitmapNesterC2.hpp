@@ -111,18 +111,15 @@ public:
                         const BoundingBox& bed,
                         const ArrangeParams& params)
     {
-        // C2 M2 pipeline:
+        // C2 M3 pipeline:
         //   phase 0 — build per-item cache
         //   phase 1 — estimate K_min
         //   phase 2 — partition items into K groups
-        //   phase 3 — pack each group into an Island (M2.2:
-        //             delegation-based stub that still calls
-        //             BitmapNester inside; M2.3 replaces with real
-        //             hull-scored inner loop)
-        //   phase 4 — locate each island on its plate (M2.2 stub:
-        //             direct write-out using the island's absolute
-        //             coordinates; M3 replaces with hull-centroid
-        //             centering and spillover recovery)
+        //   phase 3 — pack each group into an Island (M2.3: real
+        //             hull-scored greedy loop, bound-agnostic)
+        //   phase 4 — locate each island on its plate (M3.0: hull-
+        //             centroid → bed-center shift, clamped to bed)
+        //   phase 5 — spillover recovery (M3.1: upcoming)
         if (items.empty()) return;
 
         auto cache  = build_cache(items);
@@ -137,11 +134,12 @@ public:
             return;
         }
 
-        // Multi-group path: pack each group as an island and locate.
+        // Multi-group path: pack each group as an island, then
+        // locate each island on its own plate.
         for (std::size_t g = 0; g < groups.size(); ++g) {
             NesterC2Island island = pack_as_island(
                 items, cache, groups[g], excludes, bed, params);
-            locate_island_on_plate(items, island, (int)g);
+            locate_island_on_plate(items, island, (int)g, bed);
         }
     }
 
@@ -588,33 +586,74 @@ private:
         return island;
     }
 
-    // M2.2 stub: locate an island on a plate.
+    // M3.0: locate an island on a plate.
     //
-    // CURRENT STATE: writes the island's items directly back to the
-    // caller's items[] vector with their bed_idx set to plate_idx.
-    // No coordinate shift — the M2.2 delegation path uses world
-    // coordinates (not relative-to-seed), so items are already where
-    // BitmapNester::arrange placed them.
+    // Takes a packed island (from pack_as_island, which works in
+    // bound-agnostic local coordinates) and positions it on the
+    // given plate by shifting so the island's hull centroid lands
+    // at the bed center. The shift is clamped so the island's bbox
+    // stays inside the bed.
     //
-    // M3 replaces this with a real two-step: shift so hull centroid
-    // lands at bed center (clamped to bed bounds), then write out.
-    // M3 also handles excludes (wipe tower collision avoidance).
+    // Why hull centroid and not bbox center? Bbox center is biased
+    // by corner items (a single spike on one side of an otherwise
+    // compact cluster drags the bbox center toward the spike).
+    // Hull centroid is the average of the hull vertices, which for
+    // a compact cluster better represents the visual center. Not
+    // perfect — a proper area-weighted centroid would be more
+    // accurate — but good enough for centering, and cheap.
+    //
+    // Items that are UNARRANGED in the island stay UNARRANGED in
+    // the output (not written to items_out). M3.1 recover_spillover
+    // will retry them.
+    //
+    // Excludes (wipe tower, calibration zones) are NOT handled
+    // yet. An M3.1 follow-up will add a safety check that clamps
+    // the shift if it would cause an item to overlap an exclude.
     static void locate_island_on_plate(ArrangePolygons& items_out,
                                        const NesterC2Island& island,
-                                       int plate_idx)
+                                       int plate_idx,
+                                       const BoundingBox& bed)
     {
+        if (island.item_indices.empty()) return;
+
+        // Compute the delta: where we want the hull centroid vs
+        // where it currently is. Convert from mm to scaled coord_t.
+        double bed_cx = unscaled<double>(bed.center().x());
+        double bed_cy = unscaled<double>(bed.center().y());
+
+        double dx_mm = bed_cx - island.hull_centroid_mm.x();
+        double dy_mm = bed_cy - island.hull_centroid_mm.y();
+
+        coord_t dx = scaled<coord_t>(dx_mm);
+        coord_t dy = scaled<coord_t>(dy_mm);
+
+        // Clamp so the island's bbox-after-shift stays inside bed.
+        // If the island is bigger than the bed in either axis, just
+        // align its min to the bed min (best we can do without
+        // cropping).
+        BoundingBox shifted_bbox = island.bbox;
+        shifted_bbox.min += Point(dx, dy);
+        shifted_bbox.max += Point(dx, dy);
+
+        if (shifted_bbox.min.x() < bed.min.x())
+            dx += (bed.min.x() - shifted_bbox.min.x());
+        if (shifted_bbox.max.x() > bed.max.x())
+            dx -= (shifted_bbox.max.x() - bed.max.x());
+        if (shifted_bbox.min.y() < bed.min.y())
+            dy += (bed.min.y() - shifted_bbox.min.y());
+        if (shifted_bbox.max.y() > bed.max.y())
+            dy -= (shifted_bbox.max.y() - bed.max.y());
+
+        // Write out each item with the centered translation and the
+        // plate_idx as bed_idx.
+        Point shift(dx, dy);
         for (std::size_t i = 0; i < island.item_indices.size(); ++i) {
             std::size_t orig = island.item_indices[i];
-            items_out[orig].translation = island.translations[i];
+            Vec2crd t = island.translations[i];
+            items_out[orig].translation = Vec2crd{t.x() + shift.x(),
+                                                  t.y() + shift.y()};
             items_out[orig].rotation    = island.rotations[i];
-            // plate_idx here is the group index; for single-plate
-            // fits we write 0, for multi-plate cases the groups
-            // get distinct plate numbers.
-            //
-            // Items that couldn't place inside pack_as_island keep
-            // their UNARRANGED state. They're candidates for M3's
-            // spillover recovery.
-            items_out[orig].bed_idx = (plate_idx);
+            items_out[orig].bed_idx     = plate_idx;
         }
     }
 
