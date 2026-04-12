@@ -353,16 +353,51 @@ inline bool no_overlap(const ArrangePolygons &items)
 // Usage:
 //   test_utils::dump_placement_ascii(items, bed, "test_name.txt");
 
+// cell_mm default: match bitmap resolution (0.5mm) to avoid Nyquist
+// aliasing. The render auto-crops to the occupied region ± 5 cells
+// so the output stays compact even at high resolution.
 inline void dump_placement_ascii(const ArrangePolygons& items,
                                   const BoundingBox& bed,
                                   const std::string& filename,
-                                  double cell_mm = 5.0)
+                                  double cell_mm = 0.5)
 {
     double bed_w = unscaled<double>(bed.size().x());
     double bed_h = unscaled<double>(bed.size().y());
-    int cols = (int)(bed_w / cell_mm) + 2;  // +2 for border
-    int rows = (int)(bed_h / cell_mm) + 2;
-    if (cols > 200 || rows > 200) return;
+    int full_cols = (int)(bed_w / cell_mm);
+    int full_rows = (int)(bed_h / cell_mm);
+
+    // First pass: find the occupied bounding region in cell coords
+    // so we can crop to it + margin. Avoids 400×400 grids at 0.5mm.
+    int occ_min_c = full_cols, occ_max_c = 0;
+    int occ_min_r = full_rows, occ_max_r = 0;
+    double bed_min_x_pre = unscaled<double>(bed.min.x());
+    double bed_min_y_pre = unscaled<double>(bed.min.y());
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (items[i].bed_idx == UNARRANGED) continue;
+        ExPolygon poly = items[i].poly;
+        if (items[i].rotation != 0.0) poly.rotate(items[i].rotation);
+        poly.translate(items[i].translation.x(), items[i].translation.y());
+        BoundingBox pbb = get_extents(poly);
+        int c0 = (int)((unscaled<double>(pbb.min.x()) - bed_min_x_pre) / cell_mm);
+        int c1 = (int)((unscaled<double>(pbb.max.x()) - bed_min_x_pre) / cell_mm);
+        int r0 = (int)((unscaled<double>(pbb.min.y()) - bed_min_y_pre) / cell_mm);
+        int r1 = (int)((unscaled<double>(pbb.max.y()) - bed_min_y_pre) / cell_mm);
+        occ_min_c = std::min(occ_min_c, c0);
+        occ_max_c = std::max(occ_max_c, c1);
+        occ_min_r = std::min(occ_min_r, r0);
+        occ_max_r = std::max(occ_max_r, r1);
+    }
+    if (occ_max_c <= occ_min_c) return;  // nothing placed
+
+    // Crop window: occupied region + 5 cells margin on each side.
+    int margin = 5;
+    int crop_c0 = std::max(0, occ_min_c - margin);
+    int crop_r0 = std::max(0, occ_min_r - margin);
+    int crop_c1 = std::min(full_cols, occ_max_c + margin);
+    int crop_r1 = std::min(full_rows, occ_max_r + margin);
+    int cols = crop_c1 - crop_c0 + 2;  // +2 for border
+    int rows = crop_r1 - crop_r0 + 2;
+    if (cols > 400 || rows > 400) return;
 
     // Grid: 0 = empty, 1-26 = item A-Z, -1 = overlap
     std::vector<int> grid(cols * rows, 0);
@@ -381,8 +416,8 @@ inline void dump_placement_ascii(const ArrangePolygons& items,
 
         for (int r = 0; r < rows - 2; ++r) {
             for (int c = 0; c < cols - 2; ++c) {
-                double wx = bed_min_x + (c + 0.5) * cell_mm;
-                double wy = bed_min_y + (r + 0.5) * cell_mm;
+                double wx = bed_min_x + (crop_c0 + c + 0.5) * cell_mm;
+                double wy = bed_min_y + (crop_r0 + r + 0.5) * cell_mm;
                 Point pt(scaled<coord_t>(wx), scaled<coord_t>(wy));
                 if (poly.contains(pt)) {
                     int gi = (r + 1) * cols + (c + 1);
@@ -400,8 +435,10 @@ inline void dump_placement_ascii(const ArrangePolygons& items,
     if (!f) return;
 
     // Header.
-    fprintf(f, "# C2 placement render: %dx%d mm bed, %.0f mm/cell\n",
-            (int)bed_w, (int)bed_h, cell_mm);
+    fprintf(f, "# C2 placement render: %dx%d mm bed, %.1f mm/cell, crop [%d-%d]x[%d-%d]\n",
+            (int)bed_w, (int)bed_h, cell_mm,
+            (int)(crop_c0 * cell_mm), (int)(crop_c1 * cell_mm),
+            (int)(crop_r0 * cell_mm), (int)(crop_r1 * cell_mm));
     fprintf(f, "# Items: %d placed\n", (int)items.size());
 
     // Top border.
