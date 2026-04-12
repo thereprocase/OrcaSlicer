@@ -1765,3 +1765,65 @@ TEST_CASE("S3.5: C2 vs C1 plate count on L-bracket mix",
     UNSCOPED_INFO("C2 polygon overlap: " << (c2_clean ? "clean" : "micro-overlaps (bitmap quantization)"));
     REQUIRE(c2_clean);  // Enabled after min_obj_distance inflation (S3.6)
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Treebeard-crit A: cluster-centroid compactness regression gate.
+//
+// 20 identical squares on a 256×210 bed. The centroid spread (range
+// of item centers in X and Y) must be bounded — proves the scorer
+// actually clusters instead of scattering. A random placer would
+// spread centers across the full bed; hull-perimeter scoring keeps
+// them tight.
+// ────────────────────────────────────────────────────────────────────
+TEST_CASE("C2: cluster-centroid compactness gate",
+          "[BitmapNesterC2][compactness]")
+{
+    ArrangePolygons items;
+    for (int i = 0; i < 20; ++i)
+        items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+
+    BoundingBox bed = c2_bed_mm(256.0, 210.0);
+    ArrangeParams params = c2_params();
+    params.min_obj_distance = scaled<coord_t>(1.0);
+    ArrangePolygons excludes;
+
+    BitmapNesterC2::arrange(items, excludes, bed, params);
+
+    // Compute centroid spread: range of item centers.
+    double min_cx = 1e9, max_cx = -1e9;
+    double min_cy = 1e9, max_cy = -1e9;
+    for (const auto& ap : items) {
+        if (ap.bed_idx == UNARRANGED) continue;
+        ExPolygon placed = ap.poly;
+        if (ap.rotation != 0.0) placed.rotate(ap.rotation);
+        placed.translate(ap.translation.x(), ap.translation.y());
+        BoundingBox pbb = get_extents(placed);
+        double cx = unscaled<double>(pbb.center().x());
+        double cy = unscaled<double>(pbb.center().y());
+        min_cx = std::min(min_cx, cx);
+        max_cx = std::max(max_cx, cx);
+        min_cy = std::min(min_cy, cy);
+        max_cy = std::max(max_cy, cy);
+    }
+    double spread_w = max_cx - min_cx;
+    double spread_h = max_cy - min_cy;
+    double spread_area = spread_w * spread_h;
+
+    UNSCOPED_INFO("centroid spread: " << spread_w << " x " << spread_h
+                  << " = " << spread_area << " mm^2");
+
+    // 20 squares of 30mm on a 256×210 bed. Total area = 18000 mm^2.
+    // Bed area = 53760 mm^2. At ~33% fill, a good packer clusters
+    // the 20 squares into a roughly 150×120 region. Centroid spread
+    // should be well under 180×180 = 32400 mm^2.
+    REQUIRE(spread_area <= 32400.0);
+
+    // All items placed.
+    int placed_count = 0;
+    for (const auto& ap : items)
+        if (ap.bed_idx != UNARRANGED) ++placed_count;
+    REQUIRE(placed_count == 20);
+
+    // Render.
+    test_utils::dump_placement_png(items, bed, "c2_compactness_gate.png");
+}
