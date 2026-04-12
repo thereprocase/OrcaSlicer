@@ -320,23 +320,37 @@ public:
 private:
 #endif
 
-    // M2.2: pack a group into an island.
+    // M2.3: pack a group into an island via hull-scored greedy placement.
     //
-    // CURRENT STATE (infrastructure via delegation):
-    //   Builds a temporary ArrangePolygons slice from the group,
-    //   invokes BitmapNester::arrange with the caller's bed, captures
-    //   the result, and packages it as a NesterC2Island. This still
-    //   uses C1's bbox-based scoring internally. The real hull-scored
-    //   inner loop is M2.3.
+    // This is the first C2 code that actively drives placement by
+    // delta hull perimeter instead of bbox area. For each item (sorted
+    // by priority_score descending = tall/hard items first):
     //
-    // The Island data path IS real — M2.3 will plug a different inner
-    // loop into this function signature without touching the callers.
-    // M3's locate_island_on_plate already consumes Island structs.
+    //   1. Iterate allowed rotations
+    //   2. Iterate a coarse grid of candidate positions around the
+    //      current cluster bbox, expanded by the item's max dimension
+    //   3. For each candidate, check collision against all placed
+    //      items via Clipper intersection_ex (slow but no-C1-coupling)
+    //   4. Score each clear candidate by delta(hull perimeter) — i.e.,
+    //      the new cluster hull perimeter if this item were placed here
+    //   5. Commit the globally best candidate across all rotations
     //
-    // Output translations are in world coordinates (matching the caller's
-    // bed), not relative-to-seed, because the M2.2 delegation already
-    // positions items against a real bed. M2.3's bound-agnostic packing
-    // will output relative coordinates and defer positioning to M3.
+    // Seed item (first placed) goes to origin (0,0) with rotation 0.
+    // Items that don't find a clear position anywhere in the search
+    // window are left UNARRANGED — M3's spillover recovery will
+    // handle them.
+    //
+    // Performance: O(N × R × (pos_count) × N) where N is group size,
+    // R is allowed rotations, pos_count is typically ~100-400 grid
+    // cells. Uses intersection_ex per candidate which is the slow
+    // part. For 20-item groups this is a few seconds — acceptable
+    // for dev iteration, will need a faster collision path (likely
+    // bitmap via a collaborator pattern) before production use.
+    //
+    // NOTE: bed parameter is currently ignored. This is a BOUND-AGNOSTIC
+    // pack — the island grows freely and the caller's locate phase
+    // handles fitting it onto a real plate. excludes likewise ignored
+    // because the island has no notion of a plate yet.
     static NesterC2Island pack_as_island(
         const ArrangePolygons& items_in,
         const std::vector<NesterC2ItemInfo>& cache,
@@ -345,45 +359,169 @@ private:
         const BoundingBox& bed,
         const ArrangeParams& params)
     {
-        (void)cache;  // unused in M2.2 delegation path; read in M2.3
+        (void)excludes;
+        (void)bed;
+        (void)params;
+
         NesterC2Island island;
         if (group.items.empty()) return island;
 
-        // Build a slice of the caller's ArrangePolygons for this group.
-        ArrangePolygons slice;
-        slice.reserve(group.items.size());
-        for (std::size_t idx : group.items) slice.push_back(items_in[idx]);
+        // Placement order: priority_score desc. Tallest/hardest first.
+        std::vector<std::size_t> order = group.items;
+        std::sort(order.begin(), order.end(),
+                  [&cache](std::size_t a, std::size_t b) {
+                      const auto& ia = *std::find_if(
+                          cache.begin(), cache.end(),
+                          [a](const NesterC2ItemInfo& i) { return i.original_idx == a; });
+                      const auto& ib = *std::find_if(
+                          cache.begin(), cache.end(),
+                          [b](const NesterC2ItemInfo& i) { return i.original_idx == b; });
+                      return ia.priority_score > ib.priority_score;
+                  });
 
-        // Delegate to C1. Full bed available; no artificial constraint.
-        BitmapNester::arrange(slice, excludes, bed, params);
+        // Placed polygons in local (island) coordinates.
+        ExPolygons placed_polys;
+        Points     placed_hull_pts;  // accumulated vertices for hull calcs
+        double     current_hull_perim_mm = 0.0;
 
-        // Collect the packed state into the Island.
-        Points hull_input;
-        bool bbox_init = false;
-        for (std::size_t s = 0; s < slice.size(); ++s) {
-            island.item_indices.push_back(group.items[s]);
-            island.rotations.push_back(slice[s].rotation);
-            island.translations.push_back(slice[s].translation);
+        for (std::size_t idx : order) {
+            const ArrangePolygon& ap = items_in[idx];
+            ExPolygon base_poly = ap.poly;
+            const std::vector<double>& rots_raw = ap.allowed_rotations;
+            std::vector<double> rots = rots_raw;
+            if (rots.empty()) rots.push_back(0.0);
 
-            if (slice[s].bed_idx == UNARRANGED) continue;
-            // Accumulate vertices for hull computation.
-            ExPolygon tp = slice[s].transformed_poly();
-            BoundingBox bb = get_extents(tp);
-            if (!bbox_init) { island.bbox = bb; bbox_init = true; }
-            else              island.bbox.merge(bb);
-            for (const Point& p : tp.contour.points)
-                hull_input.push_back(p);
+            // First item: seed at origin, rotation 0.
+            if (placed_polys.empty()) {
+                ExPolygon seeded = base_poly;
+                // Translate so bbox min lands at (0, 0) — predictable
+                // seed position regardless of input polygon offsets.
+                BoundingBox sbb = get_extents(seeded);
+                seeded.translate(-sbb.min.x(), -sbb.min.y());
+                placed_polys.push_back(seeded);
+
+                for (const Point& p : seeded.contour.points)
+                    placed_hull_pts.push_back(p);
+                if (placed_hull_pts.size() >= 3) {
+                    Polygon hull = Geometry::convex_hull(placed_hull_pts);
+                    if (hull.points.size() >= 3)
+                        current_hull_perim_mm = unscaled<double>(hull.length());
+                }
+                island.item_indices.push_back(idx);
+                island.rotations.push_back(0.0);
+                island.translations.push_back(Vec2crd{-sbb.min.x(), -sbb.min.y()});
+                continue;
+            }
+
+            // Compute current cluster bbox for grid search window.
+            BoundingBox cluster_bb = get_extents(placed_polys);
+
+            // Grid stride: max_dim / 4 mm, floor 2 mm. Coarse enough to
+            // keep candidate counts manageable.
+            double max_dim_mm = 20.0;
+            for (const auto& info : cache) {
+                if (info.original_idx == idx) {
+                    max_dim_mm = info.max_dim_mm;
+                    break;
+                }
+            }
+            double stride_mm = std::max(2.0, max_dim_mm / 4.0);
+            coord_t stride = scaled<coord_t>(stride_mm);
+
+            // Search window: cluster bbox expanded by max_dim on all
+            // sides. Items can wrap around the cluster.
+            coord_t margin = scaled<coord_t>(max_dim_mm * 1.25);
+            BoundingBox search_bb = cluster_bb;
+            search_bb.min -= Point(margin, margin);
+            search_bb.max += Point(margin, margin);
+
+            // Track the globally best (rot, px, py) across all rotations.
+            double best_score  = std::numeric_limits<double>::max();
+            double best_rot    = 0.0;
+            Vec2crd best_trans = Vec2crd{0, 0};
+            ExPolygon best_committed;
+            bool best_found = false;
+
+            for (double rot : rots) {
+                ExPolygon rotated = base_poly;
+                if (rot != 0.0) rotated.rotate(rot);
+                BoundingBox rot_bb = get_extents(rotated);
+                coord_t rot_w = rot_bb.size().x();
+                coord_t rot_h = rot_bb.size().y();
+                (void)rot_w; (void)rot_h;  // reserved for early bbox-vs-gap pruning
+
+                for (coord_t y = search_bb.min.y();
+                     y <= search_bb.max.y(); y += stride) {
+                    for (coord_t x = search_bb.min.x();
+                         x <= search_bb.max.x(); x += stride) {
+                        // Candidate: rotated shape translated so its
+                        // bbox min is at (x, y).
+                        ExPolygon candidate = rotated;
+                        candidate.translate(x - rot_bb.min.x(),
+                                            y - rot_bb.min.y());
+
+                        // Collision check vs all placed.
+                        ExPolygons cand_vec{candidate};
+                        bool collides = false;
+                        for (const ExPolygon& placed : placed_polys) {
+                            ExPolygons inter = intersection_ex(
+                                cand_vec, ExPolygons{placed});
+                            if (!inter.empty()) { collides = true; break; }
+                        }
+                        if (collides) continue;
+
+                        // Score: new hull perimeter if this commits.
+                        Points new_pts = placed_hull_pts;
+                        for (const Point& p : candidate.contour.points)
+                            new_pts.push_back(p);
+                        if (new_pts.size() < 3) continue;
+                        Polygon new_hull = Geometry::convex_hull(new_pts);
+                        if (new_hull.points.size() < 3) continue;
+                        double new_perim = unscaled<double>(new_hull.length());
+                        double delta = new_perim - current_hull_perim_mm;
+                        if (delta < best_score) {
+                            best_score     = delta;
+                            best_rot       = rot;
+                            best_trans     = Vec2crd{
+                                x - rot_bb.min.x(), y - rot_bb.min.y()};
+                            best_committed = candidate;
+                            best_found     = true;
+                        }
+                    }
+                }
+            }
+
+            if (!best_found) {
+                // Couldn't place this item in the search window. Mark
+                // it unplaced; M3 recover_spillover will try harder.
+                // (In M2.3's current state this just means the item's
+                // bed_idx stays UNARRANGED in items_out.)
+                continue;
+            }
+
+            // Commit: update placed_polys + hull state, record on island.
+            placed_polys.push_back(best_committed);
+            for (const Point& p : best_committed.contour.points)
+                placed_hull_pts.push_back(p);
+            if (placed_hull_pts.size() >= 3) {
+                Polygon hull = Geometry::convex_hull(placed_hull_pts);
+                if (hull.points.size() >= 3)
+                    current_hull_perim_mm = unscaled<double>(hull.length());
+            }
+            island.item_indices.push_back(idx);
+            island.rotations.push_back(best_rot);
+            island.translations.push_back(best_trans);
         }
 
-        // Compute hull perimeter and centroid. Both are future-used
-        // by locate_island_on_plate and by test metrics.
-        if (hull_input.size() >= 3) {
-            Polygon hull = Geometry::convex_hull(hull_input);
+        // Finalize island metadata.
+        if (!placed_polys.empty()) {
+            island.bbox = get_extents(placed_polys);
+        }
+        island.hull_perimeter_mm = current_hull_perim_mm;
+
+        if (placed_hull_pts.size() >= 3) {
+            Polygon hull = Geometry::convex_hull(placed_hull_pts);
             if (hull.points.size() >= 3) {
-                island.hull_perimeter_mm = unscaled<double>(hull.length());
-                // Simple centroid: average of hull vertices. For a
-                // tightly-packed hull this is close enough to the
-                // geometric centroid for centering use.
                 double cx = 0.0, cy = 0.0;
                 for (const Point& p : hull.points) {
                     cx += unscaled<double>(p.x());
@@ -394,7 +532,6 @@ private:
                 island.hull_centroid_mm = Vec2d(cx, cy);
             }
         }
-
         return island;
     }
 
