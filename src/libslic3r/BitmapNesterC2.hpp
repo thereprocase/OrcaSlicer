@@ -174,6 +174,33 @@ public:
         if (items.empty()) return;
 
         auto cache  = build_cache(items);
+
+        // Pre-filter: items that cannot be inscribed in the bed at
+        // any allowed rotation are unfittable. Mark them UNARRANGED
+        // now so they skip the entire pipeline and go straight to
+        // spillover (which gives each its own plate — correct
+        // behavior for an oversized part). Remove them from cache
+        // so partition_items never sees them.
+        double bed_w_mm = unscaled<double>(bed.size().x());
+        double bed_h_mm = unscaled<double>(bed.size().y());
+        cache.erase(std::remove_if(cache.begin(), cache.end(),
+            [&](const NesterC2ItemInfo& info) {
+                const ArrangePolygon& ap = items[info.original_idx];
+                std::vector<double> rots = ap.allowed_rotations;
+                if (rots.empty()) rots.push_back(0.0);
+                for (double rot : rots) {
+                    ExPolygon rotated = ap.poly;
+                    if (rot != 0.0) rotated.rotate(rot);
+                    BoundingBox rbb = get_extents(rotated);
+                    double rw = unscaled<double>(rbb.size().x());
+                    double rh = unscaled<double>(rbb.size().y());
+                    if (rw <= bed_w_mm && rh <= bed_h_mm)
+                        return false;  // fits at this rotation — keep
+                }
+                return true;  // no rotation fits — remove from cache
+            }),
+            cache.end());
+
         int  k      = estimate_min_plates(cache, bed);
         auto groups = partition_items(cache, k);
 
