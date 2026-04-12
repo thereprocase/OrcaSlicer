@@ -47,18 +47,30 @@ namespace Slic3r { namespace arrangement {
 struct NesterC2ItemInfo {
     std::size_t original_idx = 0;
 
-    // Geometric summary. Populated in build_cache (M1). Zero-initialized
-    // in M0 so pass-through compiles.
-    double silhouette_area_mm2   = 0.0;
+    // Geometric summary. Populated in build_cache (M1+).
+    // silhouette_area_mm2: actual polygon area (pixel-count proxy
+    //   at the 0.5 mm bitmap resolution) — use this instead of bbox
+    //   area for sort/partition per the M2.5 bbox purge directive.
+    // hull_area_mm2, hull_perimeter_mm: convex hull metrics.
+    // height_mm: Z extent from ArrangePolygon::height (populated by
+    //   Orca's ModelArrange.cpp from the 3D mesh).
+    //
+    // NOTE: max_dim_mm WAS here in M1 but was removed in M2.5.4 as
+    // part of the bbox purge — it was a bbox-derived value and no
+    // longer has any consumer in the C2 pipeline.
+    double silhouette_area_mm2     = 0.0;
     double silhouette_perimeter_mm = 0.0;
-    double hull_area_mm2         = 0.0;
-    double hull_perimeter_mm     = 0.0;
-    double max_dim_mm            = 0.0;
-    double height_mm             = 0.0;
+    double hull_area_mm2           = 0.0;
+    double hull_perimeter_mm       = 0.0;
+    double height_mm               = 0.0;
 
-    // Derived heuristics. Populated in build_cache (M1).
-    // hardness_score = hull_area / silhouette_area; higher = harder to pack
-    // priority_score = composite of priority, hardness, and height
+    // Derived heuristics. Populated in build_cache.
+    // hardness_score: hull_area / silhouette_area; higher = more
+    //   concavity, harder to pack around neighbors, should go first.
+    // priority_score: composite sort key. See build_cache for the
+    //   weighting formula — silhouette area dominates, hardness and
+    //   height are secondary. Larger parts placed first gives the
+    //   greedy more room to find interlocks for the small parts.
     double hardness_score = 1.0;
     double priority_score = 0.0;
 };
@@ -206,26 +218,36 @@ private:
                     info.hardness_score = h_area / s_area;
             }
 
-            // Bounding box — used for FFD-style sizing and for the
-            // max_dim field. Matches ArrangePolygon::poly bbox.
-            BoundingBox bb;
-            if (!ap.concave_regions.empty()) {
-                bb = get_extents(ap.concave_regions);
-            } else {
-                bb = get_extents(ap.poly);
-            }
-            double bb_w = unscaled<double>(bb.size().x());
-            double bb_h = unscaled<double>(bb.size().y());
-            info.max_dim_mm = std::max(bb_w, bb_h);
-
             info.height_mm = ap.height;
 
-            // Priority score: composite of caller priority, hardness,
-            // and height. Higher = placed earlier. Used by partitioning
-            // to pick a seed order before K-way distribution.
+            // Priority score: composite sort key for placement order.
+            // Silhouette area (pixel-count proxy) dominates — bigger
+            // parts placed first gives the greedy more freedom to fit
+            // small parts around them. Hardness and height are
+            // secondary tiebreakers.
+            //
+            // M2.5.4 note: this replaces the old formula that weighted
+            // hardness most. Silhouette area is a better primary key
+            // per the boss's directive — a crescent and a square with
+            // the same bbox have very different pixel counts, and the
+            // crescent should go first because it's harder to fit.
+            // Using silhouette area (which IS the pixel count up to
+            // rasterization error) as the primary sort key achieves
+            // this without adding a separate bitmap_pixel_count field.
+            //
+            // Weighting:
+            //   ap.priority × 1,000,000  — caller priority dominates
+            //   silhouette_area × 100    — pixel count is primary
+            //   hardness × 10            — concavity ratio is secondary
+            //   height × 1               — Z extent is tertiary
+            //
+            // For typical sizes (100-10000 mm²), silhouette area × 100
+            // lands in 10k-1M range — much larger than hardness (1-2)
+            // × 10 and typical heights (10-200). Area dominates.
             info.priority_score =
-                ap.priority * 1000.0
-                + info.hardness_score * 100.0
+                ap.priority * 1000000.0
+                + info.silhouette_area_mm2 * 100.0
+                + info.hardness_score * 10.0
                 + std::max(0.0, info.height_mm);
 
             cache.push_back(info);

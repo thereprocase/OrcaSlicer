@@ -247,8 +247,6 @@ TEST_CASE("C2 M1: build_cache populates geometric summary",
                  Catch::Matchers::WithinAbs(1200.0, 1.0));
     REQUIRE_THAT(cache[0].hull_area_mm2,
                  Catch::Matchers::WithinAbs(1200.0, 1.0));
-    REQUIRE_THAT(cache[0].max_dim_mm,
-                 Catch::Matchers::WithinAbs(40.0, 0.01));
     REQUIRE_THAT(cache[0].hardness_score,
                  Catch::Matchers::WithinAbs(1.0, 0.01));
     REQUIRE(cache[0].height_mm == 0.0);
@@ -256,11 +254,13 @@ TEST_CASE("C2 M1: build_cache populates geometric summary",
     // Item 1: 20x20 square → area 400
     REQUIRE_THAT(cache[1].silhouette_area_mm2,
                  Catch::Matchers::WithinAbs(400.0, 1.0));
-    REQUIRE_THAT(cache[1].max_dim_mm,
-                 Catch::Matchers::WithinAbs(20.0, 0.01));
 
-    // Item 2: 40x40 with height=150 → tall, priority_score should reflect it
+    // Item 2: 40x40 with height=150 → tall + largest area, should
+    // have the highest priority_score (M2.5.4 puts silhouette area
+    // as the primary sort key).
     REQUIRE(cache[2].height_mm == 150.0);
+    REQUIRE(cache[2].silhouette_area_mm2 > cache[0].silhouette_area_mm2);
+    REQUIRE(cache[2].silhouette_area_mm2 > cache[1].silhouette_area_mm2);
     REQUIRE(cache[2].priority_score > cache[0].priority_score);
     REQUIRE(cache[2].priority_score > cache[1].priority_score);
 }
