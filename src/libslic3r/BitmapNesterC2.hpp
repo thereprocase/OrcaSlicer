@@ -37,6 +37,15 @@
 
 namespace Slic3r { namespace arrangement {
 
+// Portable popcount for uint64_t — avoids __builtin_popcountll (GCC)
+// and __popcnt64 (MSVC) portability issues.
+inline int popcount64(uint64_t x) {
+    x = x - ((x >> 1) & 0x5555555555555555ULL);
+    x = (x & 0x3333333333333333ULL) + ((x >> 2) & 0x3333333333333333ULL);
+    x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0FULL;
+    return (int)((x * 0x0101010101010101ULL) >> 56);
+}
+
 // ---------------------------------------------------------------------------
 // Per-item information cached once per arrange call. Reused across every
 // phase of the pipeline so that per-item work (rasterization, hull, bbox)
@@ -91,6 +100,24 @@ struct NesterC2ItemGroup {
 // Output of pack_as_island (M2) and input to locate_island_on_plate (M3).
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Per-item compaction state. Holds the winning rotation's bitmap (moved
+// from RotCache at greedy commit time — zero alloc, zero copy). Used by
+// compact_on_plate (Phase 4.5) to XOR-unstamp/restamp parts during the
+// trash compactor iteration loop.
+// ---------------------------------------------------------------------------
+
+struct CompactItem {
+    std::size_t           original_idx = 0;
+    std::vector<uint64_t> bm;          // item bitmap (moved from RotCache)
+    int                   iw = 0;
+    int                   ih = 0;
+    int                   iwpr = 0;
+    int                   px = 0;      // current pixel position on plate
+    int                   py = 0;
+    double                rot = 0.0;   // committed rotation
+};
+
 struct NesterC2Island {
     std::vector<std::size_t> item_indices;
 
@@ -105,6 +132,18 @@ struct NesterC2Island {
     BoundingBox bbox;
     double hull_perimeter_mm = 0.0;
     Vec2d  hull_centroid_mm  = Vec2d(0.0, 0.0);
+
+    // Per-item compaction data. Populated during pack_as_island by
+    // std::move from the winning RotCache entry at commit time. Used
+    // by compact_on_plate (Phase 4.5) for XOR unstamp/restamp.
+    std::vector<CompactItem> compact_items;
+
+    // The plate bitmap resolution and dimensions used during packing.
+    // Carried forward so compact_on_plate can rebuild the composite.
+    double bitmap_res = 0.5;
+    int    plate_bw   = 2048;
+    int    plate_bh   = 2048;
+    int    plate_wpr  = 32;
 };
 
 // ---------------------------------------------------------------------------
@@ -147,11 +186,21 @@ public:
         }
 
         // Multi-group path: pack each group as an island, then
-        // locate each island on its own plate.
+        // locate each island on its own plate, then compact.
+        std::vector<NesterC2Island> islands;
+        islands.reserve(groups.size());
         for (std::size_t g = 0; g < groups.size(); ++g) {
             NesterC2Island island = pack_as_island(
                 items, cache, groups[g], excludes, bed, params);
             locate_island_on_plate(items, island, (int)g, bed);
+            islands.push_back(std::move(island));
+        }
+
+        // M4.5 trash compactor: push parts inward from bed walls.
+        // Runs after locate, before spillover. Primary goal: get
+        // parts ON the plate.
+        for (std::size_t g = 0; g < islands.size(); ++g) {
+            compact_on_plate(items, islands[g], (int)g, bed);
         }
 
         // M3.1 spillover recovery: items that pack_as_island couldn't
@@ -536,6 +585,11 @@ private:
                 island.item_indices.push_back(idx);
                 island.rotations.push_back(rc.rot);
                 island.translations.push_back(Vec2crd{dx, dy});
+
+                // M4.5: save winning bitmap for trash compactor.
+                island.compact_items.push_back({idx,
+                    std::move(rot_cache[0].bm),
+                    rc.iw, rc.ih, rc.iwpr, px, py, rc.rot});
                 continue;
             }
 
@@ -638,6 +692,11 @@ private:
             island.item_indices.push_back(idx);
             island.rotations.push_back(br.rot);
             island.translations.push_back(Vec2crd{bdx, bdy});
+
+            // M4.5: save winning bitmap for trash compactor.
+            island.compact_items.push_back({idx,
+                std::move(rot_cache[best_rci].bm),
+                br.iw, br.ih, br.iwpr, best_px, best_py, br.rot});
         }
 
         // Finalize island metadata. island.bbox is computed from
@@ -665,6 +724,10 @@ private:
                 island.hull_centroid_mm = Vec2d(cx, cy);
             }
         }
+        island.bitmap_res = res;
+        island.plate_bw   = plate_bw;
+        island.plate_bh   = plate_bh;
+        island.plate_wpr  = plate_wpr;
         return island;
     }
 
@@ -765,6 +828,300 @@ private:
             items[i].translation = Vec2crd{dx, dy};
             items[i].rotation    = 0.0;
             items[i].bed_idx     = next_plate_idx++;
+        }
+    }
+    // ─── M4.5: Trash compactor primitives ────────────────────────────
+
+    // XOR-remove an item bitmap from the composite. Inverse of stamp.
+    // Precondition: the item's bits are set in the composite (i.e.,
+    // it was stamped there). XOR clears exactly those bits. Safe
+    // because the greedy placement loop checks collides() before
+    // stamp(), guaranteeing zero overlap between items.
+    static void xor_remove(std::vector<uint64_t>& plate,
+                           int wpr, int bw, int bh,
+                           const std::vector<uint64_t>& item_bm,
+                           int iwpr, int iw, int ih,
+                           int px, int py)
+    {
+        for (int iy = 0; iy < ih; ++iy) {
+            int by = py + iy;
+            if (by < 0 || by >= bh) continue;
+            for (int wx = 0; wx < iwpr; ++wx) {
+                uint64_t word = item_bm[(std::size_t)iy * iwpr + wx];
+                if (word == 0) continue;
+                int bed_bit = px + wx * 64;
+                int bed_word = bed_bit / 64;
+                int shift = bed_bit % 64;
+                if (bed_word >= 0 && bed_word < wpr)
+                    plate[(std::size_t)by * wpr + bed_word] ^= (word << shift);
+                if (shift > 0 && bed_word + 1 >= 0 && bed_word + 1 < wpr)
+                    plate[(std::size_t)by * wpr + bed_word + 1] ^= (word >> (64 - shift));
+            }
+        }
+    }
+
+    // M4.5: Trash compactor — bitmap compaction on the BED.
+    //
+    // Runs after locate_island_on_plate, before recover_spillover.
+    // Primary goal: get parts ON the plate by pushing them inward
+    // from the bed walls. Secondary: fill corners, rectangular shape.
+    //
+    // Algorithm:
+    //   1. Rebuild composite bitmap from per-part CompactItems
+    //      (adjusted for the locate shift)
+    //   2. For each iteration (50 max, early-exit on convergence):
+    //      a. For each part (height-desc, deterministic):
+    //         - XOR-remove from composite
+    //         - Compute wall pressure: inward from nearest bed wall
+    //         - Try 1px step in wall direction
+    //         - On collision: probe void direction (4 rays toward
+    //           wall, 64px cap), try tangent step
+    //         - XOR-stamp back at best position
+    //   3. Write final positions back to items[].translation
+    //
+    // Quality gate: pixel overflow count. If overflow_after >
+    // overflow_before, reject (should never happen with inward-only).
+    static void compact_on_plate(ArrangePolygons& items,
+                                  NesterC2Island& island,
+                                  int plate_idx,
+                                  const BoundingBox& bed)
+    {
+        if (island.compact_items.size() < 2) return;
+
+        const double res = island.bitmap_res;
+        const int bw  = island.plate_bw;
+        const int bh  = island.plate_bh;
+        const int wpr = island.plate_wpr;
+
+        // Bed boundaries in pixel space.
+        int bed_min_px = (int)(unscaled<double>(bed.min.x()) / res);
+        int bed_min_py = (int)(unscaled<double>(bed.min.y()) / res);
+        int bed_max_px = (int)(unscaled<double>(bed.max.x()) / res);
+        int bed_max_py = (int)(unscaled<double>(bed.max.y()) / res);
+
+        // Adjust CompactItem pixel positions for the locate shift.
+        // locate_island_on_plate added a shift to each item's
+        // translation. We need to convert current mm-space translations
+        // back to pixel positions for bitmap operations.
+        for (auto& ci : island.compact_items) {
+            std::size_t orig = ci.original_idx;
+            // The item's current translation in scaled coords → mm → px
+            double tx_mm = unscaled<double>(items[orig].translation.x());
+            double ty_mm = unscaled<double>(items[orig].translation.y());
+            // Find the rotation's bbox offset (the same math used at
+            // commit time to derive translation from pixel position).
+            ExPolygon rotated = items[orig].poly;
+            if (ci.rot != 0.0) rotated.rotate(ci.rot);
+            BoundingBox rot_bb = get_extents(rotated);
+            // px = (translation_mm + rot_bb.min_mm) / res
+            ci.px = (int)((tx_mm + unscaled<double>(rot_bb.min.x())) / res);
+            ci.py = (int)((ty_mm + unscaled<double>(rot_bb.min.y())) / res);
+        }
+
+        // Build fresh composite from per-part bitmaps.
+        std::vector<uint64_t> composite((std::size_t)wpr * bh, 0);
+        for (const auto& ci : island.compact_items) {
+            if (ci.bm.empty()) continue;
+            BitmapNester::stamp(composite, wpr, bw, bh,
+                                ci.bm, ci.iwpr, ci.iw, ci.ih,
+                                ci.px, ci.py);
+        }
+
+        // Count initial overflow (set bits outside bed).
+        auto count_overflow = [&](const std::vector<uint64_t>& plate) {
+            int overflow = 0;
+            for (int y = 0; y < bh; ++y) {
+                if (y < bed_min_py || y >= bed_max_py) {
+                    for (int w = 0; w < wpr; ++w)
+                        overflow += popcount64(
+                            plate[(std::size_t)y * wpr + w]);
+                    continue;
+                }
+                for (int w = 0; w < wpr; ++w) {
+                    int bit_start = w * 64;
+                    int bit_end   = bit_start + 64;
+                    uint64_t word = plate[(std::size_t)y * wpr + w];
+                    if (word == 0) continue;
+                    if (bit_start >= bed_min_px && bit_end <= bed_max_px)
+                        continue;  // fully inside bed
+                    // Partially outside — count out-of-bed bits
+                    for (int b = 0; b < 64; ++b) {
+                        if (!(word & (uint64_t(1) << b))) continue;
+                        int px = bit_start + b;
+                        if (px < bed_min_px || px >= bed_max_px)
+                            ++overflow;
+                    }
+                }
+            }
+            return overflow;
+        };
+
+        int overflow_before = count_overflow(composite);
+
+        // Save positions for quality gate rollback.
+        struct SavedPos { int px, py; };
+        std::vector<SavedPos> saved;
+        saved.reserve(island.compact_items.size());
+        for (const auto& ci : island.compact_items)
+            saved.push_back({ci.px, ci.py});
+
+        // ─── Main compaction loop ────────────────────────────────
+        constexpr int MAX_ITER = 50;
+        for (int iter = 0; iter < MAX_ITER; ++iter) {
+            bool any_moved = false;
+
+            for (auto& ci : island.compact_items) {
+                if (ci.bm.empty()) continue;
+
+                // 1. Wall pressure: inward from nearest bed wall.
+                int cx = ci.px + ci.iw / 2;
+                int cy = ci.py + ci.ih / 2;
+                int dl = cx - bed_min_px;
+                int dr = bed_max_px - cx;
+                int dt = cy - bed_min_py;
+                int db = bed_max_py - cy;
+                int dmin = std::min({dl, dr, dt, db});
+
+                int step_x = 0, step_y = 0;
+                if (dmin <= 0 || dmin == dl)      step_x =  1;
+                else if (dmin == dr)              step_x = -1;
+                else if (dmin == dt)              step_y =  1;
+                else if (dmin == db)              step_y = -1;
+
+                // Guard: part at exact center → no wall pressure.
+                if (step_x == 0 && step_y == 0) continue;
+
+                // 2. XOR-remove from composite.
+                xor_remove(composite, wpr, bw, bh,
+                           ci.bm, ci.iwpr, ci.iw, ci.ih,
+                           ci.px, ci.py);
+
+                int new_px = ci.px + step_x;
+                int new_py = ci.py + step_y;
+                bool moved = false;
+
+                // 3. Try wall-pressure step.
+                if (new_px >= 0 && new_py >= 0 &&
+                    new_px + ci.iw <= bw && new_py + ci.ih <= bh &&
+                    !BitmapNester::collides(composite, wpr, bw, bh,
+                                            ci.bm, ci.iwpr, ci.iw, ci.ih,
+                                            new_px, new_py)) {
+                    ci.px = new_px;
+                    ci.py = new_py;
+                    moved = true;
+                } else {
+                    // 4. Void-pull: probe 4 directions toward wall
+                    //    for tangent sliding.
+                    int best_void_px = ci.px;
+                    int best_void_py = ci.py;
+
+                    // Try perpendicular steps (tangent to wall).
+                    int tangents[][2] = {{0, 1}, {0, -1},
+                                         {1, 0}, {-1, 0}};
+                    int best_void_len = 0;
+                    for (auto& t : tangents) {
+                        // Skip the direction we already tried.
+                        if (t[0] == step_x && t[1] == step_y) continue;
+                        int tp = ci.px + t[0];
+                        int tq = ci.py + t[1];
+                        if (tp < 0 || tq < 0 ||
+                            tp + ci.iw > bw || tq + ci.ih > bh)
+                            continue;
+                        if (!BitmapNester::collides(
+                                composite, wpr, bw, bh,
+                                ci.bm, ci.iwpr, ci.iw, ci.ih,
+                                tp, tq)) {
+                            // Probe void depth in this direction.
+                            int void_len = 0;
+                            int probe_x = tp + t[0];
+                            int probe_y = tq + t[1];
+                            while (void_len < 64 &&
+                                   probe_x >= 0 && probe_y >= 0 &&
+                                   probe_x + ci.iw <= bw &&
+                                   probe_y + ci.ih <= bh &&
+                                   !BitmapNester::collides(
+                                       composite, wpr, bw, bh,
+                                       ci.bm, ci.iwpr, ci.iw, ci.ih,
+                                       probe_x, probe_y)) {
+                                ++void_len;
+                                probe_x += t[0];
+                                probe_y += t[1];
+                            }
+                            if (void_len > best_void_len) {
+                                best_void_len = void_len;
+                                best_void_px = tp;
+                                best_void_py = tq;
+                            }
+                        }
+                    }
+                    if (best_void_px != ci.px || best_void_py != ci.py) {
+                        ci.px = best_void_px;
+                        ci.py = best_void_py;
+                        moved = true;
+                    }
+                }
+
+                // 5. Re-stamp at (possibly new) position.
+                BitmapNester::stamp(composite, wpr, bw, bh,
+                                    ci.bm, ci.iwpr, ci.iw, ci.ih,
+                                    ci.px, ci.py);
+                if (moved) any_moved = true;
+            }
+
+            if (!any_moved) break;
+        }
+
+        // ─── Quality gate: pixel overflow count ──────────────────
+        int overflow_after = count_overflow(composite);
+        if (overflow_after > overflow_before) {
+            // Reject compaction — restore saved positions.
+            for (std::size_t i = 0; i < island.compact_items.size(); ++i) {
+                island.compact_items[i].px = saved[i].px;
+                island.compact_items[i].py = saved[i].py;
+            }
+            return;
+        }
+
+        // ─── Grid-snap post-pass ─────────────────────────────────
+        int grid_px = std::max(1, (int)(2.0 / res));
+        // Rebuild composite for snap checks.
+        std::fill(composite.begin(), composite.end(), uint64_t(0));
+        for (const auto& ci : island.compact_items) {
+            if (ci.bm.empty()) continue;
+            BitmapNester::stamp(composite, wpr, bw, bh,
+                                ci.bm, ci.iwpr, ci.iw, ci.ih,
+                                ci.px, ci.py);
+        }
+        for (auto& ci : island.compact_items) {
+            if (ci.bm.empty()) continue;
+            int snap_x = (ci.px / grid_px) * grid_px;
+            int snap_y = (ci.py / grid_px) * grid_px;
+            if (snap_x == ci.px && snap_y == ci.py) continue;
+            xor_remove(composite, wpr, bw, bh,
+                       ci.bm, ci.iwpr, ci.iw, ci.ih,
+                       ci.px, ci.py);
+            if (snap_x >= 0 && snap_y >= 0 &&
+                snap_x + ci.iw <= bw && snap_y + ci.ih <= bh &&
+                !BitmapNester::collides(composite, wpr, bw, bh,
+                                        ci.bm, ci.iwpr, ci.iw, ci.ih,
+                                        snap_x, snap_y)) {
+                ci.px = snap_x;
+                ci.py = snap_y;
+            }
+            BitmapNester::stamp(composite, wpr, bw, bh,
+                                ci.bm, ci.iwpr, ci.iw, ci.ih,
+                                ci.px, ci.py);
+        }
+
+        // ─── Write back to items[].translation ───────────────────
+        for (const auto& ci : island.compact_items) {
+            std::size_t orig = ci.original_idx;
+            ExPolygon rotated = items[orig].poly;
+            if (ci.rot != 0.0) rotated.rotate(ci.rot);
+            BoundingBox rot_bb = get_extents(rotated);
+            coord_t tx = scaled<coord_t>(ci.px * res) - rot_bb.min.x();
+            coord_t ty = scaled<coord_t>(ci.py * res) - rot_bb.min.y();
+            items[orig].translation = Vec2crd{tx, ty};
         }
     }
 };
