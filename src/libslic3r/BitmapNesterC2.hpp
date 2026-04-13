@@ -227,75 +227,79 @@ public:
             compact_on_plate(items, islands[g], (int)g, bed);
         }
 
-        // M5: Post-compaction overflow detection + corner placement.
-        // Items physically outside the bed after compaction get
-        // unplaced, then we try to fit them on existing plates
-        // (corner/wall positions). Remaining overflow goes to new
-        // plates via pack → locate → compact → repeat.
+        // M5+M6: Post-compaction overflow detection + multi-plate
+        // interleaving. Only runs when the arranger controls multiple
+        // plates (full Arrange). When called for "Arrange on current
+        // plate" (all items pre-assigned to the same plate), overflow
+        // detection is skipped — items stay where compaction left them
+        // because there's no plate 2 to escape to.
+        //
+        // Detection: if all input items started on the same bed_idx
+        // (or UNARRANGED), AND we only have 1 group, this is a
+        // single-plate arrange. Skip overflow evacuation.
+        bool single_plate_mode = (groups.size() == 1);
+
         constexpr int MAX_PLATES = 10;
         int next_plate = (int)groups.size();
 
-        // Collect overflow across all plates.
-        std::vector<std::size_t> overflow_items;
-        for (std::size_t g = 0; g < islands.size(); ++g) {
-            auto overflows = identify_overflow_items(items, islands[g], bed);
-            for (std::size_t idx : overflows) {
-                items[idx].bed_idx = UNARRANGED;
-                overflow_items.push_back(idx);
-            }
-        }
-
-        // Try corner placement on existing plates.
-        if (!overflow_items.empty()) {
-            for (std::size_t g = 0; g < islands.size() && !overflow_items.empty(); ++g) {
-                auto placed = try_corner_placement(
-                    items, islands[g], (int)g, bed, overflow_items);
-                // Remove placed items from overflow list.
-                for (std::size_t p : placed) {
-                    overflow_items.erase(
-                        std::remove(overflow_items.begin(), overflow_items.end(), p),
-                        overflow_items.end());
+        if (!single_plate_mode) {
+            // Collect overflow across all plates.
+            std::vector<std::size_t> overflow_items;
+            for (std::size_t g = 0; g < islands.size(); ++g) {
+                auto overflows = identify_overflow_items(items, islands[g], bed);
+                for (std::size_t idx : overflows) {
+                    items[idx].bed_idx = UNARRANGED;
+                    overflow_items.push_back(idx);
                 }
             }
-        }
 
-        // M6: Interleaved multi-plate packing for remaining overflow.
-        // Pack overflow onto new plates, compact, detect further
-        // overflow, repeat until stable or MAX_PLATES.
-        while (!overflow_items.empty() && next_plate < MAX_PLATES) {
-            // Build a group from overflow items.
-            NesterC2ItemGroup overflow_group;
-            for (std::size_t idx : overflow_items) {
-                // Find cache entry for this item.
-                for (std::size_t ci = 0; ci < cache.size(); ++ci) {
-                    if (cache[ci].original_idx == idx) {
-                        overflow_group.items.push_back(ci);
-                        break;
+            // Try corner placement on existing plates.
+            if (!overflow_items.empty()) {
+                for (std::size_t g = 0; g < islands.size() && !overflow_items.empty(); ++g) {
+                    auto placed = try_corner_placement(
+                        items, islands[g], (int)g, bed, excludes, overflow_items);
+                    for (std::size_t p : placed) {
+                        overflow_items.erase(
+                            std::remove(overflow_items.begin(), overflow_items.end(), p),
+                            overflow_items.end());
                     }
                 }
             }
-            if (overflow_group.items.empty()) break;
 
-            // Pack → locate → compact on a new plate.
-            NesterC2Island new_island = pack_as_island(
-                items, cache, overflow_group, excludes, bed, params);
-            locate_island_on_plate(items, new_island, next_plate, bed);
-            compact_on_plate(items, new_island, next_plate, bed);
+            // M6: Pack remaining overflow onto new plates.
+            while (!overflow_items.empty() && next_plate < MAX_PLATES) {
+                NesterC2ItemGroup overflow_group;
+                for (std::size_t idx : overflow_items) {
+                    for (std::size_t ci = 0; ci < cache.size(); ++ci) {
+                        if (cache[ci].original_idx == idx) {
+                            overflow_group.items.push_back(ci);
+                            break;
+                        }
+                    }
+                }
+                if (overflow_group.items.empty()) break;
 
-            // Check for further overflow from the new plate.
-            auto new_overflows = identify_overflow_items(
-                items, new_island, bed);
-            overflow_items.clear();
-            for (std::size_t idx : new_overflows) {
-                items[idx].bed_idx = UNARRANGED;
-                overflow_items.push_back(idx);
+                NesterC2Island new_island = pack_as_island(
+                    items, cache, overflow_group, excludes, bed, params);
+                locate_island_on_plate(items, new_island, next_plate, bed);
+                compact_on_plate(items, new_island, next_plate, bed);
+
+                // Further overflow from the new plate.
+                auto new_overflows = identify_overflow_items(
+                    items, new_island, bed);
+                overflow_items.clear();
+                for (std::size_t idx : new_overflows) {
+                    items[idx].bed_idx = UNARRANGED;
+                    overflow_items.push_back(idx);
+                }
+
+                islands.push_back(std::move(new_island));
+                ++next_plate;
             }
-
-            islands.push_back(std::move(new_island));
-            ++next_plate;
         }
 
-        // Final spillover: any remaining items get individual plates.
+        // Final spillover: any remaining UNARRANGED items get
+        // individual plates.
         recover_spillover(items, cache, next_plate, bed);
     }
 
@@ -1211,6 +1215,7 @@ private:
         NesterC2Island& island,
         int plate_idx,
         const BoundingBox& bed,
+        const ArrangePolygons& excludes,
         const std::vector<std::size_t>& overflow_indices)
     {
         if (overflow_indices.empty() || island.compact_items.empty())
@@ -1230,15 +1235,29 @@ private:
         int bed_max_px = bed_min_px + (int)(bed_w_mm / res);
         int bed_max_py = bed_min_py + (int)(bed_h_mm / res);
 
-        // Rebuild composite from items still on this plate.
+        // Rebuild composite from items still on this plate + excludes.
         std::vector<uint64_t> composite((std::size_t)wpr * bh, 0);
         double bed_origin_x_mm = unscaled<double>(bed.min.x());
         double bed_origin_y_mm = unscaled<double>(bed.min.y());
 
+        // Stamp exclude zones (wipe tower, purge area) as obstacles.
+        for (const auto& excl : excludes) {
+            int eiw = 0, eih = 0, eiwpr = 0;
+            auto ebm = BitmapNester::rasterize(
+                excl.poly, res, bw, bh, eiw, eih, eiwpr);
+            if (ebm.empty()) continue;
+            BoundingBox ebb = get_extents(excl.poly);
+            double ex_mm = unscaled<double>(ebb.min.x()) - bed_origin_x_mm + margin_mm;
+            double ey_mm = unscaled<double>(ebb.min.y()) - bed_origin_y_mm + margin_mm;
+            int epx = (int)std::lround(ex_mm / res);
+            int epy = (int)std::lround(ey_mm / res);
+            BitmapNester::stamp(composite, wpr, bw, bh,
+                                ebm, eiwpr, eiw, eih, epx, epy);
+        }
+
         for (const auto& ci : island.compact_items) {
             if (ci.bm.empty()) continue;
             if (items[ci.original_idx].bed_idx == UNARRANGED) continue;
-            // Re-derive pixel position from translation.
             std::size_t orig = ci.original_idx;
             double tx_mm = unscaled<double>(items[orig].translation.x());
             double ty_mm = unscaled<double>(items[orig].translation.y());
