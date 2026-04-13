@@ -584,12 +584,17 @@ private:
         int occ_max_px = 0;
         int occ_max_py = 0;
 
-        // Hull scoring state — accumulates vertices in world-mm
-        // coordinates as items commit. Computed once per commit;
-        // the scoring loop builds a temporary "new_pts" per
-        // candidate for delta computation.
+        // Hull scoring state. placed_hull_pts holds ONLY the hull
+        // vertices (pruned after each commit), not all contour points.
+        // This keeps hull recomputation O(hull_size + item_contour)
+        // instead of O(total_contour_points_so_far).
         Points placed_hull_pts;
         double current_hull_perim_mm = 0.0;
+        Polygon current_hull;  // cached hull polygon, reused at centroid
+
+        // Scratch buffer for hull scoring — allocated once, reused
+        // per candidate to avoid O(candidates) heap allocations.
+        Points hull_scratch;
 
         for (std::size_t idx : order) {
             const ArrangePolygon& ap = items_in[idx];
@@ -786,13 +791,14 @@ private:
                     coord_t cdx = scaled<coord_t>(px * res) - rc.rot_bb.min.x();
                     coord_t cdy = scaled<coord_t>(py * res) - rc.rot_bb.min.y();
 
-                    Points new_pts;
-                    new_pts.reserve(placed_hull_pts.size() + pre_rotated_pts.size());
-                    new_pts = placed_hull_pts;
+                    hull_scratch.clear();
+                    hull_scratch.reserve(placed_hull_pts.size() + pre_rotated_pts.size());
+                    hull_scratch.insert(hull_scratch.end(),
+                        placed_hull_pts.begin(), placed_hull_pts.end());
                     for (const Point& p : pre_rotated_pts)
-                        new_pts.emplace_back(p.x() + cdx, p.y() + cdy);
-                    if (new_pts.size() < 3) return;
-                    Polygon new_hull = Geometry::convex_hull(new_pts);
+                        hull_scratch.emplace_back(p.x() + cdx, p.y() + cdy);
+                    if (hull_scratch.size() < 3) return;
+                    Polygon new_hull = Geometry::convex_hull(hull_scratch);
                     if (new_hull.points.size() < 3) return;
                     double new_perim = unscaled<double>(new_hull.length());
                     double delta = new_perim - current_hull_perim_mm;
@@ -866,10 +872,11 @@ private:
                 const RotCache& rc = rot_cache[best_rci];
                 ref_max_px = std::min(ref_max_px, plate_bw - rc.iw);
                 ref_max_py = std::min(ref_max_py, plate_bh - rc.ih);
-                // Pre-rotate once for refine (same optimization as coarse).
+                // Reuse pre_rotated_pts from the winning rotation's
+                // coarse pass (already computed above, same rotation).
                 ExPolygon ref_rotated = base_poly;
                 if (rc.rot != 0.0) ref_rotated.rotate(rc.rot);
-                Points ref_rot_pts = ref_rotated.contour.points;
+                const Points& ref_rot_pts = ref_rotated.contour.points;
                 for (int ry = ref_min_py; ry <= ref_max_py; ++ry) {
                     for (int rx = ref_min_px; rx <= ref_max_px; ++rx) {
                         if (BitmapNester::collides(plate_items, plate_wpr,
@@ -879,13 +886,14 @@ private:
                             continue;
                         coord_t cdx = scaled<coord_t>(rx * res) - rc.rot_bb.min.x();
                         coord_t cdy = scaled<coord_t>(ry * res) - rc.rot_bb.min.y();
-                        Points new_pts;
-                        new_pts.reserve(placed_hull_pts.size() + ref_rot_pts.size());
-                        new_pts = placed_hull_pts;
+                        hull_scratch.clear();
+                        hull_scratch.reserve(placed_hull_pts.size() + ref_rot_pts.size());
+                        hull_scratch.insert(hull_scratch.end(),
+                            placed_hull_pts.begin(), placed_hull_pts.end());
                         for (const Point& p : ref_rot_pts)
-                            new_pts.emplace_back(p.x() + cdx, p.y() + cdy);
-                        if (new_pts.size() < 3) continue;
-                        Polygon new_hull = Geometry::convex_hull(new_pts);
+                            hull_scratch.emplace_back(p.x() + cdx, p.y() + cdy);
+                        if (hull_scratch.size() < 3) continue;
+                        Polygon new_hull = Geometry::convex_hull(hull_scratch);
                         if (new_hull.points.size() < 3) continue;
                         double new_perim = unscaled<double>(new_hull.length());
                         double delta = new_perim - current_hull_perim_mm;
@@ -918,9 +926,14 @@ private:
             for (const Point& p : committed.contour.points)
                 placed_hull_pts.push_back(p);
             if (placed_hull_pts.size() >= 3) {
-                Polygon hull = Geometry::convex_hull(placed_hull_pts);
-                if (hull.points.size() >= 3)
-                    current_hull_perim_mm = unscaled<double>(hull.length());
+                current_hull = Geometry::convex_hull(placed_hull_pts);
+                if (current_hull.points.size() >= 3) {
+                    current_hull_perim_mm = unscaled<double>(current_hull.length());
+                    // B1: prune to hull vertices only. The hull of
+                    // (hull_vertices U new_item) == hull of (all_points U new_item).
+                    // This keeps placed_hull_pts at ~20 points instead of k*C.
+                    placed_hull_pts = current_hull.points;
+                }
             }
 
             island.item_indices.push_back(idx);
@@ -999,18 +1012,16 @@ private:
         }
         island.hull_perimeter_mm = current_hull_perim_mm;
 
-        if (placed_hull_pts.size() >= 3) {
-            Polygon hull = Geometry::convex_hull(placed_hull_pts);
-            if (hull.points.size() >= 3) {
-                double cx = 0.0, cy = 0.0;
-                for (const Point& p : hull.points) {
-                    cx += unscaled<double>(p.x());
-                    cy += unscaled<double>(p.y());
-                }
-                cx /= (double)hull.points.size();
-                cy /= (double)hull.points.size();
-                island.hull_centroid_mm = Vec2d(cx, cy);
+        // Reuse cached hull from last commit — no recomputation needed.
+        if (current_hull.points.size() >= 3) {
+            double cx = 0.0, cy = 0.0;
+            for (const Point& p : current_hull.points) {
+                cx += unscaled<double>(p.x());
+                cy += unscaled<double>(p.y());
             }
+            cx /= (double)current_hull.points.size();
+            cy /= (double)current_hull.points.size();
+            island.hull_centroid_mm = Vec2d(cx, cy);
         }
         island.bitmap_res = res;
         island.plate_bw   = plate_bw;
@@ -1186,7 +1197,7 @@ private:
                                   int plate_idx,
                                   const BoundingBox& bed)
     {
-        if (island.compact_items.size() < 2) return;
+        if (island.compact_items.empty()) return;
 
         const double res = island.bitmap_res;
 
