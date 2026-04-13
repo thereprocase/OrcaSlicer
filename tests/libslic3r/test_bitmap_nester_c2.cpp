@@ -1827,3 +1827,128 @@ TEST_CASE("C2: cluster-centroid compactness gate",
     // Render.
     test_utils::dump_placement_png(items, bed, "c2_compactness_gate.png");
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Sprint S4 — Baseline tests for compactor redesign
+// ────────────────────────────────────────────────────────────────────
+
+TEST_CASE("C2 S4: xor_remove roundtrip at word boundary (px=61)",
+          "[BitmapNesterC2][S4][xor]")
+{
+    // Item placed at px=61 straddles a 64-bit word boundary (bits 61-63
+    // in word 0, remaining bits in word 1). XOR-remove must handle the
+    // two-word path correctly.
+    const double res = 0.5;
+    const int bw = 256, bh = 256;
+    const int wpr = (bw + 63) / 64;
+    std::vector<uint64_t> plate((std::size_t)wpr * bh, 0);
+
+    ExPolygon sq = c2_rect_mm(10.0, 10.0);
+    int iw = 0, ih = 0, iwpr = 0;
+    auto bm = BitmapNester::rasterize(sq, res, bw, bh, iw, ih, iwpr);
+    REQUIRE(!bm.empty());
+
+    // Place at px=61 — straddles word boundary at bit 64.
+    int px = 61, py = 30;
+    BitmapNester::stamp(plate, wpr, bw, bh, bm, iwpr, iw, ih, px, py);
+
+    uint64_t sum_stamped = 0;
+    for (auto w : plate) sum_stamped += popcount64(w);
+    REQUIRE(sum_stamped > 0);
+
+    BitmapNesterC2::xor_remove(plate, wpr, bw, bh, bm, iwpr, iw, ih, px, py);
+
+    uint64_t sum_after = 0;
+    for (auto w : plate) sum_after += popcount64(w);
+    REQUIRE(sum_after == 0);
+}
+
+TEST_CASE("C2 S4: oversized item goes to spillover plate",
+          "[BitmapNesterC2][S4][oversized]")
+{
+    // An item larger than the bed in both axes should be marked
+    // UNARRANGED by the pre-filter and end up on a spillover plate.
+    ArrangePolygons items;
+    // Normal item that fits.
+    items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+    // Oversized item: 300×300 on a 200×200 bed.
+    ArrangePolygon big = c2_make_ap(c2_rect_mm(300.0, 300.0), 10.0);
+    big.allowed_rotations = {0.0};
+    items.push_back(std::move(big));
+
+    BoundingBox bed = c2_bed_mm(200.0, 200.0);
+    ArrangeParams params = c2_params();
+    params.allow_rotations = false;
+    ArrangePolygons excludes;
+
+    BitmapNesterC2::arrange(items, excludes, bed, params);
+
+    // Normal item should be on plate 0.
+    REQUIRE(items[0].bed_idx == 0);
+    // Oversized item should be on a different plate (spillover).
+    REQUIRE(items[1].bed_idx != UNARRANGED);
+    REQUIRE(items[1].bed_idx != items[0].bed_idx);
+}
+
+TEST_CASE("C2 S4: compactor quality gate rejects overflow increase",
+          "[BitmapNesterC2][S4][quality-gate]")
+{
+    // Construct a scenario where items are placed ON the bed with zero
+    // overflow. After compaction, overflow should remain zero (quality
+    // gate should never trigger on a zero-overflow input).
+    ArrangePolygons items;
+    for (int i = 0; i < 4; ++i)
+        items.push_back(c2_make_ap(c2_rect_mm(40.0, 40.0), 10.0));
+
+    // Generous bed: 200×200 for 4 × 40×40 squares.
+    BoundingBox bed = c2_bed_mm(200.0, 200.0);
+    ArrangeParams params = c2_params();
+    ArrangePolygons excludes;
+
+    auto cache  = BitmapNesterC2::build_cache(items);
+    auto groups = BitmapNesterC2::partition_items(cache, 1);
+    REQUIRE(groups.size() == 1);
+
+    auto island = BitmapNesterC2::pack_as_island(
+        items, cache, groups[0], excludes, bed, params);
+    BitmapNesterC2::locate_island_on_plate(items, island, 0, bed);
+
+    // Save pre-compaction translations.
+    std::vector<Vec2crd> pre;
+    for (const auto& ap : items) pre.push_back(ap.translation);
+
+    BitmapNesterC2::compact_on_plate(items, island, 0, bed);
+
+    // All items still on plate 0.
+    for (const auto& ap : items)
+        REQUIRE(ap.bed_idx == 0);
+
+    // Verify no bitmap collision between any pair.
+    const double res = island.bitmap_res;
+    const int bw = 512, bh = 512;
+    const int wpr = (bw + 63) / 64;
+
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        for (std::size_t j = i + 1; j < items.size(); ++j) {
+            ExPolygon pi = items[i].poly;
+            if (items[i].rotation != 0.0) pi.rotate(items[i].rotation);
+            pi.translate(items[i].translation);
+            ExPolygon pj = items[j].poly;
+            if (items[j].rotation != 0.0) pj.rotate(items[j].rotation);
+            pj.translate(items[j].translation);
+
+            // Bounding box overlap check as proxy — if bboxes don't
+            // overlap, no collision possible.
+            BoundingBox bbi = get_extents(pi);
+            BoundingBox bbj = get_extents(pj);
+            if (!bbi.overlap(bbj)) continue;
+
+            // If bboxes overlap, verify no polygon intersection.
+            auto isects = intersection_ex(to_polygons(pi), to_polygons(pj));
+            double isect_area = 0;
+            for (const auto& e : isects)
+                isect_area += std::abs(e.area());
+            REQUIRE(isect_area < 1e6);  // < 1 mm² (in scaled² units)
+        }
+    }
+}

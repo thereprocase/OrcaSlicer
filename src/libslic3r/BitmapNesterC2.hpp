@@ -1438,37 +1438,6 @@ private:
             return;
         }
 
-        // ─── Grid-snap post-pass ─────────────────────────────────
-        int grid_px = std::max(1, (int)(2.0 / res));
-        // Rebuild composite for snap checks.
-        std::fill(composite.begin(), composite.end(), uint64_t(0));
-        for (const auto& ci : island.compact_items) {
-            if (ci.bm.empty()) continue;
-            BitmapNester::stamp(composite, wpr, bw, bh,
-                                ci.bm, ci.iwpr, ci.iw, ci.ih,
-                                ci.px, ci.py);
-        }
-        for (auto& ci : island.compact_items) {
-            if (ci.bm.empty()) continue;
-            int snap_x = (ci.px / grid_px) * grid_px;
-            int snap_y = (ci.py / grid_px) * grid_px;
-            if (snap_x == ci.px && snap_y == ci.py) continue;
-            xor_remove(composite, wpr, bw, bh,
-                       ci.bm, ci.iwpr, ci.iw, ci.ih,
-                       ci.px, ci.py);
-            if (snap_x >= 0 && snap_y >= 0 &&
-                snap_x + ci.iw <= bw && snap_y + ci.ih <= bh &&
-                !BitmapNester::collides(composite, wpr, bw, bh,
-                                        ci.bm, ci.iwpr, ci.iw, ci.ih,
-                                        snap_x, snap_y)) {
-                ci.px = snap_x;
-                ci.py = snap_y;
-            }
-            BitmapNester::stamp(composite, wpr, bw, bh,
-                                ci.bm, ci.iwpr, ci.iw, ci.ih,
-                                ci.px, ci.py);
-        }
-
         // ─── Write back to items[].translation ───────────────────
         // Convert from compactor pixel space back to bed-relative
         // scaled translations.
