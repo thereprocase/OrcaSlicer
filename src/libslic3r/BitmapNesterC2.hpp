@@ -227,20 +227,76 @@ public:
             compact_on_plate(items, islands[g], (int)g, bed);
         }
 
-        // TODO: post-compaction overflow check. Items hanging off the
-        // bed after compaction should be unplaced and sent to spillover.
-        // Disabled for now — the compactor sometimes INCREASES overflow
-        // (quality gate rejects, items stay in original positions which
-        // may still overflow). Need to fix compactor convergence first.
+        // M5: Post-compaction overflow detection + corner placement.
+        // Items physically outside the bed after compaction get
+        // unplaced, then we try to fit them on existing plates
+        // (corner/wall positions). Remaining overflow goes to new
+        // plates via pack → locate → compact → repeat.
+        constexpr int MAX_PLATES = 10;
+        int next_plate = (int)groups.size();
 
-        // M3.1 spillover recovery: items that pack_as_island couldn't
-        // fit (best_rci stayed -1) still have bed_idx == UNARRANGED.
-        // Each gets its own plate. This is the
-        // minimum viable spillover — guarantees every item ends up
-        // placed somewhere, no items silently vanish. Fitting
-        // spillovers onto existing plates with remaining space is an
-        // optimization for a future milestone.
-        recover_spillover(items, cache, (int)groups.size(), bed);
+        // Collect overflow across all plates.
+        std::vector<std::size_t> overflow_items;
+        for (std::size_t g = 0; g < islands.size(); ++g) {
+            auto overflows = identify_overflow_items(items, islands[g], bed);
+            for (std::size_t idx : overflows) {
+                items[idx].bed_idx = UNARRANGED;
+                overflow_items.push_back(idx);
+            }
+        }
+
+        // Try corner placement on existing plates.
+        if (!overflow_items.empty()) {
+            for (std::size_t g = 0; g < islands.size() && !overflow_items.empty(); ++g) {
+                auto placed = try_corner_placement(
+                    items, islands[g], (int)g, bed, overflow_items);
+                // Remove placed items from overflow list.
+                for (std::size_t p : placed) {
+                    overflow_items.erase(
+                        std::remove(overflow_items.begin(), overflow_items.end(), p),
+                        overflow_items.end());
+                }
+            }
+        }
+
+        // M6: Interleaved multi-plate packing for remaining overflow.
+        // Pack overflow onto new plates, compact, detect further
+        // overflow, repeat until stable or MAX_PLATES.
+        while (!overflow_items.empty() && next_plate < MAX_PLATES) {
+            // Build a group from overflow items.
+            NesterC2ItemGroup overflow_group;
+            for (std::size_t idx : overflow_items) {
+                // Find cache entry for this item.
+                for (std::size_t ci = 0; ci < cache.size(); ++ci) {
+                    if (cache[ci].original_idx == idx) {
+                        overflow_group.items.push_back(ci);
+                        break;
+                    }
+                }
+            }
+            if (overflow_group.items.empty()) break;
+
+            // Pack → locate → compact on a new plate.
+            NesterC2Island new_island = pack_as_island(
+                items, cache, overflow_group, excludes, bed, params);
+            locate_island_on_plate(items, new_island, next_plate, bed);
+            compact_on_plate(items, new_island, next_plate, bed);
+
+            // Check for further overflow from the new plate.
+            auto new_overflows = identify_overflow_items(
+                items, new_island, bed);
+            overflow_items.clear();
+            for (std::size_t idx : new_overflows) {
+                items[idx].bed_idx = UNARRANGED;
+                overflow_items.push_back(idx);
+            }
+
+            islands.push_back(std::move(new_island));
+            ++next_plate;
+        }
+
+        // Final spillover: any remaining items get individual plates.
+        recover_spillover(items, cache, next_plate, bed);
     }
 
     // ─── M1 phase functions (exposed for testing via the
@@ -1099,6 +1155,175 @@ private:
             items_out[orig].rotation    = island.rotations[i];
             items_out[orig].bed_idx     = plate_idx;
         }
+    }
+
+    // M5: Identify items that overflow the bed after compaction.
+    // Returns indices of items whose placed polygon extends outside
+    // the bed bounding box. These items get set to UNARRANGED so
+    // the interleaving loop can re-place them.
+    static std::vector<std::size_t> identify_overflow_items(
+        ArrangePolygons& items,
+        const NesterC2Island& island,
+        const BoundingBox& bed)
+    {
+        std::vector<std::size_t> overflow;
+        Polygon bed_poly(Points{
+            bed.min,
+            Point(bed.max.x(), bed.min.y()),
+            bed.max,
+            Point(bed.min.x(), bed.max.y())
+        });
+        Polygons bed_polys = {bed_poly};
+
+        for (const auto& ci : island.compact_items) {
+            if (ci.bm.empty()) continue;
+            std::size_t orig = ci.original_idx;
+            if (items[orig].bed_idx == UNARRANGED) continue;
+
+            ExPolygon placed = items[orig].poly;
+            if (items[orig].rotation != 0.0)
+                placed.rotate(items[orig].rotation);
+            placed.translate(items[orig].translation);
+
+            // Check if any part of the polygon is outside the bed.
+            auto outside = diff_ex(to_polygons(placed), bed_polys);
+            double outside_area = 0;
+            for (const auto& e : outside)
+                outside_area += std::abs(e.area());
+
+            // Threshold: 1mm² in scaled² units (= 1e6 in nanometer²).
+            // Bitmap quantization can produce sub-pixel overhangs at
+            // bed edges; those are harmless. Real overflow is much
+            // larger.
+            if (outside_area > 1e6) {
+                overflow.push_back(orig);
+            }
+        }
+        return overflow;
+    }
+
+    // M5: Try to place overflow items in corners and along walls of
+    // an existing plate. Uses bitmap collision against the plate's
+    // composite. Returns indices of items that were successfully
+    // placed (removed from overflow).
+    static std::vector<std::size_t> try_corner_placement(
+        ArrangePolygons& items,
+        NesterC2Island& island,
+        int plate_idx,
+        const BoundingBox& bed,
+        const std::vector<std::size_t>& overflow_indices)
+    {
+        if (overflow_indices.empty() || island.compact_items.empty())
+            return {};
+
+        const double res = island.bitmap_res;
+        double bed_w_mm = unscaled<double>(bed.size().x());
+        double bed_h_mm = unscaled<double>(bed.size().y());
+        double margin_mm = 50.0;
+        double total_w_mm = bed_w_mm + 2 * margin_mm;
+        double total_h_mm = bed_h_mm + 2 * margin_mm;
+        const int bw  = ((int)(total_w_mm / res) + 63) & ~63;
+        const int bh  = (int)(total_h_mm / res) + 1;
+        const int wpr = (bw + 63) / 64;
+        int bed_min_px = (int)(margin_mm / res);
+        int bed_min_py = (int)(margin_mm / res);
+        int bed_max_px = bed_min_px + (int)(bed_w_mm / res);
+        int bed_max_py = bed_min_py + (int)(bed_h_mm / res);
+
+        // Rebuild composite from items still on this plate.
+        std::vector<uint64_t> composite((std::size_t)wpr * bh, 0);
+        double bed_origin_x_mm = unscaled<double>(bed.min.x());
+        double bed_origin_y_mm = unscaled<double>(bed.min.y());
+
+        for (const auto& ci : island.compact_items) {
+            if (ci.bm.empty()) continue;
+            if (items[ci.original_idx].bed_idx == UNARRANGED) continue;
+            // Re-derive pixel position from translation.
+            std::size_t orig = ci.original_idx;
+            double tx_mm = unscaled<double>(items[orig].translation.x());
+            double ty_mm = unscaled<double>(items[orig].translation.y());
+            ExPolygon rotated = items[orig].poly;
+            if (ci.rot != 0.0) rotated.rotate(ci.rot);
+            BoundingBox rot_bb = get_extents(rotated);
+            coord_t pad_sc = scaled<coord_t>(ci.pad_px * res);
+            double inflated_min_x = unscaled<double>(rot_bb.min.x() - pad_sc);
+            double inflated_min_y = unscaled<double>(rot_bb.min.y() - pad_sc);
+            double world_x = tx_mm + inflated_min_x - bed_origin_x_mm + margin_mm;
+            double world_y = ty_mm + inflated_min_y - bed_origin_y_mm + margin_mm;
+            int px = (int)std::lround(world_x / res);
+            int py = (int)std::lround(world_y / res);
+            BitmapNester::stamp(composite, wpr, bw, bh,
+                                ci.bm, ci.iwpr, ci.iw, ci.ih, px, py);
+        }
+
+        std::vector<std::size_t> placed;
+
+        for (std::size_t orig : overflow_indices) {
+            // Find the CompactItem for this overflow item.
+            const CompactItem* found_ci = nullptr;
+            for (const auto& ci : island.compact_items) {
+                if (ci.original_idx == orig) { found_ci = &ci; break; }
+            }
+            if (!found_ci || found_ci->bm.empty()) continue;
+            const auto& ci = *found_ci;
+
+            // Generate candidate positions: 4 corners + wall sweeps.
+            struct Candidate { int px, py; };
+            std::vector<Candidate> candidates;
+
+            // Corners.
+            candidates.push_back({bed_min_px, bed_min_py});
+            candidates.push_back({bed_max_px - ci.iw, bed_min_py});
+            candidates.push_back({bed_min_px, bed_max_py - ci.ih});
+            candidates.push_back({bed_max_px - ci.iw, bed_max_py - ci.ih});
+
+            // Wall sweeps: 32 positions along each wall.
+            int sweep_step = std::max(1, (bed_max_px - bed_min_px) / 32);
+            for (int s = sweep_step; s < bed_max_px - bed_min_px; s += sweep_step) {
+                candidates.push_back({bed_min_px + s, bed_min_py});
+                candidates.push_back({bed_min_px + s, bed_max_py - ci.ih});
+                candidates.push_back({bed_min_px, bed_min_py + s});
+                candidates.push_back({bed_max_px - ci.iw, bed_min_py + s});
+            }
+
+            bool item_placed = false;
+            for (const auto& c : candidates) {
+                if (c.px < 0 || c.py < 0 ||
+                    c.px + ci.iw > bw || c.py + ci.ih > bh)
+                    continue;
+                // Must be inside bed bounds.
+                if (c.px < bed_min_px || c.py < bed_min_py ||
+                    c.px + ci.iw > bed_max_px || c.py + ci.ih > bed_max_py)
+                    continue;
+                if (BitmapNester::collides(composite, wpr, bw, bh,
+                                           ci.bm, ci.iwpr, ci.iw, ci.ih,
+                                           c.px, c.py))
+                    continue;
+
+                // Place here. Stamp into composite.
+                BitmapNester::stamp(composite, wpr, bw, bh,
+                                    ci.bm, ci.iwpr, ci.iw, ci.ih,
+                                    c.px, c.py);
+
+                // Write back translation.
+                ExPolygon rotated = items[orig].poly;
+                if (ci.rot != 0.0) rotated.rotate(ci.rot);
+                BoundingBox rot_bb = get_extents(rotated);
+                coord_t pad_sc = scaled<coord_t>(ci.pad_px * res);
+                double world_x = c.px * res - margin_mm + bed_origin_x_mm;
+                double world_y = c.py * res - margin_mm + bed_origin_y_mm;
+                coord_t tx = scaled<coord_t>(world_x) - rot_bb.min.x() + pad_sc;
+                coord_t ty = scaled<coord_t>(world_y) - rot_bb.min.y() + pad_sc;
+                items[orig].translation = Vec2crd{tx, ty};
+                items[orig].bed_idx = plate_idx;
+
+                placed.push_back(orig);
+                item_placed = true;
+                break;
+            }
+            // If not placed, item stays UNARRANGED for next-plate packing.
+        }
+        return placed;
     }
 
     // M3.1: spillover recovery. Items that pack_as_island couldn't
