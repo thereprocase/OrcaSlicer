@@ -1292,137 +1292,145 @@ private:
         for (const auto& ci : island.compact_items)
             saved.push_back({ci.px, ci.py});
 
-        // ─── Main compaction loop ────────────────────────────────
-        // Iteration budget: 50 base + extra if overflow remains.
-        // At 0.5mm/px, 50 iters = 25mm of travel. If the cluster
-        // overflows the bed by more than that, 50 isn't enough.
-        // Check overflow every 50 iters; if still non-zero, keep
-        // going up to 200 total.
-        constexpr int BASE_ITER = 50;
-        constexpr int MAX_ITER  = 200;
-        for (int iter = 0; iter < MAX_ITER; ++iter) {
-            // After base iterations, check if we still need to push.
-            // If no overflow remains, the base budget is sufficient.
-            if (iter == BASE_ITER) {
-                int mid_overflow = count_overflow(composite);
-                fprintf(stderr, "[C2 compact] iter=%d mid_overflow=%d %s\n",
-                        iter, mid_overflow,
-                        mid_overflow == 0 ? "CONVERGED" : "EXTENDING");
-                if (mid_overflow == 0) break;
-            }
-            bool any_moved = false;
+        // ─── Closing-walls compaction ─────────────────────────────
+        // Sweep each axis outside-in: items closest to walls move
+        // first, sliding inward until collision or fully inside bed.
+        // Two rounds of H-V (4 passes total) to handle axis-ordering
+        // bias. Try both axis orderings, keep the result with less
+        // overflow.
 
-            for (auto& ci : island.compact_items) {
+        // Sweep one axis. horizontal=true: left/right walls close.
+        // horizontal=false: top/bottom walls close.
+        // Items sorted by distance to nearest wall on this axis
+        // (ascending = outermost first).
+        auto sweep_axis = [&](bool horizontal) {
+            // Build sort order: distance to nearest wall on this axis.
+            std::vector<std::size_t> order(island.compact_items.size());
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(),
+                [&](std::size_t a, std::size_t b) {
+                    auto& ca = island.compact_items[a];
+                    auto& cb = island.compact_items[b];
+                    int center_a, center_b, wall_lo, wall_hi;
+                    if (horizontal) {
+                        center_a = ca.px + ca.iw / 2;
+                        center_b = cb.px + cb.iw / 2;
+                        wall_lo = bed_min_px;
+                        wall_hi = bed_max_px;
+                    } else {
+                        center_a = ca.py + ca.ih / 2;
+                        center_b = cb.py + cb.ih / 2;
+                        wall_lo = bed_min_py;
+                        wall_hi = bed_max_py;
+                    }
+                    int dist_a = std::min(std::abs(center_a - wall_lo),
+                                          std::abs(wall_hi - center_a));
+                    int dist_b = std::min(std::abs(center_b - wall_lo),
+                                          std::abs(wall_hi - center_b));
+                    return dist_a < dist_b;
+                });
+
+            for (std::size_t idx : order) {
+                auto& ci = island.compact_items[idx];
                 if (ci.bm.empty()) continue;
 
-                // 1. Wall pressure: inward from nearest bed wall.
-                int cx = ci.px + ci.iw / 2;
-                int cy = ci.py + ci.ih / 2;
-                int dl = cx - bed_min_px;
-                int dr = bed_max_px - cx;
-                int dt = cy - bed_min_py;
-                int db = bed_max_py - cy;
-                int dmin = std::min({dl, dr, dt, db});
+                int center = horizontal ? (ci.px + ci.iw / 2)
+                                        : (ci.py + ci.ih / 2);
+                int wall_lo = horizontal ? bed_min_px : bed_min_py;
+                int wall_hi = horizontal ? bed_max_px : bed_max_py;
+                int dist_lo = center - wall_lo;
+                int dist_hi = wall_hi - center;
 
-                // Wall pressure: push inward from the nearest wall.
-                // dmin identifies which wall is closest (or which the
-                // item has crossed, when dmin < 0). The corresponding
-                // direction pushes TOWARD bed center.
-                //
-                // Sauron audit 2026-04-12: the old `dmin <= 0` guard
-                // unconditionally pushed right, which was wrong when
-                // items hung off the right/top/bottom walls. Removed.
-                int step_x = 0, step_y = 0;
-                if      (dmin == dl)  step_x =  1;  // nearest left wall → push right
-                else if (dmin == dr)  step_x = -1;  // nearest right wall → push left
-                else if (dmin == dt)  step_y =  1;  // nearest top wall → push down
-                else if (dmin == db)  step_y = -1;  // nearest bottom wall → push up
+                // Push direction: inward from nearest wall.
+                int step = (std::abs(dist_lo) <= std::abs(dist_hi)) ? 1 : -1;
 
-                // Guard: exact center of bed → no wall pressure.
-                if (step_x == 0 && step_y == 0) continue;
-
-                // 2. XOR-remove from composite.
+                // XOR-remove from composite.
                 xor_remove(composite, wpr, bw, bh,
                            ci.bm, ci.iwpr, ci.iw, ci.ih,
                            ci.px, ci.py);
 
-                int new_px = ci.px + step_x;
-                int new_py = ci.py + step_y;
-                bool moved = false;
+                // Slide inward until collision or fully inside bed.
+                int max_slide = horizontal ? (bed_max_px - bed_min_px)
+                                           : (bed_max_py - bed_min_py);
+                for (int s = 0; s < max_slide; ++s) {
+                    int try_px = ci.px + (horizontal ? step : 0);
+                    int try_py = ci.py + (horizontal ? 0 : step);
 
-                // 3. Try wall-pressure step.
-                if (new_px >= 0 && new_py >= 0 &&
-                    new_px + ci.iw <= bw && new_py + ci.ih <= bh &&
-                    !BitmapNester::collides(composite, wpr, bw, bh,
-                                            ci.bm, ci.iwpr, ci.iw, ci.ih,
-                                            new_px, new_py)) {
-                    ci.px = new_px;
-                    ci.py = new_py;
-                    moved = true;
-                } else {
-                    // 4. Void-pull: probe 4 directions toward wall
-                    //    for tangent sliding.
-                    int best_void_px = ci.px;
-                    int best_void_py = ci.py;
+                    if (try_px < 0 || try_py < 0 ||
+                        try_px + ci.iw > bw || try_py + ci.ih > bh)
+                        break;
 
-                    // Try perpendicular steps (tangent to wall).
-                    int tangents[][2] = {{0, 1}, {0, -1},
-                                         {1, 0}, {-1, 0}};
-                    int best_void_len = 0;
-                    for (auto& t : tangents) {
-                        // Skip the direction we already tried.
-                        if (t[0] == step_x && t[1] == step_y) continue;
-                        int tp = ci.px + t[0];
-                        int tq = ci.py + t[1];
-                        if (tp < 0 || tq < 0 ||
-                            tp + ci.iw > bw || tq + ci.ih > bh)
-                            continue;
-                        if (!BitmapNester::collides(
-                                composite, wpr, bw, bh,
-                                ci.bm, ci.iwpr, ci.iw, ci.ih,
-                                tp, tq)) {
-                            // Probe void depth in this direction.
-                            int void_len = 0;
-                            int probe_x = tp + t[0];
-                            int probe_y = tq + t[1];
-                            while (void_len < 64 &&
-                                   probe_x >= 0 && probe_y >= 0 &&
-                                   probe_x + ci.iw <= bw &&
-                                   probe_y + ci.ih <= bh &&
-                                   !BitmapNester::collides(
-                                       composite, wpr, bw, bh,
-                                       ci.bm, ci.iwpr, ci.iw, ci.ih,
-                                       probe_x, probe_y)) {
-                                ++void_len;
-                                probe_x += t[0];
-                                probe_y += t[1];
-                            }
-                            if (void_len > best_void_len) {
-                                best_void_len = void_len;
-                                best_void_px = tp;
-                                best_void_py = tq;
-                            }
-                        }
-                    }
-                    if (best_void_px != ci.px || best_void_py != ci.py) {
-                        ci.px = best_void_px;
-                        ci.py = best_void_py;
-                        moved = true;
-                    }
+                    if (BitmapNester::collides(composite, wpr, bw, bh,
+                                               ci.bm, ci.iwpr, ci.iw, ci.ih,
+                                               try_px, try_py))
+                        break;
+
+                    ci.px = try_px;
+                    ci.py = try_py;
+
+                    // Check if fully inside bed on this axis.
+                    int item_lo = horizontal ? ci.px : ci.py;
+                    int item_hi = item_lo + (horizontal ? ci.iw : ci.ih);
+                    if (item_lo >= wall_lo && item_hi <= wall_hi)
+                        break;
                 }
 
-                // 5. Re-stamp at (possibly new) position.
+                // Re-stamp at new position.
                 BitmapNester::stamp(composite, wpr, bw, bh,
                                     ci.bm, ci.iwpr, ci.iw, ci.ih,
                                     ci.px, ci.py);
-                if (moved) any_moved = true;
             }
+        };
 
-            if (!any_moved) {
-                fprintf(stderr, "[C2 compact] converged at iter=%d\n", iter);
-                break;
+        // Run compaction with H-V ordering.
+        constexpr int ROUNDS = 2;
+        auto run_compaction = [&]() {
+            for (int r = 0; r < ROUNDS; ++r) {
+                sweep_axis(true);   // horizontal
+                sweep_axis(false);  // vertical
+            }
+        };
+
+        // Try H-V ordering.
+        run_compaction();
+        int overflow_hv = count_overflow(composite);
+
+        // Save H-V positions.
+        std::vector<SavedPos> pos_hv;
+        pos_hv.reserve(island.compact_items.size());
+        for (const auto& ci : island.compact_items)
+            pos_hv.push_back({ci.px, ci.py});
+
+        // Restore to pre-compaction, try V-H ordering.
+        for (std::size_t i = 0; i < island.compact_items.size(); ++i) {
+            island.compact_items[i].px = saved[i].px;
+            island.compact_items[i].py = saved[i].py;
+        }
+        std::fill(composite.begin(), composite.end(), uint64_t(0));
+        for (const auto& ci : island.compact_items) {
+            if (ci.bm.empty()) continue;
+            BitmapNester::stamp(composite, wpr, bw, bh,
+                                ci.bm, ci.iwpr, ci.iw, ci.ih,
+                                ci.px, ci.py);
+        }
+
+        // V-H ordering.
+        for (int r = 0; r < ROUNDS; ++r) {
+            sweep_axis(false);
+            sweep_axis(true);
+        }
+        int overflow_vh = count_overflow(composite);
+
+        // Keep the better result.
+        fprintf(stderr, "[C2 compact] overflow: H-V=%d V-H=%d\n",
+                overflow_hv, overflow_vh);
+        if (overflow_hv <= overflow_vh) {
+            for (std::size_t i = 0; i < island.compact_items.size(); ++i) {
+                island.compact_items[i].px = pos_hv[i].px;
+                island.compact_items[i].py = pos_hv[i].py;
             }
         }
+        // else: V-H positions already in place
 
         // ─── Quality gate: pixel overflow count ──────────────────
         int overflow_after = count_overflow(composite);
