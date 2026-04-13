@@ -2089,3 +2089,123 @@ TEST_CASE("C2 S4-M2: compactor overflow monotonicity",
     // No overlaps on any plate.
     REQUIRE(test_utils::no_overlap(items));
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Sprint S4 — on-plate validation (every item fits within bed bounds)
+// ────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Assert every placed item's polygon is fully contained within the
+// bed rectangle. Uses polygon difference: placed_poly - bed_poly
+// should be empty. If any area remains after subtraction, the item
+// extends outside the bed.
+void require_all_on_plate(const ArrangePolygons& items,
+                          const BoundingBox& bed)
+{
+    // Build bed polygon.
+    Polygon bed_poly(Points{
+        bed.min,
+        Point(bed.max.x(), bed.min.y()),
+        bed.max,
+        Point(bed.min.x(), bed.max.y())
+    });
+    Polygons bed_polys = {bed_poly};
+
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (items[i].bed_idx == UNARRANGED) continue;
+        ExPolygon placed = items[i].poly;
+        if (items[i].rotation != 0.0) placed.rotate(items[i].rotation);
+        placed.translate(items[i].translation);
+
+        // Difference: item - bed. If anything remains, the item is
+        // partially outside the bed.
+        auto outside = diff_ex(to_polygons(placed), bed_polys);
+        double outside_area = 0;
+        for (const auto& e : outside)
+            outside_area += std::abs(e.area());
+
+        BoundingBox pbb = get_extents(placed);
+        UNSCOPED_INFO("item " << i << " plate " << items[i].bed_idx
+                      << " bbox [" << unscaled<double>(pbb.min.x())
+                      << "," << unscaled<double>(pbb.min.y()) << "] - ["
+                      << unscaled<double>(pbb.max.x()) << ","
+                      << unscaled<double>(pbb.max.y()) << "]"
+                      << " outside_area=" << unscaled<double>(unscaled<double>(outside_area))
+                      << " mm^2");
+        // Zero tolerance. The test must be stricter than the pipeline.
+        // If polygon math says it's outside, it's outside.
+        REQUIRE(outside_area == 0);
+    }
+}
+
+} // namespace
+
+TEST_CASE("C2 S4: all items on plate — single item",
+          "[BitmapNesterC2][S4][on-plate]")
+{
+    ArrangePolygons items;
+    items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+    BoundingBox bed = c2_bed_mm(200.0, 200.0);
+    ArrangeParams params = c2_params();
+    ArrangePolygons excludes;
+    BitmapNesterC2::arrange(items, excludes, bed, params);
+    require_all_on_plate(items, bed);
+}
+
+TEST_CASE("C2 S4: all items on plate — 4 squares tight bed",
+          "[BitmapNesterC2][S4][on-plate]")
+{
+    ArrangePolygons items;
+    for (int i = 0; i < 4; ++i)
+        items.push_back(c2_make_ap(c2_rect_mm(40.0, 40.0), 10.0));
+    BoundingBox bed = c2_bed_mm(100.0, 100.0);
+    ArrangeParams params = c2_params();
+    ArrangePolygons excludes;
+    BitmapNesterC2::arrange(items, excludes, bed, params);
+    require_all_on_plate(items, bed);
+}
+
+TEST_CASE("C2 S4: all items on plate — mixed shapes",
+          "[BitmapNesterC2][S4][on-plate]")
+{
+    ArrangePolygons items;
+    items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 120.0));
+    items.push_back(c2_make_ap(c2_rect_mm(20.0, 20.0),  10.0));
+    items.push_back(c2_make_ap(c2_l_shape_40_20_mm(),    50.0));
+    items.push_back(c2_make_ap(c2_c_shape_mm(),          10.0));
+    items.push_back(c2_make_ap(c2_rect_mm(15.0, 15.0),  10.0));
+    BoundingBox bed = c2_bed_mm(200.0, 200.0);
+    ArrangeParams params = c2_params();
+    ArrangePolygons excludes;
+    BitmapNesterC2::arrange(items, excludes, bed, params);
+    require_all_on_plate(items, bed);
+}
+
+TEST_CASE("C2 S4: all items on plate — 20 squares multi-plate",
+          "[BitmapNesterC2][S4][on-plate]")
+{
+    ArrangePolygons items;
+    for (int i = 0; i < 20; ++i)
+        items.push_back(c2_make_ap(c2_rect_mm(30.0, 30.0), 10.0));
+    BoundingBox bed = c2_bed_mm(200.0, 200.0);
+    ArrangeParams params = c2_params();
+    params.min_obj_distance = scaled<coord_t>(1.0);
+    ArrangePolygons excludes;
+    BitmapNesterC2::arrange(items, excludes, bed, params);
+    require_all_on_plate(items, bed);
+}
+
+TEST_CASE("C2 S4: all items on plate — L-shapes with spacing",
+          "[BitmapNesterC2][S4][on-plate]")
+{
+    ArrangePolygons items;
+    for (int i = 0; i < 6; ++i)
+        items.push_back(c2_make_ap(c2_l_shape_40_20_mm(), 10.0));
+    BoundingBox bed = c2_bed_mm(200.0, 200.0);
+    ArrangeParams params = c2_params();
+    params.min_obj_distance = scaled<coord_t>(2.0);
+    ArrangePolygons excludes;
+    BitmapNesterC2::arrange(items, excludes, bed, params);
+    require_all_on_plate(items, bed);
+}
